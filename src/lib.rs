@@ -132,6 +132,8 @@ define_options! { MountOption (FuseMountOption) {
     builtin Exec,
     builtin NoExec,
     builtin DirSync,
+    builtin Atime,
+    builtin NoAtime,
     define "direct_io" DirectIO,
     define BlkSize(String),
     define MaxSize(String), // size of filesystem

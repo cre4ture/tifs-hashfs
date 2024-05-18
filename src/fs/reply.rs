@@ -227,7 +227,7 @@ impl Bmap {
 
 #[derive(Debug)]
 pub struct Lseek {
-    offset: i64,
+    pub offset: i64,
 }
 
 impl Lseek {

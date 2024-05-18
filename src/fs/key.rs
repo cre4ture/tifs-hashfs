@@ -122,7 +122,7 @@ impl<'a> From<ScopedKey<'a>> for Key {
     fn from(key: ScopedKey<'a>) -> Self {
         use ScopedKey::*;
 
-        let mut data = Vec::with_capacity(key.len());
+        let mut data = Vec::with_capacity(1 + key.len());
         data.push(key.scope());
         match key {
             Meta => (),

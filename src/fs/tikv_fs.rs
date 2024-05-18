@@ -1,6 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::matches;
+use std::ops::DerefMut;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
@@ -13,12 +15,14 @@ use fuser::*;
 use libc::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET};
 use parse_size::parse_size;
 use tikv_client::{Config, TransactionClient};
+use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::async_fs::AsyncFileSystem;
 use super::dir::Directory;
 use super::error::{FsError, Result};
+use super::file_handler::FileHandler;
 use super::key::ROOT_INODE;
 use super::mode::make_mode;
 use super::reply::{
@@ -30,6 +34,40 @@ use crate::MountOption;
 pub const DIR_SELF: ByteString = ByteString::from_static(".");
 pub const DIR_PARENT: ByteString = ByteString::from_static("..");
 
+struct TiFsMutable {
+    pub freed_fhs: HashSet<u64>,
+    pub next_fh: u64,
+    pub file_handlers: HashMap<u64, FileHandler>,
+}
+
+impl TiFsMutable {
+
+    fn new() -> Self {
+        Self {
+            freed_fhs: HashSet::new(),
+            next_fh: 0,
+            file_handlers: HashMap::new(),
+        }
+    }
+
+    fn get_free_fh(&mut self) -> u64 {
+        let reused = self.freed_fhs.iter().next().map(u64::clone);
+        if let Some(Some(reused)) = reused.map(|x| self.freed_fhs.take(&x)) {
+            return reused;
+        }
+
+        let fh = self.next_fh;
+        self.next_fh = self.next_fh + 1;
+        fh
+    }
+
+    fn new_file_handler(&mut self) -> u64 {
+        let fh = self.get_free_fh();
+        self.file_handlers.insert(fh, FileHandler::default());
+        fh
+    }
+}
+
 pub struct TiFs {
     pub pd_endpoints: Vec<String>,
     pub config: Config,
@@ -37,6 +75,8 @@ pub struct TiFs {
     pub direct_io: bool,
     pub block_size: u64,
     pub max_size: Option<u64>,
+    pub enable_atime: bool,
+    mut_data: RwLock<TiFsMutable>,
 }
 
 type BoxedFuture<'a, T> = Pin<Box<dyn 'a + Send + Future<Output = Result<T>>>>;
@@ -95,7 +135,30 @@ impl TiFs {
                     .ok(),
                 _ => None,
             }),
+            enable_atime: options.iter().find_map(|option| match option {
+                MountOption::NoAtime => Some(false),
+                MountOption::Atime => Some(true),
+                _ => None,
+            }).unwrap_or(true),
+            mut_data: RwLock::new(TiFsMutable::new()),
         })
+    }
+
+    async fn with_mut_data<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut TiFsMutable) -> R,
+    {
+        let mut data = self.mut_data.write().await;
+        Ok(f(data.deref_mut()))
+    }
+
+    async fn get_file_handler(&self, fh: u64) -> Option<FileHandler> {
+        let d = self.mut_data.read().await;
+        d.file_handlers.get(&fh).map(FileHandler::clone)
+    }
+
+    async fn get_file_handler_checked(&self, fh: u64) -> Result<FileHandler> {
+        self.get_file_handler(fh).await.ok_or(FsError::FhNotFound { fh })
     }
 
     #[instrument(skip(txn, f))]
@@ -137,7 +200,7 @@ impl TiFs {
         self.process_txn(&mut txn, f).await
     }
 
-    async fn spin<F, T>(&self, delay: Option<Duration>, mut f: F) -> Result<T>
+    async fn spin<F, T>(&self, msg: &String, delay: Option<Duration>, mut f: F) -> Result<T>
     where
         T: 'static + Send,
         F: for<'a> FnMut(&'a TiFs, &'a mut Txn) -> BoxedFuture<'a, T>,
@@ -147,39 +210,44 @@ impl TiFs {
             match self.with_optimistic(&mut f).await {
                 Ok(v) => break Ok(v),
                 Err(FsError::KeyError(err)) => {
-                    trace!("spin because of a key error({})", err);
+                    eprintln!("{msg}: spin because of a key error({})", err);
                     if let Some(time) = delay {
                         sleep(time).await;
                     }
                 }
-                Err(err) => {
-                    if other_error_count >= 6 {
-                        break Err(err);
+                Err(FsError::UnknownError(err)) => {
+                    if other_error_count >= 3 {
+                        break Err(FsError::UnknownError(err));
                     }
                     other_error_count = other_error_count + 1;
-                    trace!("spin because of a unknown error({})", err);
-                    sleep(Duration::from_millis(300)).await;
+                    eprintln!("{msg}: spin because of a unknown error({})", err);
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    eprintln!("{msg}: no spin, error({})", err);
+                    return Err(err);
                 }
             }
         }
     }
 
-    async fn spin_no_delay<F, T>(&self, f: F) -> Result<T>
+    async fn spin_no_delay<F, T, S>(&self, msg: &S, f: F) -> Result<T>
     where
         T: 'static + Send,
         F: for<'a> FnMut(&'a TiFs, &'a mut Txn) -> BoxedFuture<'a, T>,
+        S: ToString + ?Sized,
     {
-        self.spin(None, f).await
+        self.spin(&msg.to_string(), None, f).await
     }
 
     async fn read_dir(&self, ino: u64) -> Result<Directory> {
-        self.spin_no_delay(move |_, txn| Box::pin(txn.read_dir(ino)))
+        self.spin_no_delay("read_dir", move |_, txn| Box::pin(txn.read_dir(ino)))
             .await
     }
 
     async fn read_inode(&self, ino: u64) -> Result<FileAttr> {
         let ino = self
-            .spin_no_delay(move |_, txn| Box::pin(txn.read_inode(ino)))
+            .spin_no_delay("read_inode", move |_, txn| Box::pin(txn.read_inode(ino)))
             .await?;
         Ok(ino.file_attr)
     }
@@ -192,7 +260,7 @@ impl TiFs {
         #[cfg(any(target_os = "freebsd", target_os = "macos"))] typ: i16,
     ) -> Result<()> {
         while !self
-            .spin_no_delay(move |_, txn| {
+            .spin_no_delay("setlkw", move |_, txn| {
                 Box::pin(async move {
                     let mut inode = txn.read_inode(ino).await?;
                     match typ {
@@ -262,7 +330,7 @@ impl AsyncFileSystem for TiFs {
             .add_capabilities(fuser::consts::FUSE_FLOCK_LOCKS)
             .expect("kernel config failed to add cap_fuse FUSE_CAP_FLOCK_LOCKS");
 
-        self.spin_no_delay(move |fs, txn| {
+        self.spin_no_delay("init", move |fs, txn| {
             Box::pin(async move {
                 info!("initializing tifs on {:?} ...", &fs.pd_endpoints);
                 if let Some(meta) = txn.read_meta().await? {
@@ -297,7 +365,7 @@ impl AsyncFileSystem for TiFs {
     #[tracing::instrument]
     async fn lookup(&self, parent: u64, name: ByteString) -> Result<Entry> {
         Self::check_file_name(&name)?;
-        self.spin_no_delay(move |_, txn| {
+        self.spin_no_delay(&format!("lookup, parent: {parent}, name: {}", name.escape_debug()), move |_, txn| {
             let name = name.clone();
             Box::pin(async move {
                 let ino = txn.lookup(parent, name).await?;
@@ -329,7 +397,7 @@ impl AsyncFileSystem for TiFs {
         _bkuptime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> Result<Attr> {
-        self.spin_no_delay(move |_, txn| {
+        self.spin_no_delay("setattr", move |_, txn| {
             Box::pin(async move {
                 // TODO: how to deal with fh, chgtime, bkuptime?
                 let mut attr = txn.read_inode(ino).await?;
@@ -376,9 +444,12 @@ impl AsyncFileSystem for TiFs {
     #[tracing::instrument]
     async fn open(&self, ino: u64, flags: i32) -> Result<Open> {
         // TODO: deal with flags
-        let fh = self
-            .spin_no_delay(move |_, txn| Box::pin(txn.open(ino)))
+        self
+            .spin_no_delay(&format!("open ino: {ino}, flags: {flags}"),
+            move |_, txn| Box::pin(txn.open(ino)))
             .await?;
+
+        let fh = self.with_mut_data(|d| d.new_file_handler()).await?;
 
         let mut open_flags = 0;
         #[cfg(target_os = "linux")]
@@ -402,8 +473,11 @@ impl AsyncFileSystem for TiFs {
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<Data> {
+        let enable_atime = self.enable_atime;
+        let file_handler = self.get_file_handler_checked(fh).await?;
         let data = self
-            .spin_no_delay(move |_, txn| Box::pin(txn.read(ino, fh, offset, size)))
+            .spin_no_delay(&format!("read, ino:{ino}, fh:{fh}, offset:{offset}, size:{size}"),
+            move |_, txn| Box::pin(txn.read(ino, file_handler, offset, size, enable_atime)))
             .await?;
         Ok(Data::new(data))
     }
@@ -420,8 +494,9 @@ impl AsyncFileSystem for TiFs {
         _lock_owner: Option<u64>,
     ) -> Result<Write> {
         let data: Bytes = data.into();
+        let file_handler = self.get_file_handler_checked(fh).await?;
         let len = self
-            .spin_no_delay(move |_, txn| Box::pin(txn.write(ino, fh, offset, data.clone())))
+            .spin_no_delay("write", move |_, txn| Box::pin(txn.write(ino, file_handler, offset, data.clone())))
             .await?;
         Ok(Write::new(len as u32))
     }
@@ -439,7 +514,7 @@ impl AsyncFileSystem for TiFs {
     ) -> Result<Entry> {
         Self::check_file_name(&name)?;
         let attr = self
-            .spin_no_delay(move |_, txn| Box::pin(txn.mkdir(parent, name.clone(), mode, gid, uid)))
+            .spin_no_delay("mkdir", move |_, txn| Box::pin(txn.mkdir(parent, name.clone(), mode, gid, uid)))
             .await?;
         Ok(Entry::new(attr.into(), 0))
     }
@@ -447,7 +522,7 @@ impl AsyncFileSystem for TiFs {
     #[tracing::instrument]
     async fn rmdir(&self, parent: u64, raw_name: ByteString) -> Result<()> {
         Self::check_file_name(&raw_name)?;
-        self.spin_no_delay(move |_, txn| Box::pin(txn.rmdir(parent, raw_name.clone())))
+        self.spin_no_delay("rmdir", move |_, txn| Box::pin(txn.rmdir(parent, raw_name.clone())))
             .await
     }
 
@@ -464,7 +539,7 @@ impl AsyncFileSystem for TiFs {
     ) -> Result<Entry> {
         Self::check_file_name(&name)?;
         let attr = self
-            .spin_no_delay(move |_, txn| {
+            .spin_no_delay("mknod", move |_, txn| {
                 Box::pin(txn.make_inode(parent, name.clone(), mode, gid, uid, rdev))
             })
             .await?;
@@ -498,9 +573,9 @@ impl AsyncFileSystem for TiFs {
     }
 
     async fn lseek(&self, ino: u64, fh: u64, offset: i64, whence: i32) -> Result<Lseek> {
-        self.spin_no_delay(move |_, txn| {
+        let file_handler = self.get_file_handler_checked(fh).await?;
+        let result = self.spin_no_delay("lseek", move |_, txn| {
             Box::pin(async move {
-                let mut file_handler = txn.read_fh(ino, fh).await?;
                 let inode = txn.read_inode(ino).await?;
                 let target_cursor = match whence {
                     SEEK_SET => offset,
@@ -515,13 +590,18 @@ impl AsyncFileSystem for TiFs {
                         offset: target_cursor,
                     });
                 }
-
-                file_handler.cursor = target_cursor as u64;
-                txn.save_fh(ino, fh, &file_handler).await?;
                 Ok(Lseek::new(target_cursor))
             })
         })
-        .await
+        .await?;
+
+        self.with_mut_data(|d| -> Result<()> {
+            let file_handler = d.file_handlers.get_mut(&fh).ok_or(FsError::FhNotFound { fh: fh })?;
+            file_handler.cursor = result.offset as u64;
+            Ok(())
+        }).await??;
+
+        Ok(result)
     }
 
     async fn release(
@@ -532,21 +612,29 @@ impl AsyncFileSystem for TiFs {
         _lock_owner: Option<u64>,
         _flush: bool,
     ) -> Result<()> {
-        self.spin_no_delay(move |_, txn| Box::pin(txn.close(ino, fh)))
-            .await
+        let result = self.spin_no_delay(&format!("release, ino:{ino}, fh:{fh}"),
+            move |_, txn| Box::pin(txn.close(ino)))
+            .await?;
+
+        self.with_mut_data(|d|{
+            d.file_handlers.remove(&fh);
+        }).await?;
+
+        Ok(result)
     }
 
     /// Create a hard link.
     async fn link(&self, ino: u64, newparent: u64, newname: ByteString) -> Result<Entry> {
         Self::check_file_name(&newname)?;
         let inode = self
-            .spin_no_delay(move |_, txn| Box::pin(txn.link(ino, newparent, newname.clone())))
+            .spin_no_delay("link", move |_, txn| Box::pin(txn.link(ino, newparent, newname.clone())))
             .await?;
         Ok(Entry::new(inode.into(), 0))
     }
 
     async fn unlink(&self, parent: u64, raw_name: ByteString) -> Result<()> {
-        self.spin_no_delay(move |_, txn| Box::pin(txn.unlink(parent, raw_name.clone())))
+        self.spin_no_delay(&format!("unlink, parent:{parent}, raw_name:{}", raw_name.escape_debug()),
+            move |_, txn| Box::pin(txn.unlink(parent, raw_name.clone())))
             .await
     }
 
@@ -560,7 +648,7 @@ impl AsyncFileSystem for TiFs {
     ) -> Result<()> {
         Self::check_file_name(&raw_name)?;
         Self::check_file_name(&new_raw_name)?;
-        self.spin_no_delay(move |_, txn| {
+        self.spin_no_delay("rename", move |_, txn| {
             let name = raw_name.clone();
             let new_name = new_raw_name.clone();
             Box::pin(async move {
@@ -588,7 +676,7 @@ impl AsyncFileSystem for TiFs {
         link: ByteString,
     ) -> Result<Entry> {
         Self::check_file_name(&name)?;
-        self.spin_no_delay(move |_, txn| {
+        self.spin_no_delay("symlink", move |_, txn| {
             let name = name.clone();
             let link = link.clone();
             Box::pin(async move {
@@ -611,8 +699,9 @@ impl AsyncFileSystem for TiFs {
     }
 
     async fn readlink(&self, ino: u64) -> Result<Data> {
-        self.spin(None, move |_, txn| {
-            Box::pin(async move { Ok(Data::new(txn.read_link(ino).await?)) })
+        let enable_atime = self.enable_atime;
+        self.spin(&"readlink".to_string(), None, move |_, txn| {
+            Box::pin(async move { Ok(Data::new(txn.read_link(ino, enable_atime).await?)) })
         })
         .await
     }
@@ -626,7 +715,7 @@ impl AsyncFileSystem for TiFs {
         length: i64,
         _mode: i32,
     ) -> Result<()> {
-        self.spin_no_delay(move |_, txn| {
+        self.spin_no_delay("fallocate", move |_, txn| {
             Box::pin(async move {
                 let mut inode = txn.read_inode(ino).await?;
                 txn.fallocate(&mut inode, offset, length).await
@@ -638,7 +727,7 @@ impl AsyncFileSystem for TiFs {
 
     // TODO: Find an api to calculate total and available space on tikv.
     async fn statfs(&self, _ino: u64) -> Result<StatFs> {
-        self.spin_no_delay(|_, txn| Box::pin(txn.statfs())).await
+        self.spin_no_delay("statfs", |_, txn| Box::pin(txn.statfs())).await
     }
 
     #[tracing::instrument]
@@ -655,7 +744,7 @@ impl AsyncFileSystem for TiFs {
     ) -> Result<()> {
         #[cfg(any(target_os = "freebsd", target_os = "macos"))]
         let typ = typ as i16;
-        let not_again = self.spin_no_delay(move |_, txn| {
+        let not_again = self.spin_no_delay("setlk", move |_, txn| {
             Box::pin(async move {
                 let mut inode = txn.read_inode(ino).await?;
                 warn!("setlk, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
@@ -740,7 +829,7 @@ impl AsyncFileSystem for TiFs {
         pid: u32,
     ) -> Result<Lock> {
         // TODO: read only operation need not txn?
-        self.spin_no_delay(move |_, txn| {
+        self.spin_no_delay("getlk", move |_, txn| {
             Box::pin(async move {
                 let inode = txn.read_inode(ino).await?;
                 warn!("getlk, inode:{:?}, pid:{:?}", inode, pid);

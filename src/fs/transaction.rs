@@ -74,50 +74,28 @@ impl Txn {
         })
     }
 
-    pub async fn open(&mut self, ino: u64) -> Result<u64> {
+    pub async fn open(&mut self, ino: u64) -> Result<()> {
         let mut inode = self.read_inode(ino).await?;
-        let fh = inode.next_fh;
-        self.save_fh(ino, fh, &FileHandler::default()).await?;
-        inode.next_fh += 1;
         inode.opened_fh += 1;
         self.save_inode(&inode).await?;
-        Ok(fh)
+        Ok(())
     }
 
-    pub async fn close(&mut self, ino: u64, fh: u64) -> Result<()> {
-        self.read_fh(ino, fh).await?;
-        self.delete(ScopedKey::handler(ino, fh)).await?;
-
+    pub async fn close(&mut self, ino: u64) -> Result<()> {
         let mut inode = self.read_inode(ino).await?;
         inode.opened_fh -= 1;
         self.save_inode(&inode).await
     }
 
-    pub async fn read_fh(&mut self, ino: u64, fh: u64) -> Result<FileHandler> {
-        let data = self
-            .get(ScopedKey::handler(ino, fh))
-            .await?
-            .ok_or(FsError::FhNotFound { ino, fh })?;
-        FileHandler::deserialize(&data)
-    }
-
-    pub async fn save_fh(&mut self, ino: u64, fh: u64, handler: &FileHandler) -> Result<()> {
-        Ok(self
-            .put(ScopedKey::handler(ino, fh), handler.serialize()?)
-            .await?)
-    }
-
-    pub async fn read(&mut self, ino: u64, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
-        let handler = self.read_fh(ino, fh).await?;
+    pub async fn read(&mut self, ino: u64, handler: FileHandler, offset: i64, size: u32, update_atime: bool) -> Result<Vec<u8>> {
         let start = handler.cursor as i64 + offset;
         if start < 0 {
             return Err(FsError::InvalidOffset { ino, offset: start });
         }
-        self.read_data(ino, start as u64, Some(size as u64)).await
+        self.read_data(ino, start as u64, Some(size as u64), update_atime).await
     }
 
-    pub async fn write(&mut self, ino: u64, fh: u64, offset: i64, data: Bytes) -> Result<usize> {
-        let handler = self.read_fh(ino, fh).await?;
+    pub async fn write(&mut self, ino: u64, handler: FileHandler, offset: i64, data: Bytes) -> Result<usize> {
         let start = handler.cursor as i64 + offset;
         if start < 0 {
             return Err(FsError::InvalidOffset { ino, offset: start });
@@ -298,7 +276,7 @@ impl Txn {
 
     async fn read_inline_data(
         &mut self,
-        inode: &mut Inode,
+        inode: &Inode,
         start: u64,
         size: u64,
     ) -> Result<Vec<u8>> {
@@ -314,10 +292,6 @@ impl Txn {
             let to_copy = size.min(inlined.len() - start);
             data[..to_copy].copy_from_slice(&inlined[start..start + to_copy]);
         }
-
-        inode.atime = SystemTime::now();
-        self.save_inode(inode).await?;
-
         Ok(data)
     }
 
@@ -326,8 +300,9 @@ impl Txn {
         ino: u64,
         start: u64,
         chunk_size: Option<u64>,
+        update_atime: bool,
     ) -> Result<Vec<u8>> {
-        let mut attr = self.read_inode(ino).await?;
+        let attr = self.read_inode(ino).await?;
         if start >= attr.size {
             return Ok(Vec::new());
         }
@@ -335,8 +310,14 @@ impl Txn {
         let max_size = attr.size - start;
         let size = chunk_size.unwrap_or(max_size).min(max_size);
 
+        if update_atime {
+            let mut attr = attr.clone();
+            attr.atime = SystemTime::now();
+            self.save_inode(&attr).await?;
+        }
+
         if attr.inline_data.is_some() {
-            return self.read_inline_data(&mut attr, start, size).await;
+            return self.read_inline_data(&attr, start, size).await;
         }
 
         let target = start + size;
@@ -383,8 +364,6 @@ impl Txn {
             );
 
         data.resize(size as usize, 0);
-        attr.atime = SystemTime::now();
-        self.save_inode(&attr).await?;
         Ok(data)
     }
 
@@ -480,11 +459,16 @@ impl Txn {
         self.write_inline_data(inode, 0, &data).await
     }
 
-    pub async fn read_link(&mut self, ino: u64) -> Result<Vec<u8>> {
-        let mut inode = self.read_inode(ino).await?;
+    pub async fn read_link(&mut self, ino: u64, update_atime: bool) -> Result<Vec<u8>> {
+        let inode = self.read_inode(ino).await?;
         debug_assert!(inode.file_attr.kind == FileType::Symlink);
         let size = inode.size;
-        self.read_inline_data(&mut inode, 0, size).await
+        if update_atime {
+            let mut inode = inode.clone();
+            inode.atime = SystemTime::now();
+            self.save_inode(&inode).await?;
+        }
+        self.read_inline_data(&inode, 0, size).await
     }
 
     pub async fn link(&mut self, ino: u64, newparent: u64, newname: ByteString) -> Result<Inode> {
