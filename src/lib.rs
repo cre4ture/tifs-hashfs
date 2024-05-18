@@ -140,6 +140,7 @@ define_options! { MountOption (FuseMountOption) {
     define Tls(String),
 //    define "opt" OptionName(Display_Debug_Clone_PartialEq_FromStr_able)
     define Name(String),
+    define HashedBlocks,
 }}
 
 #[cfg(test)]

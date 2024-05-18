@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use tikv_client::Key;
 
-use super::error::{FsError, Result};
+use super::{error::{FsError, Result}, inode};
 
 pub const ROOT_INODE: u64 = fuser::FUSE_ROOT_ID;
 
@@ -14,6 +14,7 @@ pub enum ScopedKeyKind<'a> {
     Block { ino: u64, block: u64 },
     FileHandler { ino: u64, handler: u64 },
     FileIndex { parent: u64, name: &'a str },
+    HashedBlock { hash: &'a[u8] },
 }
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
@@ -120,6 +121,7 @@ impl<'a> ScopedKey<'a> {
     const BLOCK: u8 = 2;
     const HANDLER: u8 = 3;
     const INDEX: u8 = 4;
+    const HASHED_BLOCK: u8 = 5;
 
     pub fn scope(&self) -> u8 {
         use ScopedKeyKind::*;
@@ -130,6 +132,7 @@ impl<'a> ScopedKey<'a> {
             Block { ino: _, block: _ } => Self::BLOCK,
             FileHandler { ino: _, handler: _ } => Self::HANDLER,
             FileIndex { parent: _, name: _ } => Self::INDEX,
+            HashedBlock { hash: _ } => Self::HASHED_BLOCK,
         }
     }
 
@@ -142,6 +145,7 @@ impl<'a> ScopedKey<'a> {
             Block { ino: _, block: _ } => size_of::<u64>() * 2,
             FileHandler { ino: _, handler: _ } => size_of::<u64>() * 2,
             FileIndex { parent: _, name } => size_of::<u64>() + name.len(),
+            HashedBlock { hash: _ } => size_of::<inode::Hash>(),
         };
 
         return self.prefix.len() + 1 + kind_size;
@@ -167,6 +171,9 @@ impl<'a> ScopedKey<'a> {
             FileIndex { parent, name } => {
                 data.extend(parent.to_be_bytes().iter());
                 data.extend(name.as_bytes().iter());
+            }
+            HashedBlock { hash } => {
+                data.extend(hash)
             }
         }
         data

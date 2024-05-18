@@ -17,12 +17,15 @@ pub struct LockState {
     pub lk_type: i16,
 }
 
+pub type Hash = blake3::Hash;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Inode {
     pub file_attr: FileAttr,
     pub lock_state: LockState,
     pub inline_data: Option<Vec<u8>>,
-    pub next_fh: u64,
+    pub data_hash: Option<Hash>,
+    pub next_fh: Option<u64>,
     pub opened_fh: u64,
 }
 
@@ -59,7 +62,8 @@ impl From<FileAttr> for Inode {
             file_attr: attr,
             lock_state: LockState::new(HashSet::new(), F_UNLCK),
             inline_data: None,
-            next_fh: 0,
+            data_hash: None,
+            next_fh: None,
             opened_fh: 0,
         }
     }

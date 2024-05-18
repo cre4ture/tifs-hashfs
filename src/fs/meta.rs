@@ -6,18 +6,41 @@ use super::reply::StatFs;
 use super::serialize::{deserialize, serialize, ENCODING};
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct StaticFsParameters{
+    pub hashed_blocks: bool,
+}
+
+impl StaticFsParameters {
+    pub const fn new() -> Self {
+        Self {
+            hashed_blocks: false,
+        }
+    }
+}
+
+impl Default for StaticFsParameters {
+    fn default() -> Self {
+        Self {
+            hashed_blocks: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Meta {
     pub inode_next: u64,
     pub block_size: u64,
     pub last_stat: Option<StatFs>,
+    pub config_flags: Option<StaticFsParameters>,
 }
 
 impl Meta {
-    pub const fn new(block_size: u64) -> Self {
+    pub const fn new(block_size: u64, config: StaticFsParameters) -> Self {
         Self {
             inode_next: ROOT_INODE,
             block_size,
             last_stat: None,
+            config_flags: Some(config),
         }
     }
 

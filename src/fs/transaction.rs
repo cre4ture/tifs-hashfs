@@ -7,6 +7,8 @@ use fuser::{FileAttr, FileType};
 use tikv_client::{Backoff, RetryOptions, Transaction, TransactionClient, TransactionOptions};
 use tracing::{debug, instrument, trace};
 
+use crate::fs::meta::StaticFsParameters;
+
 use super::block::empty_block;
 use super::dir::Directory;
 use super::error::{FsError, Result};
@@ -25,9 +27,40 @@ pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000
 pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
 
 
+struct BlockSplitter {
+    block_size: u64,
+    start: u64,
+    data: bytes::Bytes,
+    start_block_index: u64,
+    start_index_in_start_block: usize,
+}
+
+impl BlockSplitter {
+    fn new(block_size: u64, start: u64, data: bytes::Bytes) -> Self {
+
+        let start_block_index = start / block_size;
+        let start_index_in_start_block = (start % block_size) as usize;
+        Self {
+            block_size,
+            start,
+            data,
+            start_block_index,
+            start_index_in_start_block,
+        }
+    }
+
+    fn get_irregular_first_block_and_rest(&self) -> (u64,usize,&[u8],&[u8]) {
+        let first_block_remaining_space = self.block_size as usize - self.start_index_in_start_block;
+        let (first_block, rest) = self.data.split_at(first_block_remaining_space.min(self.data.len()));
+        (self.start_block_index, self.start_index_in_start_block, first_block, rest)
+    }
+}
+
+
 pub struct Txn<'a> {
     key_builder: &'a ScopedKeyBuilder<'a>,
     txn: Transaction,
+    hashed_blocks: bool,
     block_size: u64,
     max_blocks: Option<u64>,
     max_name_len: u32,
@@ -56,6 +89,7 @@ impl<'a> Txn<'a> {
     pub async fn begin_optimistic(
         key_builder: &'a ScopedKeyBuilder<'a>,
         client: &TransactionClient,
+        hashed_blocks: bool,
         block_size: u64,
         max_size: Option<u64>,
         max_name_len: u32,
@@ -71,6 +105,7 @@ impl<'a> Txn<'a> {
         Ok(Txn {
             key_builder,
             txn,
+            hashed_blocks,
             block_size,
             max_blocks: max_size.map(|size| size / block_size),
             max_name_len,
@@ -119,7 +154,9 @@ impl<'a> Txn<'a> {
         let mut meta = self
             .read_meta()
             .await?
-            .unwrap_or_else(|| Meta::new(self.block_size));
+            .unwrap_or_else(|| Meta::new(self.block_size, StaticFsParameters{
+                hashed_blocks: self.hashed_blocks
+            }));
         self.check_space_left(&meta)?;
         let ino = meta.inode_next;
         meta.inode_next += 1;
@@ -391,34 +428,12 @@ impl<'a> Txn<'a> {
         Ok(clear_size)
     }
 
-    #[instrument(skip(self, data))]
-    pub async fn write_data(&mut self, ino: u64, start: u64, data: Bytes) -> Result<usize> {
-        let write_start = SystemTime::now();
-        debug!("write data at ({})[{}]", ino, start);
-        let meta = self.read_meta().await?.unwrap();
-        self.check_space_left(&meta)?;
+    pub async fn write_blocks_traditional(&mut self, ino: u64, start: u64, data: &Bytes) -> Result<()> {
 
-        let mut inode = self.read_inode(ino).await?;
-        let size = data.len();
-        let target = start + size as u64;
+        let bs = BlockSplitter::new(self.block_size, start, data.clone());
+        let (mut block_index, start_index, first_block, mut rest) = bs.get_irregular_first_block_and_rest();
 
-        if inode.inline_data.is_some() && target > self.inline_data_threshold() {
-            self.transfer_inline_data_to_block(&mut inode).await?;
-        }
-
-        if (inode.inline_data.is_some() || inode.size == 0)
-            && target <= self.inline_data_threshold()
-        {
-            return self.write_inline_data(&mut inode, start, &data).await;
-        }
-
-        let mut block_index = start / self.block_size;
         let start_key = self.key_builder.block(ino, block_index);
-        let start_index = (start % self.block_size) as usize;
-
-        let first_block_size = self.block_size as usize - start_index;
-
-        let (first_block, mut rest) = data.split_at(first_block_size.min(data.len()));
 
         let mut start_value = self
             .get(start_key)
@@ -446,6 +461,37 @@ impl<'a> Txn<'a> {
             self.put(key, value).await?;
             rest = current_rest;
         }
+
+        Ok(())
+    }
+
+    pub async fn write_data_hashed_blocks(&self) -> Result<()> {
+        //let hash: blake3::Hash = blake3::hash(input);
+        Ok(())
+    }
+
+    #[instrument(skip(self, data))]
+    pub async fn write_data(&mut self, ino: u64, start: u64, data: Bytes) -> Result<usize> {
+        let write_start = SystemTime::now();
+        debug!("write data at ({})[{}]", ino, start);
+        let meta = self.read_meta().await?.unwrap();
+        self.check_space_left(&meta)?;
+
+        let mut inode = self.read_inode(ino).await?;
+        let size = data.len();
+        let target = start + size as u64;
+
+        if inode.inline_data.is_some() && target > self.inline_data_threshold() {
+            self.transfer_inline_data_to_block(&mut inode).await?;
+        }
+
+        if (inode.inline_data.is_some() || inode.size == 0)
+            && target <= self.inline_data_threshold()
+        {
+            return self.write_inline_data(&mut inode, start, &data).await;
+        }
+
+        self.write_blocks_traditional(ino, start, &data).await?;
 
         inode.atime = SystemTime::now();
         inode.mtime = SystemTime::now();

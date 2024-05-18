@@ -77,6 +77,7 @@ pub struct TiFs {
     pub block_size: u64,
     pub max_size: Option<u64>,
     pub enable_atime: bool,
+    pub hashed_blocks: bool,
     mut_data: RwLock<TiFsMutable>,
 }
 
@@ -101,7 +102,7 @@ impl TiFs {
             .await
             .map_err(|err| anyhow!("{}", err))?;
         info!("connected to pd endpoints: {:?}", pd_endpoints);
-        Ok(TiFs {
+        let fs = TiFs {
             name,
             client,
             pd_endpoints: pd_endpoints.clone().into_iter().map(Into::into).collect(),
@@ -143,8 +144,30 @@ impl TiFs {
                 MountOption::Atime => Some(true),
                 _ => None,
             }).unwrap_or(true),
+            hashed_blocks: options.iter().find_map(|opt|{
+                (MountOption::HashedBlocks == *opt).then_some(true)
+            }).unwrap_or(false),
             mut_data: RwLock::new(TiFsMutable::new()),
-        })
+        };
+
+        fs.check_metadata().await?;
+
+        Ok(fs)
+    }
+
+    async fn check_metadata(&self) -> Result<()> {
+        let metadata = self
+            .spin_no_delay("check_metadata",
+            move |_, txn| Box::pin(txn.read_meta()))
+            .await?;
+        if let Some(meta) = metadata {
+            let cfg_flags = meta.config_flags.unwrap_or_default();
+            if cfg_flags.hashed_blocks != self.hashed_blocks {
+                panic!("stored config information mismatch: hashed_blocks desired: {}, actual: {}", self.hashed_blocks, cfg_flags.hashed_blocks);
+            }
+        }
+
+        Ok(())
     }
 
     async fn with_mut_data<F, R>(&self, f: F) -> Result<R>
@@ -197,6 +220,7 @@ impl TiFs {
         let mut txn = Txn::begin_optimistic(
             &key_builder,
             &self.client,
+            self.hashed_blocks,
             self.block_size,
             self.max_size,
             Self::MAX_NAME_LEN,
