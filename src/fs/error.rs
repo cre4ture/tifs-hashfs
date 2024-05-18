@@ -1,3 +1,5 @@
+use std::backtrace::Backtrace;
+
 use thiserror::Error;
 use tracing::error;
 
@@ -91,6 +93,7 @@ impl From<std::ffi::NulError> for FsError {
 
 impl From<std::io::Error> for FsError {
     fn from(err: std::io::Error) -> Self {
+        println!("Unknown Error 1: {:?}, backtrace:\n{}", err, Backtrace::force_capture());
         Self::UnknownError(err.to_string())
     }
 }
@@ -102,7 +105,11 @@ impl From<tikv_client::Error> for FsError {
         match err {
             KeyError(err) => Self::KeyError(format!("{:?}", err)),
             MultipleKeyErrors(errs) => Self::KeyError(format!("{:?}", errs)),
-            _ => Self::UnknownError(err.to_string()),
+            // Grpc(ge) if let grpcio::error::Error::RpcFailure(status) = ge => {}
+            _ => {
+                println!("Unknown Error 2: {:?}, backtrace:\n{}", err, Backtrace::force_capture());
+                Self::UnknownError(err.to_string())
+            }
         }
     }
 }

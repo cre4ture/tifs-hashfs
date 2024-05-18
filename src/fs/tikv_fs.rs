@@ -142,6 +142,7 @@ impl TiFs {
         T: 'static + Send,
         F: for<'a> FnMut(&'a TiFs, &'a mut Txn) -> BoxedFuture<'a, T>,
     {
+        let mut other_error_count = 0;
         loop {
             match self.with_optimistic(&mut f).await {
                 Ok(v) => break Ok(v),
@@ -151,7 +152,14 @@ impl TiFs {
                         sleep(time).await;
                     }
                 }
-                Err(err) => break Err(err),
+                Err(err) => {
+                    if other_error_count >= 6 {
+                        break Err(err);
+                    }
+                    other_error_count = other_error_count + 1;
+                    trace!("spin because of a unknown error({})", err);
+                    sleep(Duration::from_millis(300)).await;
+                }
             }
         }
     }
