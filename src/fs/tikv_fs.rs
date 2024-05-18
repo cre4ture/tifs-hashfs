@@ -23,7 +23,7 @@ use super::async_fs::AsyncFileSystem;
 use super::dir::Directory;
 use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
-use super::key::ROOT_INODE;
+use super::key::{ScopedKeyBuilder, ROOT_INODE};
 use super::mode::make_mode;
 use super::reply::{
     get_time, Attr, Create, Data, Dir, Entry, Lock, Lseek, Open, StatFs, Write, Xattr,
@@ -69,6 +69,7 @@ impl TiFsMutable {
 }
 
 pub struct TiFs {
+    pub name: Vec<u8>,
     pub pd_endpoints: Vec<String>,
     pub config: Config,
     pub client: TransactionClient,
@@ -88,6 +89,7 @@ impl TiFs {
 
     #[instrument]
     pub async fn construct<S>(
+        name: Vec<u8>,
         pd_endpoints: Vec<S>,
         cfg: Config,
         options: Vec<MountOption>,
@@ -100,6 +102,7 @@ impl TiFs {
             .map_err(|err| anyhow!("{}", err))?;
         info!("connected to pd endpoints: {:?}", pd_endpoints);
         Ok(TiFs {
+            name,
             client,
             pd_endpoints: pd_endpoints.clone().into_iter().map(Into::into).collect(),
             config: cfg,
@@ -162,10 +165,10 @@ impl TiFs {
     }
 
     #[instrument(skip(txn, f))]
-    async fn process_txn<F, T>(&self, txn: &mut Txn, f: F) -> Result<T>
+    async fn process_txn<'b, F, T>(&self, txn: &mut Txn<'b>, f: F) -> Result<T>
     where
         T: 'static + Send,
-        F: for<'a> FnOnce(&'a TiFs, &'a mut Txn) -> BoxedFuture<'a, T>,
+        F: for<'a> FnOnce(&'a TiFs, &'a mut Txn<'b>) -> BoxedFuture<'a, T>,
     {
         match f(self, txn).await {
             Ok(v) => {
@@ -190,7 +193,9 @@ impl TiFs {
         T: 'static + Send,
         F: for<'a> FnOnce(&'a TiFs, &'a mut Txn) -> BoxedFuture<'a, T>,
     {
+        let key_builder = ScopedKeyBuilder::new(&self.name);
         let mut txn = Txn::begin_optimistic(
+            &key_builder,
             &self.client,
             self.block_size,
             self.max_size,
@@ -496,7 +501,8 @@ impl AsyncFileSystem for TiFs {
         let data: Bytes = data.into();
         let file_handler = self.get_file_handler_checked(fh).await?;
         let len = self
-            .spin_no_delay("write", move |_, txn| Box::pin(txn.write(ino, file_handler, offset, data.clone())))
+            .spin_no_delay(&format!("write, ino:{ino}, fh:{fh}, offset:{offset}, data.len:{}", data.len()),
+            move |_, txn| Box::pin(txn.write(ino, file_handler, offset, data.clone())))
             .await?;
         Ok(Write::new(len as u32))
     }

@@ -13,7 +13,7 @@ use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
 use super::index::Index;
 use super::inode::Inode;
-use super::key::{ScopedKey, ROOT_INODE};
+use super::key::{ScopedKeyBuilder, ScopedKeyKind, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::{as_file_kind, as_file_perm, make_mode};
 use super::reply::{DirItem, StatFs};
@@ -25,14 +25,15 @@ pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000
 pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
 
 
-pub struct Txn {
+pub struct Txn<'a> {
+    key_builder: &'a ScopedKeyBuilder<'a>,
     txn: Transaction,
     block_size: u64,
     max_blocks: Option<u64>,
     max_name_len: u32,
 }
 
-impl Txn {
+impl<'a> Txn<'a> {
     const INLINE_DATA_THRESHOLD_BASE: u64 = 1 << 4;
 
     fn inline_data_threshold(&self) -> u64 {
@@ -53,6 +54,7 @@ impl Txn {
     }
 
     pub async fn begin_optimistic(
+        key_builder: &'a ScopedKeyBuilder<'a>,
         client: &TransactionClient,
         block_size: u64,
         max_size: Option<u64>,
@@ -67,6 +69,7 @@ impl Txn {
             .begin_with_options(options)
             .await?;
         Ok(Txn {
+            key_builder,
             txn,
             block_size,
             max_blocks: max_size.map(|size| size / block_size),
@@ -172,7 +175,7 @@ impl Txn {
     }
 
     pub async fn get_index(&mut self, parent: u64, name: ByteString) -> Result<Option<u64>> {
-        let key = ScopedKey::index(parent, &name);
+        let key = self.key_builder.index(parent, &name);
         self.get(key)
             .await
             .map_err(FsError::from)
@@ -184,26 +187,27 @@ impl Txn {
     }
 
     pub async fn set_index(&mut self, parent: u64, name: ByteString, ino: u64) -> Result<()> {
-        let key = ScopedKey::index(parent, &name);
+        let key = self.key_builder.index(parent, &name);
         let value = Index::new(ino).serialize()?;
         Ok(self.put(key, value).await?)
     }
 
     pub async fn remove_index(&mut self, parent: u64, name: ByteString) -> Result<()> {
-        let key = ScopedKey::index(parent, &name);
+        let key = self.key_builder.index(parent, &name);
         Ok(self.delete(key).await?)
     }
 
     pub async fn read_inode(&mut self, ino: u64) -> Result<Inode> {
+        let key = self.key_builder.inode(ino);
         let value = self
-            .get(ScopedKey::inode(ino))
+            .get(key)
             .await?
             .ok_or(FsError::InodeNotFound { inode: ino })?;
         Ok(Inode::deserialize(&value)?)
     }
 
     pub async fn save_inode(&mut self, inode: &Inode) -> Result<()> {
-        let key = ScopedKey::inode(inode.ino);
+        let key = self.key_builder.inode(inode.ino);
 
         if inode.nlink == 0 && inode.opened_fh == 0 {
             self.delete(key).await?;
@@ -215,23 +219,26 @@ impl Txn {
     }
 
     pub async fn remove_inode(&mut self, ino: u64) -> Result<()> {
-        self.delete(ScopedKey::inode(ino)).await?;
+        let key = self.key_builder.inode(ino);
+        self.delete(key).await?;
         Ok(())
     }
 
     pub async fn read_meta(&mut self) -> Result<Option<Meta>> {
-        let opt_data = self.get(ScopedKey::meta()).await?;
+        let key = self.key_builder.meta();
+        let opt_data = self.get(key).await?;
         opt_data.map(|data| Meta::deserialize(&data)).transpose()
     }
 
     pub async fn save_meta(&mut self, meta: &Meta) -> Result<()> {
-        self.put(ScopedKey::meta(), meta.serialize()?).await?;
+        let key = self.key_builder.meta();
+        self.put(key, meta.serialize()?).await?;
         Ok(())
     }
 
     async fn transfer_inline_data_to_block(&mut self, inode: &mut Inode) -> Result<()> {
         debug_assert!(inode.size <= self.inline_data_threshold());
-        let key = ScopedKey::block(inode.ino, 0);
+        let key = self.key_builder.block(inode.ino, 0);
         let mut data = inode.inline_data.clone().unwrap();
         data.resize(self.block_size as usize, 0);
         self.put(key, data).await?;
@@ -324,9 +331,10 @@ impl Txn {
         let start_block = start / self.block_size;
         let end_block = (target + self.block_size - 1) / self.block_size;
 
+        let block_range = self.key_builder.block_range(ino, start_block..end_block);
         let pairs = self
             .scan(
-                ScopedKey::block_range(ino, start_block..end_block),
+                block_range,
                 (end_block - start_block) as u32,
             )
             .await?;
@@ -334,8 +342,8 @@ impl Txn {
         let mut data = pairs
             .enumerate()
             .flat_map(|(i, pair)| {
-                let key = if let Ok(ScopedKey::Block { ino: _, block }) =
-                    ScopedKey::parse(pair.key().into())
+                let key = if let Ok(ScopedKeyKind::Block { ino: _, block }) =
+                    self.key_builder.parse(pair.key().into()).map(|x|x.key_type)
                 {
                     block
                 } else {
@@ -372,7 +380,8 @@ impl Txn {
         let end_block = (attr.size + self.block_size - 1) / self.block_size;
 
         for block in 0..end_block {
-            self.delete(ScopedKey::block(ino, block)).await?;
+            let key = self.key_builder.block(ino, block);
+            self.delete(key).await?;
         }
 
         let clear_size = attr.size;
@@ -404,7 +413,7 @@ impl Txn {
         }
 
         let mut block_index = start / self.block_size;
-        let start_key = ScopedKey::block(ino, block_index);
+        let start_key = self.key_builder.block(ino, block_index);
         let start_index = (start % self.block_size) as usize;
 
         let first_block_size = self.block_size as usize - start_index;
@@ -422,7 +431,7 @@ impl Txn {
 
         while !rest.is_empty() {
             block_index += 1;
-            let key = ScopedKey::block(ino, block_index);
+            let key = self.key_builder.block(ino, block_index);
             let (curent_block, current_rest) =
                 rest.split_at((self.block_size as usize).min(rest.len()));
             let mut value = curent_block.to_vec();
@@ -596,8 +605,9 @@ impl Txn {
     }
 
     pub async fn read_dir(&mut self, ino: u64) -> Result<Directory> {
+        let key = self.key_builder.block(ino, 0);
         let data = self
-            .get(ScopedKey::block(ino, 0))
+            .get(key)
             .await?
             .ok_or(FsError::BlockNotFound {
                 inode: ino,
@@ -615,7 +625,8 @@ impl Txn {
         inode.mtime = SystemTime::now();
         inode.ctime = SystemTime::now();
         self.save_inode(&inode).await?;
-        self.put(ScopedKey::block(ino, 0), data).await?;
+        let key = self.key_builder.block(ino, 0);
+        self.put(key, data).await?;
         Ok(inode)
     }
 
@@ -626,9 +637,10 @@ impl Txn {
             .await?
             .expect("meta should not be none after fs initialized");
         let next_inode = meta.inode_next;
+        let range = self.key_builder.inode_range(ROOT_INODE..next_inode);
         let (used_blocks, files) = self
             .scan(
-                ScopedKey::inode_range(ROOT_INODE..next_inode),
+                range,
                 (next_inode - ROOT_INODE) as u32,
             )
             .await?
@@ -664,7 +676,7 @@ impl Txn {
     }
 }
 
-impl Deref for Txn {
+impl<'a> Deref for Txn<'a> {
     type Target = Transaction;
 
     fn deref(&self) -> &Self::Target {
@@ -672,7 +684,7 @@ impl Deref for Txn {
     }
 }
 
-impl DerefMut for Txn {
+impl<'a> DerefMut for Txn<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.txn
     }

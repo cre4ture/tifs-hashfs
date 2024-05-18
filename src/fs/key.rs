@@ -8,7 +8,7 @@ use super::error::{FsError, Result};
 pub const ROOT_INODE: u64 = fuser::FUSE_ROOT_ID;
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
-pub enum ScopedKey<'a> {
+pub enum ScopedKeyKind<'a> {
     Meta,
     Inode(u64),
     Block { ino: u64, block: u64 },
@@ -16,99 +16,95 @@ pub enum ScopedKey<'a> {
     FileIndex { parent: u64, name: &'a str },
 }
 
-impl<'a> ScopedKey<'a> {
-    const META: u8 = 0;
-    const INODE: u8 = 1;
-    const BLOCK: u8 = 2;
-    const HANDLER: u8 = 3;
-    const INDEX: u8 = 4;
+#[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
+pub struct ScopedKey<'a> {
+    pub prefix: &'a [u8],
+    pub key_type: ScopedKeyKind<'a>,
+}
 
-    pub const fn meta() -> Self {
-        Self::Meta
+pub struct ScopedKeyBuilder<'a> {
+    prefix: &'a [u8],
+}
+
+impl<'a> ScopedKeyBuilder<'a> {
+    pub fn new(prefix: &'a [u8]) -> Self {
+        Self {
+            prefix
+        }
     }
 
-    pub const fn inode(ino: u64) -> Self {
-        Self::Inode(ino)
+    pub const fn meta(&self) -> ScopedKey {
+        ScopedKey{
+            prefix: self.prefix, key_type: ScopedKeyKind::Meta,
+        }
     }
 
-    pub const fn block(ino: u64, block: u64) -> Self {
-        Self::Block { ino, block }
+    pub const fn inode(&self, ino: u64) -> ScopedKey {
+        ScopedKey{
+            prefix: self.prefix, key_type: ScopedKeyKind::Inode(ino),
+        }
     }
 
-    pub const fn root() -> Self {
-        Self::inode(ROOT_INODE)
+    pub const fn block(&self, ino: u64, block: u64) -> ScopedKey {
+        ScopedKey{
+            prefix: self.prefix, key_type: ScopedKeyKind::Block { ino, block },
+        }
     }
 
-    pub const fn handler(ino: u64, handler: u64) -> Self {
-        Self::FileHandler { ino, handler }
+    pub const fn root(&self) -> ScopedKey {
+        self.inode(ROOT_INODE)
     }
 
-    pub fn index(parent: u64, name: &'a str) -> Self {
-        Self::FileIndex { parent, name }
+    pub const fn handler(&self, ino: u64, handler: u64) -> ScopedKey {
+        ScopedKey {
+            prefix: &self.prefix, key_type: ScopedKeyKind::FileHandler { ino, handler }
+        }
     }
 
-    pub fn block_range(ino: u64, block_range: Range<u64>) -> Range<Key> {
+    pub fn index(&self, parent: u64, name: &'a str) -> ScopedKey {
+        ScopedKey {
+            prefix: &self.prefix, key_type: ScopedKeyKind::FileIndex { parent, name }
+        }
+    }
+
+    pub fn block_range(&self, ino: u64, block_range: Range<u64>) -> Range<Key> {
         debug_assert_ne!(0, ino);
-        Self::block(ino, block_range.start).into()..Self::block(ino, block_range.end).into()
+        self.block(ino, block_range.start).into()..self.block(ino, block_range.end).into()
     }
 
-    pub fn inode_range(ino_range: Range<u64>) -> Range<Key> {
-        Self::inode(ino_range.start).into()..Self::inode(ino_range.end).into()
+    pub fn inode_range(&self, ino_range: Range<u64>) -> Range<Key> {
+        self.inode(ino_range.start).into()..self.inode(ino_range.end).into()
     }
 
-    pub fn scope(&self) -> u8 {
-        use ScopedKey::*;
-
-        match self {
-            Meta => Self::META,
-            Inode(_) => Self::INODE,
-            Block { ino: _, block: _ } => Self::BLOCK,
-            FileHandler { ino: _, handler: _ } => Self::HANDLER,
-            FileIndex { parent: _, name: _ } => Self::INDEX,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        use ScopedKey::*;
-
-        1 + match self {
-            Meta => 0,
-            Inode(_) => size_of::<u64>(),
-            Block { ino: _, block: _ } => size_of::<u64>() * 2,
-            FileHandler { ino: _, handler: _ } => size_of::<u64>() * 2,
-            FileIndex { parent: _, name } => size_of::<u64>() + name.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn parse(key: &'a [u8]) -> Result<Self> {
+    pub fn parse(&self, key: &'a [u8]) -> Result<ScopedKey> {
         let invalid_key = || FsError::InvalidScopedKey(key.to_owned());
+        let (prefix, key) = key.split_at(self.prefix.len());
+        if prefix != self.prefix {
+            return Err(FsError::UnknownError("key with invalid prefix!".into()));
+        }
         let (scope, data) = key.split_first().ok_or_else(invalid_key)?;
         match *scope {
-            Self::META => Ok(Self::meta()),
-            Self::INODE => {
+            ScopedKey::META => Ok(self.meta()),
+            ScopedKey::INODE => {
                 let ino = u64::from_be_bytes(*data.array_chunks().next().ok_or_else(invalid_key)?);
-                Ok(Self::inode(ino))
+                Ok(self.inode(ino))
             }
-            Self::BLOCK => {
+            ScopedKey::BLOCK => {
                 let mut arrays = data.array_chunks();
                 let ino = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
                 let block = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                Ok(Self::block(ino, block))
+                Ok(self.block(ino, block))
             }
-            Self::HANDLER => {
+            ScopedKey::HANDLER => {
                 let mut arrays = data.array_chunks();
                 let ino = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
                 let handler = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                Ok(Self::handler(ino, handler))
+                Ok(self.handler(ino, handler))
             }
-            Self::INDEX => {
+            ScopedKey::INDEX => {
                 let parent =
                     u64::from_be_bytes(*data.array_chunks().next().ok_or_else(invalid_key)?);
-                Ok(Self::index(
+                Ok(self.index(
                     parent,
                     std::str::from_utf8(&data[size_of::<u64>()..]).map_err(|_| invalid_key())?,
                 ))
@@ -118,13 +114,46 @@ impl<'a> ScopedKey<'a> {
     }
 }
 
-impl<'a> From<ScopedKey<'a>> for Key {
-    fn from(key: ScopedKey<'a>) -> Self {
-        use ScopedKey::*;
+impl<'a> ScopedKey<'a> {
+    const META: u8 = 0;
+    const INODE: u8 = 1;
+    const BLOCK: u8 = 2;
+    const HANDLER: u8 = 3;
+    const INDEX: u8 = 4;
 
-        let mut data = Vec::with_capacity(1 + key.len());
-        data.push(key.scope());
-        match key {
+    pub fn scope(&self) -> u8 {
+        use ScopedKeyKind::*;
+
+        match self.key_type {
+            Meta => Self::META,
+            Inode(_) => Self::INODE,
+            Block { ino: _, block: _ } => Self::BLOCK,
+            FileHandler { ino: _, handler: _ } => Self::HANDLER,
+            FileIndex { parent: _, name: _ } => Self::INDEX,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        use ScopedKeyKind::*;
+
+        let kind_size = match self.key_type {
+            Meta => 0,
+            Inode(_) => size_of::<u64>(),
+            Block { ino: _, block: _ } => size_of::<u64>() * 2,
+            FileHandler { ino: _, handler: _ } => size_of::<u64>() * 2,
+            FileIndex { parent: _, name } => size_of::<u64>() + name.len(),
+        };
+
+        return self.prefix.len() + 1 + kind_size;
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        use ScopedKeyKind::*;
+
+        let mut data = Vec::with_capacity(self.len());
+        data.extend(self.prefix);
+        data.push(self.scope());
+        match self.key_type {
             Meta => (),
             Inode(ino) => data.extend(ino.to_be_bytes().iter()),
             Block { ino, block } => {
@@ -140,6 +169,12 @@ impl<'a> From<ScopedKey<'a>> for Key {
                 data.extend(name.as_bytes().iter());
             }
         }
-        data.into()
+        data
+    }
+}
+
+impl<'a> From<ScopedKey<'a>> for Key {
+    fn from(key: ScopedKey<'a>) -> Self {
+        key.serialize().into()
     }
 }

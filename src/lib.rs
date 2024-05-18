@@ -139,6 +139,7 @@ define_options! { MountOption (FuseMountOption) {
     define MaxSize(String), // size of filesystem
     define Tls(String),
 //    define "opt" OptionName(Display_Debug_Clone_PartialEq_FromStr_able)
+    define Name(String),
 }}
 
 #[cfg(test)]
@@ -310,8 +311,17 @@ where
         Default::default()
     };
 
+    let name_str = options.iter().find_map(|opt|{
+        if let MountOption::Name(name) = opt {
+            Some(name.clone())
+        } else {
+            None
+        }
+    }).unwrap_or("".into());
+
     debug!("use tikv client config: {:?}", client_cfg);
-    let fs_impl = TiFs::construct(endpoints, client_cfg, options).await?;
+    let name = name_str.as_bytes();
+    let fs_impl = TiFs::construct(name.to_vec(), endpoints, client_cfg, options).await?;
 
     make_daemon()?;
 
