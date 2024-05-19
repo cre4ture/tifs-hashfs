@@ -12,6 +12,7 @@ use tikv_client::{Backoff, KvPair, RetryOptions, Transaction, TransactionClient,
 use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
 
+use crate::fs::block;
 use crate::fs::meta::StaticFsParameters;
 
 use super::block::empty_block;
@@ -318,10 +319,13 @@ impl<'a> Txn<'a> {
     }
 
     async fn hb_read_data(&mut self, ino: u64, start: u64, size: u64) -> Result<Vec<u8>> {
-        let bs = BlockSplitterRead::new(self.block_size, start, size);
 
+        let bs = BlockSplitterRead::new(self.block_size, start, size);
         let block_range = bs.first_block_index..bs.end_block_index;
+        eprintln!("hb_read_data(ino: {ino}, start:{start}, size: {size}) - block_size: {}, blocks_count: {}, range: [{}..{}[", bs.block_size, bs.block_count, block_range.start, block_range.end);
+
         let block_hashes = self.hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
+        eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
         let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
         let blocks_data = self.hb_get_block_data_by_hashes(&block_hashes_set).await?;
 
@@ -341,8 +345,11 @@ impl<'a> Txn<'a> {
                 _ => (0, (bs.size as usize - result.len()).min(bs.block_size as usize)),
             };
 
-            // do a copy, as some blocks might be used multiple times
-            result.extend_from_slice(&block_data[rd_start..(rd_start+rd_size)]);
+            if rd_start < block_data.len() {
+                // do a copy, as some blocks might be used multiple times
+                let rd_end = rd_start + rd_size;
+                result.extend_from_slice(&block_data[rd_start..rd_end.min(block_data.len())]);
+            }
         }
 
         Ok(result)
@@ -496,14 +503,14 @@ impl<'a> Txn<'a> {
             .await?;
         Ok(iter.filter_map(|pair| {
             let Some(key) = self.key_builder.parse_key_block_address(pair.key().into()) else {
-                tracing::error!("failed parsing block address from response");
+                tracing::error!("failed parsing block address from response 1");
                 return None;
             };
             let hash = if pair.value().len() >= blake3::OUT_LEN {
                 let data: &[u8; blake3::OUT_LEN] = pair.value()[0..blake3::OUT_LEN].try_into().unwrap();
                 inode::Hash::from_bytes(data.to_owned())
             } else {
-                tracing::error!("failed parsing hash value from response");
+                tracing::error!("failed parsing hash value from response 2");
                 return None;
             };
             Some((key, hash))
@@ -559,6 +566,8 @@ impl<'a> Txn<'a> {
 
         let bs = BlockSplitterWrite::new(self.block_size, start, &data);
         let block_range = bs.get_range();
+        eprintln!("hb_write_data(ino: {}, start:{}, size: {}) - block_size: {}, blocks_count: {}, range: [{}..{}[", inode.ino, start, data.len(), bs.block_size, block_range.count(), block_range.start, block_range.end);
+
         let hash_list_prev = self.hb_get_block_hash_list_by_block_range(inode.ino, block_range.clone()).await?;
 
         let mut pre_data_hash_request = HashSet::<inode::Hash>::new();

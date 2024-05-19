@@ -122,14 +122,18 @@ impl<'a> ScopedKeyBuilder<'a> {
     }
 
     pub fn parse_key_block_address(&self, key: &'a [u8]) -> Option<BlockAddress> {
-        let o = self.parse(key).ok();
-        if let Some(key) = o {
+        let o = self.parse(key);
+        if let Ok(key) = o {
             match key.key_type {
                 ScopedKeyKind::Block { ino, block } => Some(BlockAddress{ino, index: block}),
                 ScopedKeyKind::HashOfBlock { ino, block } => Some(BlockAddress{ino, index: block}),
-                _ => None,
+                other => {
+                    tracing::error!("parse_key_block_address(): unexpected key_type: {:?}", other);
+                    None
+                }
             }
         } else {
+            tracing::error!("parse_key_block_address(): failed parsing key. Err: {:?}, Data: {:?}", o.unwrap_err(), key);
             None
         }
     }
@@ -166,6 +170,18 @@ impl<'a> ScopedKeyBuilder<'a> {
                     parent,
                     std::str::from_utf8(&data[size_of::<u64>()..]).map_err(|_| invalid_key())?,
                 ))
+            }
+            ScopedKey::HASHED_BLOCK => {
+                Ok(ScopedKey{prefix, key_type: ScopedKeyKind::HashedBlock { hash: data }})
+            }
+            ScopedKey::HASH_OF_BLOCK => {
+                let mut arrays = data.array_chunks();
+                let ino = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
+                let block = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
+                Ok(ScopedKey{prefix, key_type: ScopedKeyKind::HashOfBlock { ino, block }})
+            }
+            ScopedKey::HASHED_BLOCK_EXISTS => {
+                Ok(ScopedKey{prefix, key_type: ScopedKeyKind::HashedBlockExists { hash: data }})
             }
             _ => Err(invalid_key()),
         }
