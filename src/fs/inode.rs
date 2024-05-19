@@ -18,6 +18,13 @@ pub struct LockState {
 }
 
 pub type Hash = blake3::Hash;
+pub type TiFsHash = blake3::Hash;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+pub struct BlockAddress {
+    pub ino: u64,
+    pub index: u64,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Inode {
@@ -25,7 +32,7 @@ pub struct Inode {
     pub lock_state: LockState,
     pub inline_data: Option<Vec<u8>>,
     pub data_hash: Option<Hash>,
-    pub next_fh: Option<u64>,
+    pub next_fh: Option<u64>,       // not used, deprecated. Keep to not get errors on old fs instances
     pub opened_fh: u64,
 }
 

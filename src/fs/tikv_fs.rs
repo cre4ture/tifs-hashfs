@@ -74,7 +74,7 @@ pub struct TiFs {
     pub config: Config,
     pub client: TransactionClient,
     pub direct_io: bool,
-    pub block_size: u64,
+    pub block_size: usize,
     pub max_size: Option<u64>,
     pub enable_atime: bool,
     pub hashed_blocks: bool,
@@ -85,7 +85,7 @@ type BoxedFuture<'a, T> = Pin<Box<dyn 'a + Send + Future<Output = Result<T>>>>;
 
 impl TiFs {
     pub const SCAN_LIMIT: u32 = 1 << 10;
-    pub const DEFAULT_BLOCK_SIZE: u64 = 1 << 16;
+    pub const DEFAULT_BLOCK_SIZE: usize = 1 << 16;
     pub const MAX_NAME_LEN: u32 = 1 << 8;
 
     #[instrument]
@@ -120,7 +120,7 @@ impl TiFs {
                         })
                         .map(|size| {
                             debug!("block size: {}", size);
-                            size
+                            size as usize
                         })
                         .ok(),
                     _ => None,

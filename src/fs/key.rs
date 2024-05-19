@@ -1,9 +1,9 @@
-use std::mem::size_of;
+use std::{convert::TryInto, mem::size_of};
 use std::ops::Range;
 
 use tikv_client::Key;
 
-use super::{error::{FsError, Result}, inode};
+use super::{error::{FsError, Result}, inode::{self, BlockAddress, TiFsHash}};
 
 pub const ROOT_INODE: u64 = fuser::FUSE_ROOT_ID;
 
@@ -15,6 +15,8 @@ pub enum ScopedKeyKind<'a> {
     FileHandler { ino: u64, handler: u64 },
     FileIndex { parent: u64, name: &'a str },
     HashedBlock { hash: &'a[u8] },
+    HashOfBlock { ino: u64, block: u64 },
+    HashedBlockExists { hash: &'a[u8] },
 }
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
@@ -52,6 +54,24 @@ impl<'a> ScopedKeyBuilder<'a> {
         }
     }
 
+    pub const fn block_hash(&self, addr: BlockAddress) -> ScopedKey {
+        ScopedKey{
+            prefix: self.prefix, key_type: ScopedKeyKind::HashOfBlock { ino: addr.ino, block: addr.index },
+        }
+    }
+
+    pub const fn hashed_block<'fl>(&self, hash: &'a inode::Hash) -> ScopedKey<'a> {
+        ScopedKey {
+            prefix: &self.prefix, key_type: ScopedKeyKind::HashedBlock { hash: hash.as_bytes() },
+        }
+    }
+
+    pub const fn hashed_block_exists<'fl>(&self, hash: &'a inode::Hash) -> ScopedKey<'a> {
+        ScopedKey {
+            prefix: &self.prefix, key_type: ScopedKeyKind::HashedBlockExists { hash: hash.as_bytes() },
+        }
+    }
+
     pub const fn root(&self) -> ScopedKey {
         self.inode(ROOT_INODE)
     }
@@ -73,8 +93,45 @@ impl<'a> ScopedKeyBuilder<'a> {
         self.block(ino, block_range.start).into()..self.block(ino, block_range.end).into()
     }
 
+    pub fn block_hash_range(&self, ino: u64, block_range: Range<u64>) -> Range<Key> {
+        debug_assert_ne!(0, ino);
+        self.block_hash(BlockAddress { ino, index: block_range.start, })
+            .into()..self.block_hash(BlockAddress { ino, index: block_range.end }).into()
+    }
+
     pub fn inode_range(&self, ino_range: Range<u64>) -> Range<Key> {
         self.inode(ino_range.start).into()..self.inode(ino_range.end).into()
+    }
+
+    pub fn parse_hash_from_dyn_sized_array(data: &[u8]) -> Option<TiFsHash> {
+        let static_len: Option<&[u8;blake3::OUT_LEN]> = data.try_into().ok();
+        static_len.and_then(|sl| Some(TiFsHash::from_bytes(*sl)))
+    }
+
+    pub fn parse_key_hashed_block(&self, key: &'a [u8]) -> Option<inode::Hash> {
+        let o = self.parse(key).ok();
+        if let Some(key) = o {
+            match key.key_type {
+                ScopedKeyKind::HashedBlock { hash } => Self::parse_hash_from_dyn_sized_array(hash),
+                ScopedKeyKind::HashedBlockExists { hash } => Self::parse_hash_from_dyn_sized_array(hash),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn parse_key_block_address(&self, key: &'a [u8]) -> Option<BlockAddress> {
+        let o = self.parse(key).ok();
+        if let Some(key) = o {
+            match key.key_type {
+                ScopedKeyKind::Block { ino, block } => Some(BlockAddress{ino, index: block}),
+                ScopedKeyKind::HashOfBlock { ino, block } => Some(BlockAddress{ino, index: block}),
+                _ => None,
+            }
+        } else {
+            None
+        }
     }
 
     pub fn parse(&self, key: &'a [u8]) -> Result<ScopedKey> {
@@ -122,6 +179,8 @@ impl<'a> ScopedKey<'a> {
     const HANDLER: u8 = 3;
     const INDEX: u8 = 4;
     const HASHED_BLOCK: u8 = 5;
+    const HASH_OF_BLOCK: u8 = 6;
+    const HASHED_BLOCK_EXISTS: u8 = 7;
 
     pub fn scope(&self) -> u8 {
         use ScopedKeyKind::*;
@@ -133,6 +192,8 @@ impl<'a> ScopedKey<'a> {
             FileHandler { ino: _, handler: _ } => Self::HANDLER,
             FileIndex { parent: _, name: _ } => Self::INDEX,
             HashedBlock { hash: _ } => Self::HASHED_BLOCK,
+            HashOfBlock { ino: _, block: _ } => Self::HASH_OF_BLOCK,
+            HashedBlockExists { hash: _ } => Self::HASHED_BLOCK_EXISTS,
         }
     }
 
@@ -146,6 +207,8 @@ impl<'a> ScopedKey<'a> {
             FileHandler { ino: _, handler: _ } => size_of::<u64>() * 2,
             FileIndex { parent: _, name } => size_of::<u64>() + name.len(),
             HashedBlock { hash: _ } => size_of::<inode::Hash>(),
+            HashOfBlock { ino: _, block: _ } => size_of::<u64>() * 2,
+            HashedBlockExists { hash: _ } => size_of::<inode::Hash>(),
         };
 
         return self.prefix.len() + 1 + kind_size;
@@ -173,6 +236,13 @@ impl<'a> ScopedKey<'a> {
                 data.extend(name.as_bytes().iter());
             }
             HashedBlock { hash } => {
+                data.extend(hash)
+            }
+            HashOfBlock { ino, block } => {
+                data.extend(ino.to_be_bytes().iter());
+                data.extend(block.to_be_bytes().iter())
+            }
+            HashedBlockExists { hash } => {
                 data.extend(hash)
             }
         }

@@ -1,9 +1,11 @@
+pub mod hash_block;
 pub mod async_fs;
 pub mod block;
 pub mod client;
 pub mod dir;
 pub mod error;
 pub mod file_handler;
+pub mod hashed_block;
 pub mod index;
 pub mod inode;
 pub mod key;

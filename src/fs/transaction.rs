@@ -1,11 +1,15 @@
-use std::ops::{Deref, DerefMut};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
+use std::ops::{Deref, DerefMut, Range};
 use std::time::SystemTime;
 
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
-use tikv_client::{Backoff, RetryOptions, Transaction, TransactionClient, TransactionOptions};
+use tikv_client::{Backoff, KvPair, RetryOptions, Transaction, TransactionClient, TransactionOptions};
 use tracing::{debug, instrument, trace};
+use tikv_client::transaction::Mutation;
 
 use crate::fs::meta::StaticFsParameters;
 
@@ -13,8 +17,11 @@ use super::block::empty_block;
 use super::dir::Directory;
 use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
+use super::hash_block::block_splitter::BlockSplitter;
+use super::hash_block::helpers::UpdateIrregularBlock;
+use super::hashed_block::HashBlockData;
 use super::index::Index;
-use super::inode::Inode;
+use super::inode::{self, BlockAddress, Inode, TiFsHash};
 use super::key::{ScopedKeyBuilder, ScopedKeyKind, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::{as_file_kind, as_file_perm, make_mode};
@@ -25,36 +32,6 @@ use super::tikv_fs::{DIR_PARENT, DIR_SELF};
 pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000, 100);
 pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000);
 pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
-
-
-struct BlockSplitter {
-    block_size: u64,
-    start: u64,
-    data: bytes::Bytes,
-    start_block_index: u64,
-    start_index_in_start_block: usize,
-}
-
-impl BlockSplitter {
-    fn new(block_size: u64, start: u64, data: bytes::Bytes) -> Self {
-
-        let start_block_index = start / block_size;
-        let start_index_in_start_block = (start % block_size) as usize;
-        Self {
-            block_size,
-            start,
-            data,
-            start_block_index,
-            start_index_in_start_block,
-        }
-    }
-
-    fn get_irregular_first_block_and_rest(&self) -> (u64,usize,&[u8],&[u8]) {
-        let first_block_remaining_space = self.block_size as usize - self.start_index_in_start_block;
-        let (first_block, rest) = self.data.split_at(first_block_remaining_space.min(self.data.len()));
-        (self.start_block_index, self.start_index_in_start_block, first_block, rest)
-    }
-}
 
 
 pub struct Txn<'a> {
@@ -90,7 +67,7 @@ impl<'a> Txn<'a> {
         key_builder: &'a ScopedKeyBuilder<'a>,
         client: &TransactionClient,
         hashed_blocks: bool,
-        block_size: u64,
+        block_size: usize,
         max_size: Option<u64>,
         max_name_len: u32,
     ) -> Result<Self> {
@@ -106,8 +83,8 @@ impl<'a> Txn<'a> {
             key_builder,
             txn,
             hashed_blocks,
-            block_size,
-            max_blocks: max_size.map(|size| size / block_size),
+            block_size: block_size as u64,
+            max_blocks: max_size.map(|size| size / block_size as u64),
             max_name_len,
         })
     }
@@ -154,7 +131,7 @@ impl<'a> Txn<'a> {
         let mut meta = self
             .read_meta()
             .await?
-            .unwrap_or_else(|| Meta::new(self.block_size, StaticFsParameters{
+            .unwrap_or_else(|| Meta::new(self.block_size as u64, StaticFsParameters{
                 hashed_blocks: self.hashed_blocks
             }));
         self.check_space_left(&meta)?;
@@ -365,8 +342,8 @@ impl<'a> Txn<'a> {
         }
 
         let target = start + size;
-        let start_block = start / self.block_size;
-        let end_block = (target + self.block_size - 1) / self.block_size;
+        let start_block = start / self.block_size as u64;
+        let end_block = (target + self.block_size as u64 - 1) / self.block_size as u64;
 
         let block_range = self.key_builder.block_range(ino, start_block..end_block);
         let pairs = self
@@ -430,10 +407,13 @@ impl<'a> Txn<'a> {
 
     pub async fn write_blocks_traditional(&mut self, ino: u64, start: u64, data: &Bytes) -> Result<()> {
 
-        let bs = BlockSplitter::new(self.block_size, start, data.clone());
-        let (mut block_index, start_index, first_block, mut rest) = bs.get_irregular_first_block_and_rest();
-
+        let mut block_index = start / self.block_size;
         let start_key = self.key_builder.block(ino, block_index);
+        let start_index = (start % self.block_size) as usize;
+
+        let first_block_size = self.block_size as usize - start_index;
+
+        let (first_block, mut rest) = data.split_at(first_block_size.min(data.len()));
 
         let mut start_value = self
             .get(start_key)
@@ -465,8 +445,138 @@ impl<'a> Txn<'a> {
         Ok(())
     }
 
-    pub async fn write_data_hashed_blocks(&self) -> Result<()> {
-        //let hash: blake3::Hash = blake3::hash(input);
+    pub async fn hb_get_block_hash_list_by_block_range(&mut self, ino: u64, block_range: Range<u64>) -> Result<HashMap<BlockAddress, inode::Hash>>
+    {
+        let range = self.key_builder.block_hash_range(ino, block_range.clone());
+        let iter = self
+            .scan(
+                range,
+                block_range.count() as u32,
+            )
+            .await?;
+        Ok(iter.filter_map(|pair| {
+            let Some(key) = self.key_builder.parse_key_block_address(pair.key().into()) else {
+                tracing::error!("failed parsing block address from response");
+                return None;
+            };
+            let hash = if pair.value().len() >= blake3::OUT_LEN {
+                let data: &[u8; blake3::OUT_LEN] = pair.value()[0..blake3::OUT_LEN].try_into().unwrap();
+                inode::Hash::from_bytes(data.to_owned())
+            } else {
+                tracing::error!("failed parsing hash value from response");
+                return None;
+            };
+            Some((key, hash))
+        }).collect())
+    }
+
+    // pub async fn hb_get_block_data_by_block_index(&mut self, inode: &Inode, index: u64) -> Result<HashedBlock> {
+    //     let Some(start_hash_vec) = &inode.block_hashes else {
+    //         return Ok(self.hb_new_block());
+    //     };
+
+    //     let maybe_hash = start_hash_vec.get(index as usize);
+    //     let Some(Some(hash)) = maybe_hash else {
+    //         return Ok(self.hb_new_block());
+    //     };
+
+    //     self.hb_get_block_data_by_hashes(&[hash])
+    //         .await?.into_iter().next().ok_or_else(FsError::BlockNotFound { inode: inode.ino, block: index })
+    // }
+
+    pub async fn hb_get_block_data_by_hashes(&mut self, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, HashBlockData<'_>>>
+    {
+        let key = hash_list.iter().map(|h| self.key_builder.hashed_block(&h)).collect::<Vec<_>>();
+        let data_list = self.txn.batch_get(key).await?;
+        Ok(data_list.into_iter().filter_map(|pair| {
+            let Some(hash) = self.key_builder.parse_key_hashed_block(pair.key().into()) else {
+                tracing::error!("failed parsing hash from response!");
+                return None;
+            };
+            Some((hash, Cow::Owned(pair.into_value())))
+        }).collect())
+    }
+
+    // pub async fn hb_irregular_update_block_data(
+    //     &mut self,
+    //     hash: inode::Hash,
+    //     start_write_pos: usize,
+    //     block_write_data: &[u8],
+    //     mutations: &mut Vec<Mutation>) -> Result<()> {
+
+    //     let existing_block_data = self.hb_get_block_data_by_block_index(&mut inode, block_index).await?;
+    //     if let Some(existing_hash) = &existing_block_data.hash {
+    //         mutations.push(Mutation::Delete(self.key_builder.hashed_block(existing_hash)))
+    //     }
+    //     existing_block_data.update_data_range(start_write_pos, block_write_data);
+    //     let new_hash = existing_block_data.update_hash();
+
+    //     mutations.push(Mutation::Put(self.key_builder.hashed_block(new_hash), new_hash.data));
+    //     Ok(())
+    // }
+
+    pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<()> {
+
+        let bs = BlockSplitter::new(self.block_size, start, &data);
+        let block_range = bs.get_range();
+        let hash_list_prev = self.hb_get_block_hash_list_by_block_range(inode.ino, block_range.clone()).await?;
+
+        let mut pre_data_hash_request = HashSet::<inode::Hash>::new();
+        let first_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
+            inode.ino, bs.first_data, bs.first_data_start_position, &hash_list_prev, &mut pre_data_hash_request
+        );
+        let last_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
+            inode.ino, bs.last_data, 0, &hash_list_prev, &mut pre_data_hash_request
+        );
+
+        let pre_data = self.hb_get_block_data_by_hashes(&pre_data_hash_request).await?;
+        let mut new_blocks = HashMap::new();
+        let mut new_block_hashes = HashMap::new();
+
+        first_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_hashes);
+        last_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_hashes);
+
+        for (index, chunk) in bs.mid_data.data.chunks(self.block_size as usize).enumerate() {
+            let hash = blake3::hash(chunk);
+            new_blocks.insert(hash, Cow::Borrowed(chunk));
+            new_block_hashes.insert(BlockAddress{ino: inode.ino, index: bs.mid_data.block_index + index as u64}, hash);
+        }
+
+        let exists_keys_request = new_blocks.keys().map(|k| self.key_builder.hashed_block_exists(k)).collect::<Vec<_>>();
+        let exists_keys_response = self.batch_get(exists_keys_request).await?.collect::<Vec<_>>();
+        for KvPair(key, _) in exists_keys_response.into_iter() {
+            let key = (&key).into();
+            let hash = self.key_builder.parse_key_hashed_block(key).ok_or(FsError::UnknownError("failed parsing hash from response".into()))?;
+            new_blocks.remove(&hash);
+        }
+
+        let mut mutations = Vec::<Mutation>::new();
+        // upload new blocks:
+        for (k, new_block) in new_blocks {
+            mutations.push(Mutation::Put(self.key_builder.hashed_block(&k).into(), new_block.into()));
+            mutations.push(Mutation::Put(self.key_builder.hashed_block_exists(&k).into(), vec![]));
+        }
+
+        // remove outdated blocks:
+        // TODO!
+
+        // filter out unchanged blocks:
+        for (address, prev_block_hash) in hash_list_prev.iter() {
+            if let Some(new_block_hash) = new_block_hashes.get(&address) {
+                if prev_block_hash == new_block_hash {
+                    new_block_hashes.remove(&address);
+                }
+            }
+        }
+
+        // write new block mapping:
+        for (k, new_hash) in new_block_hashes {
+            mutations.push(Mutation::Put(self.key_builder.block_hash(k).into(), new_hash.as_bytes().to_vec()));
+        }
+
+        // execute all
+        self.batch_mutate(mutations).await?;
+
         Ok(())
     }
 
@@ -491,7 +601,11 @@ impl<'a> Txn<'a> {
             return self.write_inline_data(&mut inode, start, &data).await;
         }
 
-        self.write_blocks_traditional(ino, start, &data).await?;
+        if self.hashed_blocks {
+            self.hb_write_data(&mut inode, start, &data).await?;
+        } else {
+            self.write_blocks_traditional(ino, start, &data).await?;
+        }
 
         inode.atime = SystemTime::now();
         inode.mtime = SystemTime::now();

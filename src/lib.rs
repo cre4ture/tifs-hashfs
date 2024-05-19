@@ -1,4 +1,5 @@
 #![feature(array_chunks)]
+#![feature(map_try_insert)]
 
 pub mod fs;
 
