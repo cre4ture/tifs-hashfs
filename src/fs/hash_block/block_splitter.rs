@@ -608,6 +608,14 @@ mod test_reader {
         assert_eq!(bs.end_block_index, 14);
     }
 
-
+    #[test]
+    fn read_issue_in_real_test() {
+        let bs = BlockSplitterRead::new(65536, 53248, 65536);
+        assert_eq!(bs.first_block_index, 0);
+        assert_eq!(bs.first_block_read_offset, 53248);
+        assert_eq!(bs.bytes_to_read_first_block, 12288);
+        assert_eq!(bs.block_count, 2);
+        assert_eq!(bs.end_block_index, 2);
+    }
 
 }

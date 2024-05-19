@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet}, ops::Deref, sync::Arc};
 
-use crate::fs::{hashed_block::{HashBlockData, HashedBlock}, inode::{BlockAddress, TiFsHash}};
+use crate::fs::{hashed_block::HashedBlock, inode::{BlockAddress, TiFsHash}};
 
 use super::block_splitter::BlockIndexAndData;
 
@@ -42,7 +42,7 @@ impl<'ol> UpdateIrregularBlock<'ol> {
     pub fn get_and_modify_block_and_publish_hash(
         &self,
         pre_data: &HashMap<TiFsHash, Arc<Vec<u8>>>,
-        new_blocks: &mut HashMap<TiFsHash, HashBlockData<'_>>,
+        new_blocks: &mut HashMap<TiFsHash, Arc<Vec<u8>>>,
         new_block_hashes: &mut HashMap<BlockAddress, TiFsHash>,
     ) {
         if self.block_splitter_data.data.len() > 0 {
@@ -54,7 +54,7 @@ impl<'ol> UpdateIrregularBlock<'ol> {
             };
             HashedBlock::update_data_range_in_vec(self.block_splitter_data_start_position, self.block_splitter_data.data, &mut modifiable);
             let new_hash = HashedBlock::calculate_hash(&modifiable);
-            let _ = new_blocks.try_insert(new_hash.clone(), HashBlockData::Owned(modifiable));
+            let _ = new_blocks.try_insert(new_hash.clone(), Arc::new(modifiable));
             new_block_hashes.insert(BlockAddress{ino: self.ino, index: self.block_splitter_data.block_index}, new_hash);
         }
     }

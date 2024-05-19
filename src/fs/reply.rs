@@ -1,3 +1,4 @@
+use std::any::type_name;
 use std::fmt::Debug;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -241,13 +242,16 @@ pub trait FsReply<T: Debug>: Sized {
     fn reply_err(self, err: libc::c_int);
 
     fn reply(self, id: u64, result: Result<T>) {
+        let tp = type_name::<T>();
         match result {
             Ok(item) => {
                 trace!("ok. reply for request({})", id);
+                eprintln!("ok. reply for request({}) - type: {}", id, tp);
                 self.reply_ok(item)
             }
             Err(err) => {
                 debug!("err. reply with {} for request ({})", err, id);
+                eprintln!("err. reply with {} for request ({}) - type: {}", err, id, tp);
 
                 let err = err.into();
                 if err == -1 {

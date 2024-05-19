@@ -30,6 +30,7 @@ where
     spawn(async move {
         trace!("reply to request({})", id);
         let result = f.await;
+        // TODO eprintln!("reply to request({}): {:?}", id, result);
         reply.reply(id, result);
     });
 }
@@ -676,10 +677,17 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         reply: ReplyData,
     ) {
         let async_impl = self.0.clone();
+        eprintln!("read request: id:{}, ino:{ino}, fh:{fh}, pos:{offset}, size:{size}, flags:{flags}", req.unique());
         spawn_reply(req.unique(), reply, async move {
-            async_impl
+            let r = async_impl
                 .read(ino, fh, offset, size, flags, lock_owner)
-                .await
+                .await;
+            if let Ok(data) = &r {
+                eprintln!("read done: len: {}", data.data.len());
+            } else {
+                eprintln!("read done: err: {:?}", r);
+            }
+            r
         });
     }
 

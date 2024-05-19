@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::iter::FromIterator;
@@ -327,12 +326,13 @@ impl<'a> Txn<'a> {
         eprintln!("hb_read_data(ino: {ino}, start:{start}, size: {size}) - block_size: {}, blocks_count: {}, range: [{}..{}[", bs.block_size, bs.block_count, block_range.start, block_range.end);
 
         let block_hashes = self.hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
-        eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
+        //eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
         let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
         let blocks_data = self.hb_get_block_data_by_hashes(&block_hashes_set).await?;
 
         let mut result = Vec::new();
         for block_index in block_range.clone() {
+            let rel_index = block_index - block_range.start;
 
             let addr = BlockAddress{ino, index: block_index};
             let block_data = if let Some(block_hash) = block_hashes.get(&addr) {
@@ -341,16 +341,16 @@ impl<'a> Txn<'a> {
                 } else { &vec![] }
             } else { &vec![] };
 
-
-            let (rd_start, rd_size) = match block_index {
-                1 => (bs.first_block_read_offset as usize, bs.bytes_to_read_first_block as usize),
+            let (rd_start, rd_size) = match rel_index {
+                0 => (bs.first_block_read_offset as usize, bs.bytes_to_read_first_block as usize),
                 _ => (0, (bs.size as usize - result.len()).min(bs.block_size as usize)),
             };
 
             if rd_start < block_data.len() {
                 // do a copy, as some blocks might be used multiple times
-                let rd_end = rd_start + rd_size;
-                result.extend_from_slice(&block_data[rd_start..rd_end.min(block_data.len())]);
+                let rd_end = (rd_start + rd_size).min(block_data.len());
+                eprintln!("extend (result.len(): {}) from slice ({block_index}): {rd_start}..{rd_end}", result.len());
+                result.extend_from_slice(&block_data[rd_start..rd_end]);
             }
         }
 
@@ -601,8 +601,12 @@ impl<'a> Txn<'a> {
 
         for (index, chunk) in bs.mid_data.data.chunks(self.block_size as usize).enumerate() {
             let hash = blake3::hash(chunk);
-            new_blocks.insert(hash, Cow::Borrowed(chunk));
+            new_blocks.insert(hash, Arc::new(chunk.to_vec()));
             new_block_hashes.insert(BlockAddress{ino: inode.ino, index: bs.mid_data.block_index + index as u64}, hash);
+        }
+
+        for (k, new_block) in &new_blocks {
+            self.block_cache.insert(*k, new_block.clone()).await;
         }
 
         let exists_keys_request = new_blocks.keys().map(|k| self.key_builder.hashed_block_exists(k)).collect::<Vec<_>>();
@@ -616,7 +620,7 @@ impl<'a> Txn<'a> {
         let mut mutations = Vec::<Mutation>::new();
         // upload new blocks:
         for (k, new_block) in new_blocks {
-            mutations.push(Mutation::Put(self.key_builder.hashed_block(&k).into(), new_block.into()));
+            mutations.push(Mutation::Put(self.key_builder.hashed_block(&k).into(), new_block.deref().clone()));
             mutations.push(Mutation::Put(self.key_builder.hashed_block_exists(&k).into(), vec![]));
         }
 

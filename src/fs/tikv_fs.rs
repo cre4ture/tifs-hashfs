@@ -251,8 +251,8 @@ impl TiFs {
         loop {
             match self.with_optimistic(&mut f).await {
                 Ok(v) => break Ok(v),
-                Err(FsError::KeyError(err)) => {
-                    eprintln!("{msg}: spin because of a key error({})", err);
+                Err(FsError::KeyError(_err)) => {
+                    eprintln!("{msg}: spin because of a key error"); //({}, {:?})", err, err);
                     if let Some(time) = delay {
                         sleep(time).await;
                     }
@@ -262,11 +262,12 @@ impl TiFs {
                         break Err(FsError::UnknownError(err));
                     }
                     other_error_count = other_error_count + 1;
-                    eprintln!("{msg}: spin because of a unknown error({})", err);
+                    eprintln!("{msg}: spin because of a unknown error({}, {:?})", err, err);
                     sleep(Duration::from_millis(100)).await;
                 }
+                Err(err @ FsError::FileNotFound { file: _ }) => return Err(err),
                 Err(err) => {
-                    eprintln!("{msg}: no spin, error({})", err);
+                    eprintln!("{msg}: no spin, error({}, {:?})", err, err);
                     return Err(err);
                 }
             }
@@ -661,6 +662,7 @@ impl AsyncFileSystem for TiFs {
 
         self.with_mut_data(|d|{
             d.file_handlers.remove(&fh);
+            d.freed_fhs.insert(fh);
         }).await?;
 
         Ok(result)
