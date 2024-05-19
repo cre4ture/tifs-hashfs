@@ -42,3 +42,7 @@ default = ["json"]
 
 binc = ["bincode"]
 json = ["serde_json"]
+
+
+[dev-dependencies]
+lazy_static="1.4"

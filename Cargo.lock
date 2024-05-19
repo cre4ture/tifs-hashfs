@@ -1862,6 +1862,7 @@ dependencies = [
  "clap",
  "fuser",
  "futures",
+ "lazy_static",
  "libc",
  "lru",
  "opentelemetry",

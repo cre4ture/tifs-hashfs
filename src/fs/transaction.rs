@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
+use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut, Range};
 use std::time::SystemTime;
 
@@ -17,7 +18,7 @@ use super::block::empty_block;
 use super::dir::Directory;
 use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
-use super::hash_block::block_splitter::BlockSplitter;
+use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::hashed_block::HashBlockData;
 use super::index::Index;
@@ -316,31 +317,38 @@ impl<'a> Txn<'a> {
         Ok(data)
     }
 
-    pub async fn read_data(
-        &mut self,
-        ino: u64,
-        start: u64,
-        chunk_size: Option<u64>,
-        update_atime: bool,
-    ) -> Result<Vec<u8>> {
-        let attr = self.read_inode(ino).await?;
-        if start >= attr.size {
-            return Ok(Vec::new());
+    async fn hb_read_data(&mut self, ino: u64, start: u64, size: u64) -> Result<Vec<u8>> {
+        let bs = BlockSplitterRead::new(self.block_size, start, size);
+
+        let block_range = bs.first_block_index..bs.end_block_index;
+        let block_hashes = self.hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
+        let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
+        let blocks_data = self.hb_get_block_data_by_hashes(&block_hashes_set).await?;
+
+        let mut result = Vec::new();
+        for block_index in block_range.clone() {
+
+            let addr = BlockAddress{ino, index: block_index};
+            let block_data = if let Some(block_hash) = block_hashes.get(&addr) {
+                if let Some(data) = blocks_data.get(block_hash) {
+                    data
+                } else { &HashBlockData::Borrowed(&[]) }
+            } else { &HashBlockData::Borrowed(&[]) };
+
+
+            let (rd_start, rd_size) = match block_index {
+                1 => (bs.first_block_read_offset as usize, bs.bytes_to_read_first_block as usize),
+                _ => (0, (bs.size as usize - result.len()).min(bs.block_size as usize)),
+            };
+
+            // do a copy, as some blocks might be used multiple times
+            result.extend_from_slice(&block_data[rd_start..(rd_start+rd_size)]);
         }
 
-        let max_size = attr.size - start;
-        let size = chunk_size.unwrap_or(max_size).min(max_size);
+        Ok(result)
+    }
 
-        if update_atime {
-            let mut attr = attr.clone();
-            attr.atime = SystemTime::now();
-            self.save_inode(&attr).await?;
-        }
-
-        if attr.inline_data.is_some() {
-            return self.read_inline_data(&attr, start, size).await;
-        }
-
+    async fn read_data_traditional(&mut self, ino: u64, start: u64, size: u64) -> Result<Vec<u8>> {
         let target = start + size;
         let start_block = start / self.block_size as u64;
         let end_block = (target + self.block_size as u64 - 1) / self.block_size as u64;
@@ -387,6 +395,38 @@ impl<'a> Txn<'a> {
 
         data.resize(size as usize, 0);
         Ok(data)
+    }
+
+    pub async fn read_data(
+        &mut self,
+        ino: u64,
+        start: u64,
+        chunk_size: Option<u64>,
+        update_atime: bool,
+    ) -> Result<Vec<u8>> {
+        let attr = self.read_inode(ino).await?;
+        if start >= attr.size {
+            return Ok(Vec::new());
+        }
+
+        let max_size = attr.size - start;
+        let size = chunk_size.unwrap_or(max_size).min(max_size);
+
+        if update_atime {
+            let mut attr = attr.clone();
+            attr.atime = SystemTime::now();
+            self.save_inode(&attr).await?;
+        }
+
+        if attr.inline_data.is_some() {
+            return self.read_inline_data(&attr, start, size).await;
+        }
+
+        if self.hashed_blocks {
+            self.hb_read_data(ino, start, size).await
+        } else {
+            self.read_data_traditional(ino, start, size).await
+        }
     }
 
     pub async fn clear_data(&mut self, ino: u64) -> Result<u64> {
@@ -517,7 +557,7 @@ impl<'a> Txn<'a> {
 
     pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<()> {
 
-        let bs = BlockSplitter::new(self.block_size, start, &data);
+        let bs = BlockSplitterWrite::new(self.block_size, start, &data);
         let block_range = bs.get_range();
         let hash_list_prev = self.hb_get_block_hash_list_by_block_range(inode.ino, block_range.clone()).await?;
 
