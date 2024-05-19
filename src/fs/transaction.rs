@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut, Range};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -12,7 +13,6 @@ use tikv_client::{Backoff, KvPair, RetryOptions, Transaction, TransactionClient,
 use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
 
-use crate::fs::block;
 use crate::fs::meta::StaticFsParameters;
 
 use super::block::empty_block;
@@ -21,14 +21,13 @@ use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
-use super::hashed_block::HashBlockData;
 use super::index::Index;
 use super::inode::{self, BlockAddress, Inode, TiFsHash};
 use super::key::{ScopedKeyBuilder, ScopedKeyKind, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::{as_file_kind, as_file_perm, make_mode};
 use super::reply::{DirItem, StatFs};
-use super::tikv_fs::{DIR_PARENT, DIR_SELF};
+use super::tikv_fs::{TiFsBlockCache, DIR_PARENT, DIR_SELF};
 
 
 pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000, 100);
@@ -43,6 +42,7 @@ pub struct Txn<'a> {
     block_size: u64,
     max_blocks: Option<u64>,
     max_name_len: u32,
+    block_cache: TiFsBlockCache,
 }
 
 impl<'a> Txn<'a> {
@@ -69,7 +69,8 @@ impl<'a> Txn<'a> {
         key_builder: &'a ScopedKeyBuilder<'a>,
         client: &TransactionClient,
         hashed_blocks: bool,
-        block_size: usize,
+        block_size: u64,
+        block_cache: TiFsBlockCache,
         max_size: Option<u64>,
         max_name_len: u32,
     ) -> Result<Self> {
@@ -88,6 +89,7 @@ impl<'a> Txn<'a> {
             block_size: block_size as u64,
             max_blocks: max_size.map(|size| size / block_size as u64),
             max_name_len,
+            block_cache,
         })
     }
 
@@ -335,9 +337,9 @@ impl<'a> Txn<'a> {
             let addr = BlockAddress{ino, index: block_index};
             let block_data = if let Some(block_hash) = block_hashes.get(&addr) {
                 if let Some(data) = blocks_data.get(block_hash) {
-                    data
-                } else { &HashBlockData::Borrowed(&[]) }
-            } else { &HashBlockData::Borrowed(&[]) };
+                    data.deref()
+                } else { &vec![] }
+            } else { &vec![] };
 
 
             let (rd_start, rd_size) = match block_index {
@@ -531,17 +533,29 @@ impl<'a> Txn<'a> {
     //         .await?.into_iter().next().ok_or_else(FsError::BlockNotFound { inode: inode.ino, block: index })
     // }
 
-    pub async fn hb_get_block_data_by_hashes(&mut self, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, HashBlockData<'_>>>
+    pub async fn hb_get_block_data_by_hashes(&mut self, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, Arc<Vec<u8>>>>
     {
-        let key = hash_list.iter().map(|h| self.key_builder.hashed_block(&h)).collect::<Vec<_>>();
-        let data_list = self.txn.batch_get(key).await?;
-        Ok(data_list.into_iter().filter_map(|pair| {
-            let Some(hash) = self.key_builder.parse_key_hashed_block(pair.key().into()) else {
+        let mut result = HashMap::new();
+        let mut keys = Vec::new();
+        for hash in hash_list {
+            if let Some(cached) = self.block_cache.get(hash).await {
+                result.insert(*hash, cached);
+            } else {
+                keys.push(self.key_builder.hashed_block(hash));
+            }
+        }
+
+        let rcv_data_list = self.txn.batch_get(keys).await?;
+        for pair in rcv_data_list {
+            if let Some(hash) = self.key_builder.parse_key_hashed_block(pair.key().into()) {
+                let value = Arc::new(pair.into_value());
+                result.insert(hash, value.clone());
+                self.block_cache.insert(hash, value).await;
+            } else {
                 tracing::error!("failed parsing hash from response!");
-                return None;
-            };
-            Some((hash, Cow::Owned(pair.into_value())))
-        }).collect())
+            }
+        }
+        Ok(result)
     }
 
     // pub async fn hb_irregular_update_block_data(
@@ -566,7 +580,7 @@ impl<'a> Txn<'a> {
 
         let bs = BlockSplitterWrite::new(self.block_size, start, &data);
         let block_range = bs.get_range();
-        eprintln!("hb_write_data(ino: {}, start:{}, size: {}) - block_size: {}, blocks_count: {}, range: [{}..{}[", inode.ino, start, data.len(), bs.block_size, block_range.count(), block_range.start, block_range.end);
+        eprintln!("hb_write_data(ino: {}, start:{}, size: {}) - block_size: {}, blocks_count: {}, range: [{}..{}[", inode.ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
 
         let hash_list_prev = self.hb_get_block_hash_list_by_block_range(inode.ino, block_range.clone()).await?;
 

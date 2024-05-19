@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, ops::Deref, sync::Arc};
 
 use crate::fs::{hashed_block::{HashBlockData, HashedBlock}, inode::{BlockAddress, TiFsHash}};
 
@@ -41,14 +41,14 @@ impl<'ol> UpdateIrregularBlock<'ol> {
 
     pub fn get_and_modify_block_and_publish_hash(
         &self,
-        pre_data: &HashMap<TiFsHash, HashBlockData<'_>>,
+        pre_data: &HashMap<TiFsHash, Arc<Vec<u8>>>,
         new_blocks: &mut HashMap<TiFsHash, HashBlockData<'_>>,
         new_block_hashes: &mut HashMap<BlockAddress, TiFsHash>,
     ) {
         if self.block_splitter_data.data.len() > 0 {
             let original = self.original_data_hash.and_then(|h| pre_data.get(&h));
             let mut modifiable = if let Some(orig) = original {
-                orig.clone().into_owned()
+                orig.deref().clone()
             } else {
                 Vec::new()
             };

@@ -4,6 +4,7 @@ use std::future::Future;
 use std::matches;
 use std::ops::DerefMut;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::anyhow;
@@ -13,6 +14,7 @@ use bytestring::ByteString;
 use fuser::consts::FOPEN_DIRECT_IO;
 use fuser::*;
 use libc::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET};
+use moka::future::Cache;
 use parse_size::parse_size;
 use tikv_client::{Config, TransactionClient};
 use tokio::sync::RwLock;
@@ -23,6 +25,7 @@ use super::async_fs::AsyncFileSystem;
 use super::dir::Directory;
 use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
+use super::inode::TiFsHash;
 use super::key::{ScopedKeyBuilder, ROOT_INODE};
 use super::mode::make_mode;
 use super::reply::{
@@ -34,19 +37,23 @@ use crate::MountOption;
 pub const DIR_SELF: ByteString = ByteString::from_static(".");
 pub const DIR_PARENT: ByteString = ByteString::from_static("..");
 
+pub type TiFsBlockCache = Cache<TiFsHash, Arc<Vec<u8>>>;
+
 struct TiFsMutable {
     pub freed_fhs: HashSet<u64>,
     pub next_fh: u64,
     pub file_handlers: HashMap<u64, FileHandler>,
+    pub block_cache: TiFsBlockCache,
 }
 
 impl TiFsMutable {
 
-    fn new() -> Self {
+    fn new(block_size: u64) -> Self {
         Self {
             freed_fhs: HashSet::new(),
             next_fh: 0,
             file_handlers: HashMap::new(),
+            block_cache: Cache::new((100 << 20) / block_size),
         }
     }
 
@@ -74,7 +81,7 @@ pub struct TiFs {
     pub config: Config,
     pub client: TransactionClient,
     pub direct_io: bool,
-    pub block_size: usize,
+    pub block_size: u64,
     pub max_size: Option<u64>,
     pub enable_atime: bool,
     pub hashed_blocks: bool,
@@ -85,7 +92,7 @@ type BoxedFuture<'a, T> = Pin<Box<dyn 'a + Send + Future<Output = Result<T>>>>;
 
 impl TiFs {
     pub const SCAN_LIMIT: u32 = 1 << 10;
-    pub const DEFAULT_BLOCK_SIZE: usize = 1 << 16;
+    pub const DEFAULT_BLOCK_SIZE: u64 = 1 << 16;
     pub const MAX_NAME_LEN: u32 = 1 << 8;
 
     #[instrument]
@@ -102,6 +109,24 @@ impl TiFs {
             .await
             .map_err(|err| anyhow!("{}", err))?;
         info!("connected to pd endpoints: {:?}", pd_endpoints);
+
+        let block_size = options
+            .iter()
+            .find_map(|option| match option {
+                MountOption::BlkSize(size) => parse_size(size)
+                    .map_err(|err| {
+                        error!("fail to parse blksize({}): {}", size, err);
+                        err
+                    })
+                    .map(|size| {
+                        debug!("block size: {}", size);
+                        size
+                    })
+                    .ok(),
+                _ => None,
+            })
+            .unwrap_or(Self::DEFAULT_BLOCK_SIZE);
+
         let fs = TiFs {
             name,
             client,
@@ -110,22 +135,7 @@ impl TiFs {
             direct_io: options
                 .iter()
                 .any(|option| matches!(option, MountOption::DirectIO)),
-            block_size: options
-                .iter()
-                .find_map(|option| match option {
-                    MountOption::BlkSize(size) => parse_size(size)
-                        .map_err(|err| {
-                            error!("fail to parse blksize({}): {}", size, err);
-                            err
-                        })
-                        .map(|size| {
-                            debug!("block size: {}", size);
-                            size as usize
-                        })
-                        .ok(),
-                    _ => None,
-                })
-                .unwrap_or(Self::DEFAULT_BLOCK_SIZE),
+            block_size,
             max_size: options.iter().find_map(|option| match option {
                 MountOption::MaxSize(size) => parse_size(size)
                     .map_err(|err| {
@@ -147,7 +157,7 @@ impl TiFs {
             hashed_blocks: options.iter().find_map(|opt|{
                 (MountOption::HashedBlocks == *opt).then_some(true)
             }).unwrap_or(false),
-            mut_data: RwLock::new(TiFsMutable::new()),
+            mut_data: RwLock::new(TiFsMutable::new(block_size)),
         };
 
         fs.check_metadata().await?;
@@ -216,12 +226,15 @@ impl TiFs {
         T: 'static + Send,
         F: for<'a> FnOnce(&'a TiFs, &'a mut Txn) -> BoxedFuture<'a, T>,
     {
+        let block_cache = self.mut_data.read().await.block_cache.clone();
+
         let key_builder = ScopedKeyBuilder::new(&self.name);
         let mut txn = Txn::begin_optimistic(
             &key_builder,
             &self.client,
             self.hashed_blocks,
             self.block_size,
+            block_cache,
             self.max_size,
             Self::MAX_NAME_LEN,
         )
