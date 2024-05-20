@@ -28,7 +28,7 @@ impl Default for StaticFsParameters {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Meta {
-    pub inode_next: u64,
+    pub inode_next: u64, // TODO: get rid of global counter
     pub block_size: u64,
     pub last_stat: Option<StatFs>,
     pub config_flags: Option<StaticFsParameters>,

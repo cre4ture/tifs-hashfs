@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::matches;
-use std::ops::DerefMut;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -16,7 +16,7 @@ use fuser::*;
 use libc::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET};
 use moka::future::Cache;
 use parse_size::parse_size;
-use tikv_client::{Config, TransactionClient};
+use tikv_client::Config;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
@@ -26,19 +26,21 @@ use super::async_fs::AsyncFileSystem;
 use super::dir::Directory;
 use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
-use super::inode::TiFsHash;
+use super::inode::{Inode, TiFsHash};
 use super::key::{ScopedKeyBuilder, ROOT_INODE};
 use super::mode::make_mode;
 use super::reply::{
     get_time, Attr, Create, Data, Dir, Entry, Lock, Lseek, Open, StatFs, Write, Xattr,
 };
 use super::transaction::Txn;
+use super::transaction_client_mux::TransactionClientMux;
 use crate::MountOption;
 
 pub const DIR_SELF: ByteString = ByteString::from_static(".");
 pub const DIR_PARENT: ByteString = ByteString::from_static("..");
 
 pub type TiFsBlockCache = Cache<TiFsHash, Arc<Vec<u8>>>;
+pub type TiFsInodeCache = Cache<u64, (Instant, Arc<Inode>)>;
 
 #[derive(Clone, Debug)]
 pub struct InoUse {
@@ -59,12 +61,18 @@ impl Drop for InoUse {
     }
 }
 
+#[derive(Clone)] // Caches do only clone reference, not content
+pub struct TiFsCaches {
+    pub block: TiFsBlockCache,
+    pub inode: TiFsInodeCache,
+}
+
 struct TiFsMutable {
     pub freed_fhs: HashSet<u64>,
     pub next_fh: u64,
     pub opened_ino: HashMap<u64, Weak<InoUse>>,
     pub file_handlers: HashMap<u64, FileHandler>,
-    pub block_cache: TiFsBlockCache,
+    pub caches: TiFsCaches,
 }
 
 impl TiFsMutable {
@@ -75,7 +83,10 @@ impl TiFsMutable {
             next_fh: 0,
             opened_ino: HashMap::new(),
             file_handlers: HashMap::new(),
-            block_cache: Cache::new((100 << 20) / block_size),
+            caches: TiFsCaches{
+                block: Cache::new((100 << 20) / block_size),
+                inode: Cache::new((10 << 20) / (block_size / 16)),
+            }
         }
     }
 
@@ -107,7 +118,7 @@ pub struct TiFs {
     pub instance_id: Uuid,
     pub pd_endpoints: Vec<String>,
     pub config: Config,
-    pub client: TransactionClient,
+    pub client: TransactionClientMux,
     pub direct_io: bool,
     pub block_size: u64,
     pub max_size: Option<u64>,
@@ -133,7 +144,7 @@ impl TiFs {
     where
         S: Clone + Debug + Into<String>,
     {
-        let client = TransactionClient::new_with_config(pd_endpoints.clone(), cfg.clone())
+        let client = TransactionClientMux::new(pd_endpoints.clone().into_iter().map(|s|s.into()).collect::<Vec<_>>(), cfg.clone())
             .await
             .map_err(|err| anyhow!("{}", err))?;
         info!("connected to pd endpoints: {:?}", pd_endpoints);
@@ -239,7 +250,7 @@ impl TiFs {
             Ok(v) => {
                 let commit_start = SystemTime::now();
                 txn.commit().await?;
-                debug!(
+                eprintln!(
                     "transaction committed in {} ms",
                     commit_start.elapsed().unwrap().as_millis()
                 );
@@ -258,7 +269,7 @@ impl TiFs {
         T: 'static + Send,
         F: for<'a> FnOnce(&'a TiFs, &'a mut Txn) -> BoxedFuture<'a, T>,
     {
-        let block_cache = self.mut_data.read().await.block_cache.clone();
+        let block_cache = self.mut_data.read().await.caches.clone();
 
         let key_builder = ScopedKeyBuilder::new(&self.name);
         let mut txn = Txn::begin_optimistic(
@@ -338,7 +349,7 @@ impl TiFs {
         while !self
             .spin_no_delay("setlkw", move |_, txn| {
                 Box::pin(async move {
-                    let mut inode = txn.read_inode(ino).await?;
+                    let mut inode = txn.read_inode(ino).await?.deref().clone();
                     match typ {
                         F_WRLCK => {
                             if inode.lock_state.owner_set.len() > 1 {
@@ -346,13 +357,13 @@ impl TiFs {
                             } else if inode.lock_state.owner_set.is_empty() {
                                 inode.lock_state.lk_type = F_WRLCK;
                                 inode.lock_state.owner_set.insert(lock_owner);
-                                txn.save_inode(&inode).await?;
+                                txn.save_inode(&Arc::new(inode)).await?;
                                 Ok(true)
                             } else if inode.lock_state.owner_set.get(&lock_owner)
                                 == Some(&lock_owner)
                             {
                                 inode.lock_state.lk_type = F_WRLCK;
-                                txn.save_inode(&inode).await?;
+                                txn.save_inode(&Arc::new(inode)).await?;
                                 Ok(true)
                             } else {
                                 Err(FsError::InvalidLock)
@@ -364,7 +375,7 @@ impl TiFs {
                             } else {
                                 inode.lock_state.lk_type = F_RDLCK;
                                 inode.lock_state.owner_set.insert(lock_owner);
-                                txn.save_inode(&inode).await?;
+                                txn.save_inode(&Arc::new(inode)).await?;
                                 Ok(true)
                             }
                         }
@@ -454,7 +465,7 @@ impl AsyncFileSystem for TiFs {
             let name = name.clone();
             Box::pin(async move {
                 let ino = txn.lookup(parent, name).await?;
-                Ok(Entry::new(txn.read_inode(ino).await?.into(), 0))
+                Ok(Entry::new(txn.read_inode(ino).await?.deref().clone().into(), 0))
             })
         })
         .await
@@ -485,7 +496,7 @@ impl AsyncFileSystem for TiFs {
         self.spin_no_delay("setattr", move |_, txn| {
             Box::pin(async move {
                 // TODO: how to deal with fh, chgtime, bkuptime?
-                let mut attr = txn.read_inode(ino).await?;
+                let mut attr = txn.read_inode(ino).await?.deref().clone();
                 attr.perm = match mode {
                     Some(m) => m as _,
                     None => attr.perm,
@@ -505,7 +516,7 @@ impl AsyncFileSystem for TiFs {
                 attr.ctime = ctime.unwrap_or_else(SystemTime::now);
                 attr.crtime = crtime.unwrap_or(attr.crtime);
                 attr.flags = flags.unwrap_or(attr.flags);
-                txn.save_inode(&attr).await?;
+                txn.save_inode(&Arc::new(attr.clone())).await?;
                 Ok(Attr {
                     time: get_time(),
                     attr: attr.into(),
@@ -628,7 +639,7 @@ impl AsyncFileSystem for TiFs {
         let attr = self
             .spin_no_delay("mkdir", move |_, txn| Box::pin(txn.mkdir(parent, name.clone(), mode, gid, uid)))
             .await?;
-        Ok(Entry::new(attr.into(), 0))
+        Ok(Entry::new(attr.file_attr, 0))
     }
 
     #[tracing::instrument]
@@ -655,7 +666,7 @@ impl AsyncFileSystem for TiFs {
                 Box::pin(txn.make_inode(parent, name.clone(), mode, gid, uid, rdev))
             })
             .await?;
-        Ok(Entry::new(attr.into(), 0))
+        Ok(Entry::new(attr.file_attr, 0))
     }
 
     #[tracing::instrument]
@@ -738,7 +749,7 @@ impl AsyncFileSystem for TiFs {
         let inode = self
             .spin_no_delay("link", move |_, txn| Box::pin(txn.link(ino, newparent, newname.clone())))
             .await?;
-        Ok(Entry::new(inode.into(), 0))
+        Ok(Entry::new(inode.file_attr, 0))
     }
 
     async fn unlink(&self, parent: u64, raw_name: ByteString) -> Result<()> {
@@ -785,26 +796,35 @@ impl AsyncFileSystem for TiFs {
         link: ByteString,
     ) -> Result<Entry> {
         Self::check_file_name(&name)?;
-        self.spin_no_delay("symlink", move |_, txn| {
-            let name = name.clone();
-            let link = link.clone();
+        let name_clone1 = name.clone();
+        let ino = self.spin_no_delay("inode for symlink", move |_, txn| {
+            let name = name_clone1.clone();
             Box::pin(async move {
-                let mut attr = txn
-                    .make_inode(
-                        parent,
-                        name,
-                        make_mode(FileType::Symlink, 0o777),
-                        gid,
-                        uid,
-                        0,
-                    )
-                    .await?;
-
-                txn.write_link(&mut attr, link.into_bytes()).await?;
-                Ok(Entry::new(attr.into(), 0))
+                if txn.check_if_dir_entry_exists(parent, &name).await? {
+                    return Err(FsError::FileExist {
+                        file: name.to_string(),
+                    });
+                }
+                txn.reserve_new_ino().await
             })
-        })
-        .await
+        }).await?;
+
+        let mode = make_mode(FileType::Symlink, 0o777);
+        let mut inode = Txn::initialize_inode(self.block_size, ino, mode, gid, uid, 0);
+        Txn::set_fresh_inode_to_link(&mut inode, link.into_bytes());
+        let ptr = Arc::new(inode);
+        let ptr_clone1 = ptr.clone();
+
+        self.spin_no_delay("symlink inode", move |_, txn| {
+            let name = name.clone();
+            let ptr = ptr_clone1.clone();
+            Box::pin(async move {
+                txn.save_inode(&ptr).await?;
+                txn.connect_inode_to_directory(parent, &name, ptr.deref()).await
+            })
+        }).await?;
+
+        Ok(Entry::new(ptr.file_attr, 0))
     }
 
     async fn readlink(&self, ino: u64) -> Result<Data> {
@@ -826,7 +846,7 @@ impl AsyncFileSystem for TiFs {
     ) -> Result<()> {
         self.spin_no_delay("fallocate", move |_, txn| {
             Box::pin(async move {
-                let mut inode = txn.read_inode(ino).await?;
+                let mut inode = txn.read_inode(ino).await?.deref().clone();
                 txn.fallocate(&mut inode, offset, length).await
             })
         })
@@ -855,7 +875,7 @@ impl AsyncFileSystem for TiFs {
         let typ = typ as i16;
         let not_again = self.spin_no_delay("setlk", move |_, txn| {
             Box::pin(async move {
-                let mut inode = txn.read_inode(ino).await?;
+                let mut inode = txn.read_inode(ino).await?.deref().clone();
                 warn!("setlk, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
                 if inode.file_attr.kind == FileType::Directory {
                     return Err(FsError::InvalidLock);
@@ -872,16 +892,16 @@ impl AsyncFileSystem for TiFs {
                     F_RDLCK => {
                         inode.lock_state.owner_set.insert(lock_owner);
                         inode.lock_state.lk_type = F_RDLCK;
-                        txn.save_inode(&inode).await?;
                         warn!("setlk F_RDLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
+                        txn.save_inode(&Arc::new(inode)).await?;
                         Ok(true)
                     }
                     F_WRLCK => match inode.lock_state.lk_type {
                         F_RDLCK if inode.lock_state.owner_set.len() == 1
                         && inode.lock_state.owner_set.get(&lock_owner) == Some(&lock_owner)  => {
                             inode.lock_state.lk_type = F_WRLCK;
-                            txn.save_inode(&inode).await?;
                             warn!("setlk F_WRLCK on F_RDLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
+                            txn.save_inode(&Arc::new(inode)).await?;
                             Ok(true)
                         }
                         F_RDLCK if sleep => {
@@ -894,7 +914,7 @@ impl AsyncFileSystem for TiFs {
                             inode.lock_state.owner_set.insert(lock_owner);
                             inode.lock_state.lk_type = F_WRLCK;
                             warn!("setlk F_WRLCK on F_UNLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
-                            txn.save_inode(&inode).await?;
+                            txn.save_inode(&Arc::new(inode)).await?;
                             Ok(true)
                         },
                         F_WRLCK if sleep => {
@@ -909,8 +929,8 @@ impl AsyncFileSystem for TiFs {
                         if inode.lock_state.owner_set.is_empty() {
                             inode.lock_state.lk_type = F_UNLCK;
                         }
-                        txn.save_inode(&inode).await?;
                         warn!("setlk F_UNLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
+                        txn.save_inode(&Arc::new(inode)).await?;
                         Ok(true)
                     }
                     _ => Err(FsError::InvalidLock),

@@ -3,17 +3,18 @@ use std::convert::TryInto;
 use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut, Range};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
-use tikv_client::{Backoff, KvPair, RetryOptions, Transaction, TransactionClient, TransactionOptions};
+use tikv_client::{Backoff, KvPair, RetryOptions, Transaction, TransactionOptions};
 use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
 use uuid::Uuid;
 
 use crate::fs::meta::StaticFsParameters;
+use crate::fs::utils::stop_watch::{AutoStopWatch, StopWatch};
 
 use super::block::empty_block;
 use super::dir::Directory;
@@ -27,13 +28,13 @@ use super::key::{ScopedKeyBuilder, ScopedKeyKind, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::{as_file_kind, as_file_perm, make_mode};
 use super::reply::{DirItem, StatFs};
-use super::tikv_fs::{TiFsBlockCache, DIR_PARENT, DIR_SELF};
+use super::tikv_fs::{TiFsCaches, DIR_PARENT, DIR_SELF};
+use super::transaction_client_mux::TransactionClientMux;
 
 
 pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000, 100);
 pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000);
 pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
-
 
 pub struct Txn<'a> {
     key_builder: &'a ScopedKeyBuilder<'a>,
@@ -43,7 +44,7 @@ pub struct Txn<'a> {
     block_size: u64,
     max_blocks: Option<u64>,
     max_name_len: u32,
-    block_cache: TiFsBlockCache,
+    caches: TiFsCaches,
 }
 
 impl<'a> Txn<'a> {
@@ -69,10 +70,10 @@ impl<'a> Txn<'a> {
     pub async fn begin_optimistic(
         key_builder: &'a ScopedKeyBuilder<'a>,
         instance_id: Uuid,
-        client: &TransactionClient,
+        client: &TransactionClientMux,
         hashed_blocks: bool,
         block_size: u64,
-        block_cache: TiFsBlockCache,
+        caches: TiFsCaches,
         max_size: Option<u64>,
         max_name_len: u32,
     ) -> Result<Self> {
@@ -81,7 +82,7 @@ impl<'a> Txn<'a> {
             region_backoff: DEFAULT_REGION_BACKOFF,
             lock_backoff: OPTIMISTIC_BACKOFF,
         });
-        let txn: Transaction = client
+        let txn: Transaction = client.give_one()
             .begin_with_options(options)
             .await?;
         Ok(Txn {
@@ -92,7 +93,7 @@ impl<'a> Txn<'a> {
             block_size: block_size as u64,
             max_blocks: max_size.map(|size| size / block_size as u64),
             max_name_len,
-            block_cache,
+            caches,
         })
     }
 
@@ -133,50 +134,26 @@ impl<'a> Txn<'a> {
         self.write_data(ino, start as u64, data).await
     }
 
-    pub async fn make_inode(
-        &mut self,
-        parent: u64,
-        name: ByteString,
-        mode: u32,
-        gid: u32,
-        uid: u32,
-        rdev: u32,
-    ) -> Result<Inode> {
+    pub async fn reserve_new_ino(&mut self) -> Result<u64> {
         let mut meta = self
             .read_meta()
             .await?
             .unwrap_or_else(|| Meta::new(self.block_size as u64, StaticFsParameters{
                 hashed_blocks: self.hashed_blocks
             }));
+
         self.check_space_left(&meta)?;
+
         let ino = meta.inode_next;
         meta.inode_next += 1;
 
         debug!("get ino({})", ino);
         self.save_meta(&meta).await?;
+        Ok(ino)
+    }
 
+    pub fn initialize_inode(block_size: u64, ino: u64, mode: u32, gid: u32, uid: u32, rdev: u32,) -> Inode {
         let file_type = as_file_kind(mode);
-        if parent >= ROOT_INODE {
-            if self.get_index(parent, name.clone()).await?.is_some() {
-                return Err(FsError::FileExist {
-                    file: name.to_string(),
-                });
-            }
-            self.set_index(parent, name.clone(), ino).await?;
-
-            let mut dir = self.read_dir(parent).await?;
-            debug!("read dir({:?})", &dir);
-
-            dir.push(DirItem {
-                ino,
-                name: name.to_string(),
-                typ: file_type,
-            });
-
-            self.save_dir(parent, &dir).await?;
-            // TODO: update attributes of directory
-        }
-
         let inode = FileAttr {
             ino,
             size: 0,
@@ -191,15 +168,62 @@ impl<'a> Txn<'a> {
             uid,
             gid,
             rdev,
-            blksize: self.block_size as u32,
+            blksize: block_size as u32,
             flags: 0,
         }
         .into();
 
         debug!("made inode ({:?})", &inode);
+        inode
+    }
 
-        self.save_inode(&inode).await?;
-        Ok(inode)
+    pub async fn check_if_dir_entry_exists(&mut self, parent: u64, name: &ByteString) -> Result<bool> {
+        Ok(self.get_index(parent, name.clone()).await?.is_some())
+    }
+
+    pub async fn connect_inode_to_directory(&mut self, parent: u64, name: &ByteString, inode: &Inode) -> Result<()> {
+        if parent >= ROOT_INODE {
+            if self.check_if_dir_entry_exists(parent, name).await? {
+                return Err(FsError::FileExist {
+                    file: name.to_string(),
+                });
+            }
+            self.set_index(parent, name.clone(), inode.ino).await?;
+
+            let mut dir = self.read_dir(parent).await?;
+            debug!("read dir({:?})", &dir);
+
+            dir.push(DirItem {
+                ino: inode.ino,
+                name: name.to_string(),
+                typ: inode.kind,
+            });
+
+            self.save_dir(parent, &dir).await?;
+            // TODO: update attributes of directory
+        }
+        Ok(())
+    }
+
+    pub async fn make_inode(
+        &mut self,
+        parent: u64,
+        name: ByteString,
+        mode: u32,
+        gid: u32,
+        uid: u32,
+        rdev: u32,
+    ) -> Result<Arc<Inode>> {
+        let ino = self.reserve_new_ino().await?;
+
+        let inode = Self::initialize_inode(self.block_size, ino, mode, gid, uid, rdev);
+
+        self.connect_inode_to_directory(parent, &name, &inode).await?;
+
+        let ptr = Arc::new(inode);
+
+        self.save_inode(&ptr).await?;
+        Ok(ptr)
     }
 
     pub async fn get_index(&mut self, parent: u64, name: ByteString) -> Result<Option<u64>> {
@@ -225,22 +249,38 @@ impl<'a> Txn<'a> {
         Ok(self.delete(key).await?)
     }
 
-    pub async fn read_inode(&mut self, ino: u64) -> Result<Inode> {
+    pub async fn read_inode_uncached(&mut self, ino: u64) -> Result<Arc<Inode>> {
         let key = self.key_builder.inode(ino);
         let value = self
             .get(key)
             .await?
             .ok_or(FsError::InodeNotFound { inode: ino })?;
-        Ok(Inode::deserialize(&value)?)
+        let inode = Arc::new(Inode::deserialize(&value)?);
+        self.caches.inode.insert(ino, (Instant::now(), inode.clone())).await;
+        Ok(inode)
     }
 
-    pub async fn save_inode(&mut self, inode: &Inode) -> Result<()> {
+    pub async fn read_inode(&mut self, ino: u64) -> Result<Arc<Inode>> {
+        if let Some((time, value)) = self.caches.inode.get(&ino).await {
+            if time.elapsed().as_secs() < 2 {
+                return Ok(value);
+            } else {
+                self.caches.inode.remove(&ino).await;
+            }
+        }
+
+        self.read_inode_uncached(ino).await
+    }
+
+    pub async fn save_inode(&mut self, inode: &Arc<Inode>) -> Result<()> {
         let key = self.key_builder.inode(inode.ino);
 
         if inode.nlink == 0 && inode.opened_fh == 0 {
             self.delete(key).await?;
+            self.caches.inode.remove(&inode.ino).await;
         } else {
             self.put(key, inode.serialize()?).await?;
+            self.caches.inode.insert(inode.ino, (Instant::now(), inode.clone())).await;
             debug!("save inode: {:?}", inode);
         }
         Ok(())
@@ -304,7 +344,7 @@ impl<'a> Txn<'a> {
         inode.ctime = SystemTime::now();
         inode.set_size(inlined.len() as u64, self.block_size);
         inode.inline_data = Some(inlined);
-        self.save_inode(inode).await?;
+        self.save_inode(&Arc::new(inode.clone())).await?;
 
         Ok(size)
     }
@@ -438,9 +478,9 @@ impl<'a> Txn<'a> {
         let size = chunk_size.unwrap_or(max_size).min(max_size);
 
         if update_atime {
-            let mut attr = attr.clone();
+            let mut attr = attr.deref().clone();
             attr.atime = SystemTime::now();
-            self.save_inode(&attr).await?;
+            self.save_inode(&Arc::new(attr)).await?;
         }
 
         if attr.inline_data.is_some() {
@@ -455,7 +495,7 @@ impl<'a> Txn<'a> {
     }
 
     pub async fn clear_data(&mut self, ino: u64) -> Result<u64> {
-        let mut attr = self.read_inode(ino).await?;
+        let mut attr = self.read_inode(ino).await?.deref().clone();
         let end_block = (attr.size + self.block_size - 1) / self.block_size;
 
         for block in 0..end_block {
@@ -466,7 +506,7 @@ impl<'a> Txn<'a> {
         let clear_size = attr.size;
         attr.size = 0;
         attr.atime = SystemTime::now();
-        self.save_inode(&attr).await?;
+        self.save_inode(&Arc::new(attr)).await?;
         Ok(clear_size)
     }
 
@@ -540,7 +580,7 @@ impl<'a> Txn<'a> {
         let mut result = HashMap::new();
         let mut keys = Vec::new();
         for hash in hash_list {
-            if let Some(cached) = self.block_cache.get(hash).await {
+            if let Some(cached) = self.caches.block.get(hash).await {
                 result.insert(*hash, cached);
             } else {
                 keys.push(self.key_builder.hashed_block(hash));
@@ -552,7 +592,7 @@ impl<'a> Txn<'a> {
             if let Some(hash) = self.key_builder.parse_key_hashed_block(pair.key().into()) {
                 let value = Arc::new(pair.into_value());
                 result.insert(hash, value.clone());
-                self.block_cache.insert(hash, value).await;
+                self.caches.block.insert(hash, value).await;
             } else {
                 tracing::error!("failed parsing hash from response!");
             }
@@ -562,10 +602,12 @@ impl<'a> Txn<'a> {
 
     pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<()> {
 
+        let mut watch = StopWatch::start("hb_wrt");
         let bs = BlockSplitterWrite::new(self.block_size, start, &data);
         let block_range = bs.get_range();
 
         let hash_list_prev = self.hb_get_block_hash_list_by_block_range(inode.ino, block_range.clone()).await?;
+        watch.sync("hp");
 
         let mut pre_data_hash_request = HashSet::<inode::Hash>::new();
         let first_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
@@ -576,6 +618,7 @@ impl<'a> Txn<'a> {
         );
 
         let pre_data = self.hb_get_block_data_by_hashes(&pre_data_hash_request).await?;
+        watch.sync("pd");
         let mut new_blocks = HashMap::new();
         let mut new_block_hashes = HashMap::new();
 
@@ -587,10 +630,12 @@ impl<'a> Txn<'a> {
             new_blocks.insert(hash, Arc::new(chunk.to_vec()));
             new_block_hashes.insert(BlockAddress{ino: inode.ino, index: bs.mid_data.block_index + index as u64}, hash);
         }
+        watch.sync("h");
 
         for (k, new_block) in &new_blocks {
-            self.block_cache.insert(*k, new_block.clone()).await;
+            self.caches.block.insert(*k, new_block.clone()).await;
         }
+        watch.sync("ca");
 
         let exists_keys_request = new_blocks.keys().map(|k| self.key_builder.hashed_block_exists(k)).collect::<Vec<_>>();
         let exists_keys_response = self.batch_get(exists_keys_request).await?.collect::<Vec<_>>();
@@ -599,6 +644,7 @@ impl<'a> Txn<'a> {
             let hash = self.key_builder.parse_key_hashed_block(key).ok_or(FsError::UnknownError("failed parsing hash from response".into()))?;
             new_blocks.remove(&hash);
         }
+        watch.sync("ex");
 
         let mut mutations = Vec::<Mutation>::new();
         // upload new blocks:
@@ -629,33 +675,41 @@ impl<'a> Txn<'a> {
             mutations.push(Mutation::Put(self.key_builder.block_hash(k).into(), new_hash.as_bytes().to_vec()));
         }
 
+        watch.sync("pm");
+
         // execute all
         self.batch_mutate(mutations).await?;
 
-        eprintln!("hb_write_data(ino: {}, start:{}, size: {}) - bl_size: {}, bl_count: {}, bl_idx[{}..{}[, wr_bl_hashes:{written_block_hashes}({skipped_new_block_hashes}/{input_block_hashes} skipped), wr_blocks:{written_blocks}", inode.ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
+        watch.sync("m");
+
+        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,wr_bl_hash:{written_block_hashes}({skipped_new_block_hashes}/{input_block_hashes} skipped),wr_blk:{written_blocks},{}", inode.ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end, watch);
 
         Ok(())
     }
 
     #[instrument(skip(self, data))]
     pub async fn write_data(&mut self, ino: u64, start: u64, data: Bytes) -> Result<usize> {
-        let write_start = SystemTime::now();
+        let mut watch = AutoStopWatch::start("write_data");
         debug!("write data at ({})[{}]", ino, start);
-        let meta = self.read_meta().await?.unwrap();
-        self.check_space_left(&meta)?;
+        //let meta = self.read_meta().await?.unwrap(); // TODO: is this needed?
+        //self.check_space_left(&meta)?;
 
-        let mut inode = self.read_inode(ino).await?;
+        let mut inode = self.read_inode(ino).await?.deref().clone();
         let size = data.len();
         let target = start + size as u64;
+        watch.sync("read_inode");
 
         if inode.inline_data.is_some() && target > self.inline_data_threshold() {
             self.transfer_inline_data_to_block(&mut inode).await?;
+            watch.sync("transfer_inline");
         }
 
         if (inode.inline_data.is_some() || inode.size == 0)
             && target <= self.inline_data_threshold()
         {
-            return self.write_inline_data(&mut inode, start, &data).await;
+            let result = self.write_inline_data(&mut inode, start, &data).await;
+            watch.sync("write_inline");
+            return result;
         }
 
         if self.hashed_blocks {
@@ -664,18 +718,22 @@ impl<'a> Txn<'a> {
             self.write_blocks_traditional(ino, start, &data).await?;
         }
 
+        watch.sync("write impl");
+
         inode.atime = SystemTime::now();
         inode.mtime = SystemTime::now();
         inode.ctime = SystemTime::now();
         inode.set_size(inode.size.max(target), self.block_size);
-        self.save_inode(&inode).await?;
-        trace!("write data: {}", String::from_utf8_lossy(&data));
-        debug!(
-            "write {} bytes in {}ms",
-            data.len(),
-            write_start.elapsed().unwrap().as_millis()
-        );
+        self.save_inode(&Arc::new(inode)).await?;
+        watch.sync("save inode");
         Ok(size)
+    }
+
+    pub fn set_fresh_inode_to_link(inode: &mut Inode, data: Bytes) {
+        debug_assert!(inode.file_attr.kind == FileType::Symlink);
+        inode.inline_data = Some(data.to_vec());
+        inode.size = data.len() as u64;
+        inode.blocks = 1;
     }
 
     pub async fn write_link(&mut self, inode: &mut Inode, data: Bytes) -> Result<usize> {
@@ -690,14 +748,14 @@ impl<'a> Txn<'a> {
         debug_assert!(inode.file_attr.kind == FileType::Symlink);
         let size = inode.size;
         if update_atime {
-            let mut inode = inode.clone();
+            let mut inode = inode.deref().clone();
             inode.atime = SystemTime::now();
-            self.save_inode(&inode).await?;
+            self.save_inode(&Arc::new(inode)).await?;
         }
         self.read_inline_data(&inode, 0, size).await
     }
 
-    pub async fn link(&mut self, ino: u64, newparent: u64, newname: ByteString) -> Result<Inode> {
+    pub async fn link(&mut self, ino: u64, newparent: u64, newname: ByteString) -> Result<Arc<Inode>> {
         if let Some(old_ino) = self.get_index(newparent, newname.clone()).await? {
             let inode = self.read_inode(old_ino).await?;
             match inode.kind {
@@ -707,7 +765,7 @@ impl<'a> Txn<'a> {
         }
         self.set_index(newparent, newname.clone(), ino).await?;
 
-        let mut inode = self.read_inode(ino).await?;
+        let mut inode = self.read_inode(ino).await?.deref().clone();
         let mut dir = self.read_dir(newparent).await?;
 
         dir.push(DirItem {
@@ -719,8 +777,9 @@ impl<'a> Txn<'a> {
         self.save_dir(newparent, &dir).await?;
         inode.nlink += 1;
         inode.ctime = SystemTime::now();
-        self.save_inode(&inode).await?;
-        Ok(inode)
+        let ptr = Arc::new(inode);
+        self.save_inode(&ptr).await?;
+        Ok(ptr)
     }
 
     pub async fn unlink(&mut self, parent: u64, name: ByteString) -> Result<()> {
@@ -737,10 +796,10 @@ impl<'a> Txn<'a> {
                     .collect();
                 self.save_dir(parent, &new_parent_dir).await?;
 
-                let mut inode = self.read_inode(ino).await?;
+                let mut inode = self.read_inode(ino).await?.deref().clone();
                 inode.nlink -= 1;
                 inode.ctime = SystemTime::now();
-                self.save_inode(&inode).await?;
+                self.save_inode(&Arc::new(inode)).await?;
                 Ok(())
             }
         }
@@ -797,7 +856,7 @@ impl<'a> Txn<'a> {
 
         inode.set_size(target_size, self.block_size);
         inode.mtime = SystemTime::now();
-        self.save_inode(inode).await?;
+        self.save_inode(&Arc::new(inode.clone())).await?;
         Ok(())
     }
 
@@ -808,11 +867,9 @@ impl<'a> Txn<'a> {
         mode: u32,
         gid: u32,
         uid: u32,
-    ) -> Result<Inode> {
+    ) -> Result<Arc<Inode>> {
         let dir_mode = make_mode(FileType::Directory, mode as _);
-        let mut inode = self.make_inode(parent, name, dir_mode, gid, uid, 0).await?;
-        inode.perm = mode as _;
-        self.save_inode(&inode).await?;
+        let inode = self.make_inode(parent, name, dir_mode, gid, uid, 0).await?;
         self.save_dir(inode.ino, &Directory::new()).await?;
         self.link(inode.ino, inode.ino, DIR_SELF).await?;
         if parent >= ROOT_INODE {
@@ -834,17 +891,18 @@ impl<'a> Txn<'a> {
         super::dir::decode(&data)
     }
 
-    pub async fn save_dir(&mut self, ino: u64, dir: &[DirItem]) -> Result<Inode> {
+    pub async fn save_dir(&mut self, ino: u64, dir: &[DirItem]) -> Result<Arc<Inode>> {
         let data = super::dir::encode(dir)?;
-        let mut inode = self.read_inode(ino).await?;
+        let mut inode = self.read_inode(ino).await?.deref().clone();
         inode.set_size(data.len() as u64, self.block_size);
         inode.atime = SystemTime::now();
         inode.mtime = SystemTime::now();
         inode.ctime = SystemTime::now();
-        self.save_inode(&inode).await?;
+        let ptr = Arc::new(inode);
+        self.save_inode(&ptr).await?;
         let key = self.key_builder.block(ino, 0);
         self.put(key, data).await?;
-        Ok(inode)
+        Ok(ptr)
     }
 
     pub async fn statfs(&mut self) -> Result<StatFs> {

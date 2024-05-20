@@ -34,7 +34,7 @@ pub struct Inode {
     pub inline_data: Option<Vec<u8>>,
     pub data_hash: Option<Hash>,
     pub next_fh: Option<u64>,       // not used, deprecated. Keep to not get errors on old fs instances
-    pub opened_fh: u64,
+    pub opened_fh: u64,             // not used, deprecated. Keep to not get errors on old fs instances
 }
 
 impl Inode {
