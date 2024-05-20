@@ -677,16 +677,16 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         reply: ReplyData,
     ) {
         let async_impl = self.0.clone();
-        eprintln!("read request: id:{}, ino:{ino}, fh:{fh}, pos:{offset}, size:{size}, flags:{flags}", req.unique());
+        //eprintln!("read request: id:{}, ino:{ino}, fh:{fh}, pos:{offset}, size:{size}, flags:{flags}", req.unique());
         spawn_reply(req.unique(), reply, async move {
             let r = async_impl
                 .read(ino, fh, offset, size, flags, lock_owner)
                 .await;
-            if let Ok(data) = &r {
-                eprintln!("read done: len: {}", data.data.len());
-            } else {
-                eprintln!("read done: err: {:?}", r);
-            }
+            // if let Ok(data) = &r {
+            //     eprintln!("read done: len: {}", data.data.len());
+            // } else {
+            //     eprintln!("read done: err: {:?}", r);
+            // }
             r
         });
     }

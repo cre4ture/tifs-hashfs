@@ -323,7 +323,6 @@ impl<'a> Txn<'a> {
 
         let bs = BlockSplitterRead::new(self.block_size, start, size);
         let block_range = bs.first_block_index..bs.end_block_index;
-        eprintln!("hb_read_data(ino: {ino}, start:{start}, size: {size}) - block_size: {}, blocks_count: {}, range: [{}..{}[", bs.block_size, bs.block_count, block_range.start, block_range.end);
 
         let block_hashes = self.hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
         //eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
@@ -349,9 +348,15 @@ impl<'a> Txn<'a> {
             if rd_start < block_data.len() {
                 // do a copy, as some blocks might be used multiple times
                 let rd_end = (rd_start + rd_size).min(block_data.len());
-                eprintln!("extend (result.len(): {}) from slice ({block_index}): {rd_start}..{rd_end}", result.len());
+                //eprintln!("extend (result.len(): {}) from slice ({block_index}): {rd_start}..{rd_end}", result.len());
                 result.extend_from_slice(&block_data[rd_start..rd_end]);
             }
+        }
+
+        eprintln!("hb_read_data(ino: {ino}, start:{start}, size: {size}) - block_size: {}, blocks_count: {}, range: [{}..{}[ -> {} read", bs.block_size, bs.block_count, block_range.start, block_range.end, result.len());
+
+        if result.len() < size as usize {
+            eprintln!("incomplete read - (ino: {ino}, start:{start}, size: {size}): len:{}, block_hashes:{:?}", result.len(), block_hashes);
         }
 
         Ok(result)
@@ -580,7 +585,6 @@ impl<'a> Txn<'a> {
 
         let bs = BlockSplitterWrite::new(self.block_size, start, &data);
         let block_range = bs.get_range();
-        eprintln!("hb_write_data(ino: {}, start:{}, size: {}) - block_size: {}, blocks_count: {}, range: [{}..{}[", inode.ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
 
         let hash_list_prev = self.hb_get_block_hash_list_by_block_range(inode.ino, block_range.clone()).await?;
 
@@ -619,6 +623,7 @@ impl<'a> Txn<'a> {
 
         let mut mutations = Vec::<Mutation>::new();
         // upload new blocks:
+        let written_blocks = new_blocks.len();
         for (k, new_block) in new_blocks {
             mutations.push(Mutation::Put(self.key_builder.hashed_block(&k).into(), new_block.deref().clone()));
             mutations.push(Mutation::Put(self.key_builder.hashed_block_exists(&k).into(), vec![]));
@@ -628,21 +633,27 @@ impl<'a> Txn<'a> {
         // TODO!
 
         // filter out unchanged blocks:
+        let mut skipped_new_block_hashes = 0;
+        let input_block_hashes = hash_list_prev.len();
         for (address, prev_block_hash) in hash_list_prev.iter() {
             if let Some(new_block_hash) = new_block_hashes.get(&address) {
                 if prev_block_hash == new_block_hash {
                     new_block_hashes.remove(&address);
+                    skipped_new_block_hashes += 1;
                 }
             }
         }
 
         // write new block mapping:
+        let written_block_hashes = new_block_hashes.len();
         for (k, new_hash) in new_block_hashes {
             mutations.push(Mutation::Put(self.key_builder.block_hash(k).into(), new_hash.as_bytes().to_vec()));
         }
 
         // execute all
         self.batch_mutate(mutations).await?;
+
+        eprintln!("hb_write_data(ino: {}, start:{}, size: {}) - bl_size: {}, bl_count: {}, bl_idx[{}..{}[, wr_bl_hashes:{written_block_hashes}({skipped_new_block_hashes}/{input_block_hashes} skipped), wr_blocks:{written_blocks}", inode.ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
 
         Ok(())
     }
