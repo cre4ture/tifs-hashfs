@@ -455,7 +455,7 @@ pub trait AsyncFileSystem: Send + Sync {
     }
 }
 
-pub struct AsyncFs<T>(Arc<T>);
+pub struct AsyncFs<T>(pub Arc<T>);
 
 impl<T: AsyncFileSystem> From<T> for AsyncFs<T> {
     fn from(inner: T) -> Self {

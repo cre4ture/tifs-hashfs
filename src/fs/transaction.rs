@@ -11,6 +11,7 @@ use fuser::{FileAttr, FileType};
 use tikv_client::{Backoff, KvPair, RetryOptions, Transaction, TransactionClient, TransactionOptions};
 use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
+use uuid::Uuid;
 
 use crate::fs::meta::StaticFsParameters;
 
@@ -36,6 +37,7 @@ pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
 
 pub struct Txn<'a> {
     key_builder: &'a ScopedKeyBuilder<'a>,
+    _instance_id: Uuid,
     txn: Transaction,
     hashed_blocks: bool,
     block_size: u64,
@@ -66,6 +68,7 @@ impl<'a> Txn<'a> {
 
     pub async fn begin_optimistic(
         key_builder: &'a ScopedKeyBuilder<'a>,
+        instance_id: Uuid,
         client: &TransactionClient,
         hashed_blocks: bool,
         block_size: u64,
@@ -83,6 +86,7 @@ impl<'a> Txn<'a> {
             .await?;
         Ok(Txn {
             key_builder,
+            _instance_id: instance_id,
             txn,
             hashed_blocks,
             block_size: block_size as u64,
@@ -92,17 +96,24 @@ impl<'a> Txn<'a> {
         })
     }
 
-    pub async fn open(&mut self, ino: u64) -> Result<()> {
-        let mut inode = self.read_inode(ino).await?;
-        inode.opened_fh += 1;
-        self.save_inode(&inode).await?;
+    pub async fn open(&mut self, ino: u64, use_id: Uuid) -> Result<()> {
+        // check for existence
+        let _inode = self.read_inode(ino).await?;
+        // publish opened state
+        let key = self.key_builder.opened_inode(ino, use_id);
+        self.put(key, &[]).await?;
+        eprintln!("open-ino: {ino}, use_id: {use_id}");
         Ok(())
     }
 
-    pub async fn close(&mut self, ino: u64) -> Result<()> {
-        let mut inode = self.read_inode(ino).await?;
-        inode.opened_fh -= 1;
-        self.save_inode(&inode).await
+    pub async fn close(&mut self, ino: u64, use_id: Uuid) -> Result<()> {
+        // check for existence
+        let _inode = self.read_inode(ino).await?;
+        // de-publish opened state
+        let key = self.key_builder.opened_inode(ino, use_id);
+        self.delete(key).await?;
+        eprintln!("close-ino: {ino}, use_id: {use_id}");
+        Ok(())
     }
 
     pub async fn read(&mut self, ino: u64, handler: FileHandler, offset: i64, size: u32, update_atime: bool) -> Result<Vec<u8>> {

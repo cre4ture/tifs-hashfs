@@ -327,7 +327,7 @@ where
 
     make_daemon()?;
 
-    fuser::mount2(AsyncFs::from(fs_impl), mountpoint, &fuse_options)?;
+    fuser::mount2(AsyncFs(fs_impl.clone()), mountpoint, &fuse_options)?;
 
     Ok(())
 }

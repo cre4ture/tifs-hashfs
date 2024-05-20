@@ -19,6 +19,7 @@ pub struct LockState {
 
 pub type Hash = blake3::Hash;
 pub type TiFsHash = blake3::Hash;
+pub type UInode = u64;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct BlockAddress {

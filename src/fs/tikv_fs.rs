@@ -4,7 +4,7 @@ use std::future::Future;
 use std::matches;
 use std::ops::DerefMut;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
 use anyhow::anyhow;
@@ -20,6 +20,7 @@ use tikv_client::{Config, TransactionClient};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
 
 use super::async_fs::AsyncFileSystem;
 use super::dir::Directory;
@@ -39,9 +40,29 @@ pub const DIR_PARENT: ByteString = ByteString::from_static("..");
 
 pub type TiFsBlockCache = Cache<TiFsHash, Arc<Vec<u8>>>;
 
+#[derive(Clone, Debug)]
+pub struct InoUse {
+    instance: Weak<TiFs>,
+    ino: u64,
+    use_id: Uuid,
+}
+
+impl Drop for InoUse {
+    fn drop(&mut self) {
+        if let Some(inst) = self.instance.upgrade() {
+            let ino = self.ino;
+            let use_id = self.use_id;
+            tokio::task::spawn(async move {
+                inst.release_inode_use(ino, use_id).await;
+            });
+        }
+    }
+}
+
 struct TiFsMutable {
     pub freed_fhs: HashSet<u64>,
     pub next_fh: u64,
+    pub opened_ino: HashMap<u64, Weak<InoUse>>,
     pub file_handlers: HashMap<u64, FileHandler>,
     pub block_cache: TiFsBlockCache,
 }
@@ -52,6 +73,7 @@ impl TiFsMutable {
         Self {
             freed_fhs: HashSet::new(),
             next_fh: 0,
+            opened_ino: HashMap::new(),
             file_handlers: HashMap::new(),
             block_cache: Cache::new((100 << 20) / block_size),
         }
@@ -68,15 +90,21 @@ impl TiFsMutable {
         fh
     }
 
-    fn new_file_handler(&mut self) -> u64 {
-        let fh = self.get_free_fh();
-        self.file_handlers.insert(fh, FileHandler::default());
-        fh
+    fn get_ino_use(&self, ino: u64) -> Option<Arc<InoUse>> {
+        self.opened_ino.get(&ino).and_then(|x|x.upgrade())
+    }
+
+    fn release_file_handler(&mut self, fh: u64) {
+        if self.file_handlers.remove(&fh).is_some() {
+            self.freed_fhs.insert(fh);
+        }
     }
 }
 
 pub struct TiFs {
+    pub me: Weak<TiFs>,
     pub name: Vec<u8>,
+    pub instance_id: Uuid,
     pub pd_endpoints: Vec<String>,
     pub config: Config,
     pub client: TransactionClient,
@@ -101,7 +129,7 @@ impl TiFs {
         pd_endpoints: Vec<S>,
         cfg: Config,
         options: Vec<MountOption>,
-    ) -> anyhow::Result<Self>
+    ) -> anyhow::Result<Arc<Self>>
     where
         S: Clone + Debug + Into<String>,
     {
@@ -127,38 +155,42 @@ impl TiFs {
             })
             .unwrap_or(Self::DEFAULT_BLOCK_SIZE);
 
-        let fs = TiFs {
-            name,
-            client,
-            pd_endpoints: pd_endpoints.clone().into_iter().map(Into::into).collect(),
-            config: cfg,
-            direct_io: options
-                .iter()
-                .any(|option| matches!(option, MountOption::DirectIO)),
-            block_size,
-            max_size: options.iter().find_map(|option| match option {
-                MountOption::MaxSize(size) => parse_size(size)
-                    .map_err(|err| {
-                        error!("fail to parse maxsize({}): {}", size, err);
-                        err
-                    })
-                    .map(|size| {
-                        debug!("max size: {}", size);
-                        size
-                    })
-                    .ok(),
-                _ => None,
-            }),
-            enable_atime: options.iter().find_map(|option| match option {
-                MountOption::NoAtime => Some(false),
-                MountOption::Atime => Some(true),
-                _ => None,
-            }).unwrap_or(true),
-            hashed_blocks: options.iter().find_map(|opt|{
-                (MountOption::HashedBlocks == *opt).then_some(true)
-            }).unwrap_or(false),
-            mut_data: RwLock::new(TiFsMutable::new(block_size)),
-        };
+        let fs = Arc::new_cyclic(|me| {
+            TiFs {
+                me: me.clone(),
+                name,
+                instance_id: uuid::Uuid::new_v4(),
+                client,
+                pd_endpoints: pd_endpoints.clone().into_iter().map(Into::into).collect(),
+                config: cfg,
+                direct_io: options
+                    .iter()
+                    .any(|option| matches!(option, MountOption::DirectIO)),
+                block_size,
+                max_size: options.iter().find_map(|option| match option {
+                    MountOption::MaxSize(size) => parse_size(size)
+                        .map_err(|err| {
+                            error!("fail to parse maxsize({}): {}", size, err);
+                            err
+                        })
+                        .map(|size| {
+                            debug!("max size: {}", size);
+                            size
+                        })
+                        .ok(),
+                    _ => None,
+                }),
+                enable_atime: options.iter().find_map(|option| match option {
+                    MountOption::NoAtime => Some(false),
+                    MountOption::Atime => Some(true),
+                    _ => None,
+                }).unwrap_or(true),
+                hashed_blocks: options.iter().find_map(|opt|{
+                    (MountOption::HashedBlocks == *opt).then_some(true)
+                }).unwrap_or(false),
+                mut_data: RwLock::new(TiFsMutable::new(block_size)),
+            }
+        });
 
         fs.check_metadata().await?;
 
@@ -231,6 +263,7 @@ impl TiFs {
         let key_builder = ScopedKeyBuilder::new(&self.name);
         let mut txn = Txn::begin_optimistic(
             &key_builder,
+            self.instance_id,
             &self.client,
             self.hashed_blocks,
             self.block_size,
@@ -351,6 +384,15 @@ impl TiFs {
             Err(FsError::NameTooLong {
                 file: name.to_string(),
             })
+        }
+    }
+
+    async fn release_inode_use(&self, ino: u64, use_id: Uuid) {
+        let result = self.spin_no_delay(&format!("release, ino:{ino}"),
+        move |_, txn| Box::pin(txn.close(ino, use_id)))
+        .await;
+        if let Err(e) = result {
+            tracing::error!("failed to release inode use ino: {ino}, use_id:{use_id}, err: {:?}", e);
         }
     }
 }
@@ -487,12 +529,38 @@ impl AsyncFileSystem for TiFs {
     #[tracing::instrument]
     async fn open(&self, ino: u64, flags: i32) -> Result<Open> {
         // TODO: deal with flags
-        self
-            .spin_no_delay(&format!("open ino: {ino}, flags: {flags}"),
-            move |_, txn| Box::pin(txn.open(ino)))
-            .await?;
+        let mut ino_use = self.with_mut_data(|d| d.get_ino_use(ino)).await?;
+        if ino_use.is_none() {
+            // not opened yet on this instance. open it:
+            let new_use_id = Uuid::new_v4();
+            self
+                .spin_no_delay(&format!("open ino: {ino}, flags: {flags}"),
+                move |_, txn| Box::pin(txn.open(ino, new_use_id)))
+                .await?;
+            // file exists and registration was successful, register use locally:
+            let new_ino_use = Arc::new(InoUse{
+                instance: self.me.to_owned(),
+                ino,
+                use_id: new_use_id
+            });
+            self.with_mut_data(|d: &mut TiFsMutable| d.opened_ino.insert(ino, Arc::downgrade(&new_ino_use))).await?;
+            ino_use = Some(new_ino_use);
+        }
 
-        let fh = self.with_mut_data(|d| d.new_file_handler()).await?;
+        let Some(ino_use) = ino_use else {
+            return Err(FsError::UnknownError("failed to get ino_use!".into()));
+        };
+
+        let file_handler = FileHandler{
+            cursor: 0,
+            ino_use,
+        };
+
+        let fh = self.with_mut_data(|d| {
+            let new_fh = d.get_free_fh();
+            d.file_handlers.insert(new_fh, file_handler);
+            new_fh
+        }).await?;
 
         let mut open_flags = 0;
         #[cfg(target_os = "linux")]
@@ -520,7 +588,7 @@ impl AsyncFileSystem for TiFs {
         let file_handler = self.get_file_handler_checked(fh).await?;
         let data = self
             .spin_no_delay(&format!("read, ino:{ino}, fh:{fh}, offset:{offset}, size:{size}"),
-            move |_, txn| Box::pin(txn.read(ino, file_handler, offset, size, enable_atime)))
+            move |_, txn| Box::pin(txn.read(ino, file_handler.clone(), offset, size, enable_atime)))
             .await?;
         Ok(Data::new(data))
     }
@@ -540,7 +608,7 @@ impl AsyncFileSystem for TiFs {
         let file_handler = self.get_file_handler_checked(fh).await?;
         let len = self
             .spin_no_delay(&format!("write, ino:{ino}, fh:{fh}, offset:{offset}, data.len:{}", data.len()),
-            move |_, txn| Box::pin(txn.write(ino, file_handler, offset, data.clone())))
+            move |_, txn| Box::pin(txn.write(ino, file_handler.clone(), offset, data.clone())))
             .await?;
         Ok(Write::new(len as u32))
     }
@@ -618,12 +686,13 @@ impl AsyncFileSystem for TiFs {
 
     async fn lseek(&self, ino: u64, fh: u64, offset: i64, whence: i32) -> Result<Lseek> {
         let file_handler = self.get_file_handler_checked(fh).await?;
+        let current_cursor = file_handler.cursor;
         let result = self.spin_no_delay("lseek", move |_, txn| {
             Box::pin(async move {
                 let inode = txn.read_inode(ino).await?;
                 let target_cursor = match whence {
                     SEEK_SET => offset,
-                    SEEK_CUR => file_handler.cursor as i64 + offset,
+                    SEEK_CUR => current_cursor as i64 + offset,
                     SEEK_END => inode.size as i64 + offset,
                     _ => return Err(FsError::UnknownWhence { whence }),
                 };
@@ -650,22 +719,17 @@ impl AsyncFileSystem for TiFs {
 
     async fn release(
         &self,
-        ino: u64,
+        _ino: u64,
         fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
     ) -> Result<()> {
-        let result = self.spin_no_delay(&format!("release, ino:{ino}, fh:{fh}"),
-            move |_, txn| Box::pin(txn.close(ino)))
-            .await?;
 
         self.with_mut_data(|d|{
-            d.file_handlers.remove(&fh);
-            d.freed_fhs.insert(fh);
+            d.release_file_handler(fh)
         }).await?;
-
-        Ok(result)
+        Ok(())
     }
 
     /// Create a hard link.
