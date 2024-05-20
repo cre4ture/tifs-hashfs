@@ -535,20 +535,6 @@ impl<'a> Txn<'a> {
         }).collect())
     }
 
-    // pub async fn hb_get_block_data_by_block_index(&mut self, inode: &Inode, index: u64) -> Result<HashedBlock> {
-    //     let Some(start_hash_vec) = &inode.block_hashes else {
-    //         return Ok(self.hb_new_block());
-    //     };
-
-    //     let maybe_hash = start_hash_vec.get(index as usize);
-    //     let Some(Some(hash)) = maybe_hash else {
-    //         return Ok(self.hb_new_block());
-    //     };
-
-    //     self.hb_get_block_data_by_hashes(&[hash])
-    //         .await?.into_iter().next().ok_or_else(FsError::BlockNotFound { inode: inode.ino, block: index })
-    // }
-
     pub async fn hb_get_block_data_by_hashes(&mut self, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, Arc<Vec<u8>>>>
     {
         let mut result = HashMap::new();
@@ -573,24 +559,6 @@ impl<'a> Txn<'a> {
         }
         Ok(result)
     }
-
-    // pub async fn hb_irregular_update_block_data(
-    //     &mut self,
-    //     hash: inode::Hash,
-    //     start_write_pos: usize,
-    //     block_write_data: &[u8],
-    //     mutations: &mut Vec<Mutation>) -> Result<()> {
-
-    //     let existing_block_data = self.hb_get_block_data_by_block_index(&mut inode, block_index).await?;
-    //     if let Some(existing_hash) = &existing_block_data.hash {
-    //         mutations.push(Mutation::Delete(self.key_builder.hashed_block(existing_hash)))
-    //     }
-    //     existing_block_data.update_data_range(start_write_pos, block_write_data);
-    //     let new_hash = existing_block_data.update_hash();
-
-    //     mutations.push(Mutation::Put(self.key_builder.hashed_block(new_hash), new_hash.data));
-    //     Ok(())
-    // }
 
     pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<()> {
 
