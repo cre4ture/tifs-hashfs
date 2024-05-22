@@ -142,6 +142,7 @@ define_options! { MountOption (FuseMountOption) {
 //    define "opt" OptionName(Display_Debug_Clone_PartialEq_FromStr_able)
     define Name(String),
     define HashedBlocks,
+    define NoMtime,
 }}
 
 #[cfg(test)]

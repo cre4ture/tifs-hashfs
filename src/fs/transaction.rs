@@ -28,7 +28,7 @@ use super::key::{ScopedKeyBuilder, ScopedKeyKind, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::{as_file_kind, as_file_perm, make_mode};
 use super::reply::{DirItem, StatFs};
-use super::tikv_fs::{TiFsCaches, DIR_PARENT, DIR_SELF};
+use super::tikv_fs::{TiFsCaches, TiFsConfig, DIR_PARENT, DIR_SELF};
 use super::transaction_client_mux::TransactionClientMux;
 
 
@@ -40,8 +40,8 @@ pub struct Txn<'a> {
     key_builder: &'a ScopedKeyBuilder<'a>,
     _instance_id: Uuid,
     txn: Transaction,
-    hashed_blocks: bool,
-    block_size: u64,
+    fs_config: TiFsConfig,
+    block_size: u64,            // duplicate of fs_config.block_size. Keep it to avoid refactoring efforts.
     max_blocks: Option<u64>,
     max_name_len: u32,
     caches: TiFsCaches,
@@ -71,10 +71,8 @@ impl<'a> Txn<'a> {
         key_builder: &'a ScopedKeyBuilder<'a>,
         instance_id: Uuid,
         client: &TransactionClientMux,
-        hashed_blocks: bool,
-        block_size: u64,
+        fs_config: &TiFsConfig,
         caches: TiFsCaches,
-        max_size: Option<u64>,
         max_name_len: u32,
     ) -> Result<Self> {
         let options = TransactionOptions::new_optimistic().use_async_commit();
@@ -89,9 +87,9 @@ impl<'a> Txn<'a> {
             key_builder,
             _instance_id: instance_id,
             txn,
-            hashed_blocks,
-            block_size: block_size as u64,
-            max_blocks: max_size.map(|size| size / block_size as u64),
+            fs_config: fs_config.clone(),
+            block_size: fs_config.block_size,
+            max_blocks: fs_config.max_size.map(|size| size / fs_config.block_size as u64),
             max_name_len,
             caches,
         })
@@ -117,12 +115,12 @@ impl<'a> Txn<'a> {
         Ok(())
     }
 
-    pub async fn read(&mut self, ino: u64, handler: FileHandler, offset: i64, size: u32, update_atime: bool) -> Result<Vec<u8>> {
+    pub async fn read(&mut self, ino: u64, handler: FileHandler, offset: i64, size: u32) -> Result<Vec<u8>> {
         let start = handler.cursor as i64 + offset;
         if start < 0 {
             return Err(FsError::InvalidOffset { ino, offset: start });
         }
-        self.read_data(ino, start as u64, Some(size as u64), update_atime).await
+        self.read_data(ino, start as u64, Some(size as u64), self.fs_config.enable_atime).await
     }
 
     pub async fn write(&mut self, ino: u64, handler: FileHandler, offset: i64, data: Bytes) -> Result<usize> {
@@ -139,7 +137,7 @@ impl<'a> Txn<'a> {
             .read_meta()
             .await?
             .unwrap_or_else(|| Meta::new(self.block_size as u64, StaticFsParameters{
-                hashed_blocks: self.hashed_blocks
+                hashed_blocks: self.fs_config.hashed_blocks
             }));
 
         self.check_space_left(&meta)?;
@@ -289,6 +287,7 @@ impl<'a> Txn<'a> {
     pub async fn remove_inode(&mut self, ino: u64) -> Result<()> {
         let key = self.key_builder.inode(ino);
         self.delete(key).await?;
+        self.caches.inode.remove(&ino).await;
         Ok(())
     }
 
@@ -487,7 +486,7 @@ impl<'a> Txn<'a> {
             return self.read_inline_data(&attr, start, size).await;
         }
 
-        if self.hashed_blocks {
+        if self.fs_config.hashed_blocks {
             self.hb_read_data(ino, start, size).await
         } else {
             self.read_data_traditional(ino, start, size).await
@@ -600,7 +599,7 @@ impl<'a> Txn<'a> {
         Ok(result)
     }
 
-    pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<()> {
+    pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<bool> {
 
         let mut watch = StopWatch::start("hb_wrt");
         let bs = BlockSplitterWrite::new(self.block_size, start, &data);
@@ -678,13 +677,15 @@ impl<'a> Txn<'a> {
         watch.sync("pm");
 
         // execute all
-        self.batch_mutate(mutations).await?;
-
-        watch.sync("m");
+        let was_modified = mutations.len() > 0;
+        if was_modified {
+            self.batch_mutate(mutations).await?;
+            watch.sync("m");
+        }
 
         eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,wr_bl_hash:{written_block_hashes}({skipped_new_block_hashes}/{input_block_hashes} skipped),wr_blk:{written_blocks},{}", inode.ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end, watch);
 
-        Ok(())
+        Ok(was_modified)
     }
 
     #[instrument(skip(self, data))]
@@ -712,20 +713,24 @@ impl<'a> Txn<'a> {
             return result;
         }
 
-        if self.hashed_blocks {
-            self.hb_write_data(&mut inode, start, &data).await?;
+        let content_was_modified = if self.fs_config.hashed_blocks {
+            self.hb_write_data(&mut inode, start, &data).await?
         } else {
             self.write_blocks_traditional(ino, start, &data).await?;
-        }
+            true
+        };
 
         watch.sync("write impl");
 
-        inode.atime = SystemTime::now();
-        inode.mtime = SystemTime::now();
-        inode.ctime = SystemTime::now();
-        inode.set_size(inode.size.max(target), self.block_size);
-        self.save_inode(&Arc::new(inode)).await?;
-        watch.sync("save inode");
+        let size_changed = inode.size < target;
+        if size_changed || (self.fs_config.enable_mtime && content_was_modified) {
+            inode.atime = SystemTime::now();
+            inode.mtime = SystemTime::now();
+            // inode.ctime = SystemTime::now(); TODO: bug?
+            inode.set_size(inode.size.max(target), self.block_size);
+            self.save_inode(&Arc::new(inode)).await?;
+            watch.sync("save inode");
+        }
         Ok(size)
     }
 
@@ -743,11 +748,11 @@ impl<'a> Txn<'a> {
         self.write_inline_data(inode, 0, &data).await
     }
 
-    pub async fn read_link(&mut self, ino: u64, update_atime: bool) -> Result<Vec<u8>> {
+    pub async fn read_link(&mut self, ino: u64) -> Result<Vec<u8>> {
         let inode = self.read_inode(ino).await?;
         debug_assert!(inode.file_attr.kind == FileType::Symlink);
         let size = inode.size;
-        if update_atime {
+        if self.fs_config.enable_atime {
             let mut inode = inode.deref().clone();
             inode.atime = SystemTime::now();
             self.save_inode(&Arc::new(inode)).await?;

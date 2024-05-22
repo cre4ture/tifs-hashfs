@@ -112,18 +112,24 @@ impl TiFsMutable {
     }
 }
 
+#[derive(Clone)]
+pub struct TiFsConfig {
+    pub block_size: u64,
+    pub enable_atime: bool,
+    pub enable_mtime: bool,
+    pub hashed_blocks: bool,
+    pub max_size: Option<u64>,
+}
+
 pub struct TiFs {
     pub me: Weak<TiFs>,
     pub name: Vec<u8>,
     pub instance_id: Uuid,
     pub pd_endpoints: Vec<String>,
-    pub config: Config,
+    pub client_config: Config,
     pub client: TransactionClientMux,
     pub direct_io: bool,
-    pub block_size: u64,
-    pub max_size: Option<u64>,
-    pub enable_atime: bool,
-    pub hashed_blocks: bool,
+    pub fs_config: TiFsConfig,
     mut_data: RwLock<TiFsMutable>,
 }
 
@@ -173,32 +179,38 @@ impl TiFs {
                 instance_id: uuid::Uuid::new_v4(),
                 client,
                 pd_endpoints: pd_endpoints.clone().into_iter().map(Into::into).collect(),
-                config: cfg,
+                client_config: cfg,
                 direct_io: options
                     .iter()
                     .any(|option| matches!(option, MountOption::DirectIO)),
-                block_size,
-                max_size: options.iter().find_map(|option| match option {
-                    MountOption::MaxSize(size) => parse_size(size)
-                        .map_err(|err| {
-                            error!("fail to parse maxsize({}): {}", size, err);
-                            err
-                        })
-                        .map(|size| {
-                            debug!("max size: {}", size);
-                            size
-                        })
-                        .ok(),
-                    _ => None,
-                }),
-                enable_atime: options.iter().find_map(|option| match option {
-                    MountOption::NoAtime => Some(false),
-                    MountOption::Atime => Some(true),
-                    _ => None,
-                }).unwrap_or(true),
-                hashed_blocks: options.iter().find_map(|opt|{
-                    (MountOption::HashedBlocks == *opt).then_some(true)
-                }).unwrap_or(false),
+                fs_config: TiFsConfig {
+                    block_size,
+                    max_size: options.iter().find_map(|option| match option {
+                        MountOption::MaxSize(size) => parse_size(size)
+                            .map_err(|err| {
+                                error!("fail to parse maxsize({}): {}", size, err);
+                                err
+                            })
+                            .map(|size| {
+                                debug!("max size: {}", size);
+                                size
+                            })
+                            .ok(),
+                        _ => None,
+                    }),
+                    enable_atime: options.iter().find_map(|option| match option {
+                        MountOption::NoAtime => Some(false),
+                        MountOption::Atime => Some(true),
+                        _ => None,
+                    }).unwrap_or(true),
+                    enable_mtime: options.iter().find_map(|option| match option {
+                        MountOption::NoMtime => Some(false),
+                        _ => None,
+                    }).unwrap_or(true),
+                    hashed_blocks: options.iter().find_map(|opt|{
+                        (MountOption::HashedBlocks == *opt).then_some(true)
+                    }).unwrap_or(false),
+                },
                 mut_data: RwLock::new(TiFsMutable::new(block_size)),
             }
         });
@@ -215,8 +227,8 @@ impl TiFs {
             .await?;
         if let Some(meta) = metadata {
             let cfg_flags = meta.config_flags.unwrap_or_default();
-            if cfg_flags.hashed_blocks != self.hashed_blocks {
-                panic!("stored config information mismatch: hashed_blocks desired: {}, actual: {}", self.hashed_blocks, cfg_flags.hashed_blocks);
+            if cfg_flags.hashed_blocks != self.fs_config.hashed_blocks {
+                panic!("stored config information mismatch: hashed_blocks desired: {}, actual: {}", self.fs_config.hashed_blocks, cfg_flags.hashed_blocks);
             }
         }
 
@@ -276,10 +288,8 @@ impl TiFs {
             &key_builder,
             self.instance_id,
             &self.client,
-            self.hashed_blocks,
-            self.block_size,
+            &self.fs_config,
             block_cache,
-            self.max_size,
             Self::MAX_NAME_LEN,
         )
         .await?;
@@ -595,11 +605,10 @@ impl AsyncFileSystem for TiFs {
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<Data> {
-        let enable_atime = self.enable_atime;
         let file_handler = self.get_file_handler_checked(fh).await?;
         let data = self
             .spin_no_delay(&format!("read, ino:{ino}, fh:{fh}, offset:{offset}, size:{size}"),
-            move |_, txn| Box::pin(txn.read(ino, file_handler.clone(), offset, size, enable_atime)))
+            move |_, txn| Box::pin(txn.read(ino, file_handler.clone(), offset, size)))
             .await?;
         Ok(Data::new(data))
     }
@@ -696,6 +705,7 @@ impl AsyncFileSystem for TiFs {
     }
 
     async fn lseek(&self, ino: u64, fh: u64, offset: i64, whence: i32) -> Result<Lseek> {
+        eprintln!("lseek-begin(ino:{ino},fh:{fh},offset:{offset},whence:{whence}");
         let file_handler = self.get_file_handler_checked(fh).await?;
         let current_cursor = file_handler.cursor;
         let result = self.spin_no_delay("lseek", move |_, txn| {
@@ -724,6 +734,8 @@ impl AsyncFileSystem for TiFs {
             file_handler.cursor = result.offset as u64;
             Ok(())
         }).await??;
+
+        eprintln!("lseek-ok(ino:{ino},fh:{fh},offset:{offset},whence:{whence},current_cursor:{current_cursor},new_cursor:{})", result.offset);
 
         Ok(result)
     }
@@ -810,7 +822,7 @@ impl AsyncFileSystem for TiFs {
         }).await?;
 
         let mode = make_mode(FileType::Symlink, 0o777);
-        let mut inode = Txn::initialize_inode(self.block_size, ino, mode, gid, uid, 0);
+        let mut inode = Txn::initialize_inode(self.fs_config.block_size, ino, mode, gid, uid, 0);
         Txn::set_fresh_inode_to_link(&mut inode, link.into_bytes());
         let ptr = Arc::new(inode);
         let ptr_clone1 = ptr.clone();
@@ -828,9 +840,8 @@ impl AsyncFileSystem for TiFs {
     }
 
     async fn readlink(&self, ino: u64) -> Result<Data> {
-        let enable_atime = self.enable_atime;
         self.spin(&"readlink".to_string(), None, move |_, txn| {
-            Box::pin(async move { Ok(Data::new(txn.read_link(ino, enable_atime).await?)) })
+            Box::pin(async move { Ok(Data::new(txn.read_link(ino).await?)) })
         })
         .await
     }
