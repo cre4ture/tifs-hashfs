@@ -3,6 +3,8 @@ use std::backtrace::Backtrace;
 use thiserror::Error;
 use tracing::error;
 
+use super::inode::TiFsHash;
+
 #[derive(Error, Debug)]
 pub enum FsError {
     #[error("unimplemented")]
@@ -71,6 +73,9 @@ pub enum FsError {
 
     #[error("no space left: MaxSize({0})")]
     NoSpaceLeft(u64),
+
+    #[error("Read checksum mismatch: hash: {hash} vs. actual: {actual_hash}")]
+    ChecksumMismatch{hash: TiFsHash, actual_hash: TiFsHash},
 }
 
 pub type Result<T> = std::result::Result<T, FsError>;
@@ -134,6 +139,7 @@ impl From<FsError> for libc::c_int {
             InvalidStr => libc::EINVAL,
             BlockSizeConflict { origin: _, new: _ } => libc::EINVAL,
             NoSpaceLeft(_) => libc::ENOSPC,
+            ChecksumMismatch { hash: _, actual_hash: _ } => libc::ERANGE,
             _ => libc::EFAULT,
         }
     }

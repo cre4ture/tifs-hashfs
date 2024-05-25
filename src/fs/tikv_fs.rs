@@ -119,6 +119,8 @@ pub struct TiFsConfig {
     pub enable_mtime: bool,
     pub hashed_blocks: bool,
     pub max_size: Option<u64>,
+    pub validate_writes: bool,
+    pub validate_read_hashes: bool,
 }
 
 pub struct TiFs {
@@ -209,6 +211,12 @@ impl TiFs {
                     }).unwrap_or(true),
                     hashed_blocks: options.iter().find_map(|opt|{
                         (MountOption::HashedBlocks == *opt).then_some(true)
+                    }).unwrap_or(false),
+                    validate_writes: options.iter().find_map(|opt|{
+                        (MountOption::ValidateWrites == *opt).then_some(true)
+                    }).unwrap_or(false),
+                    validate_read_hashes: options.iter().find_map(|opt|{
+                        (MountOption::ValidateReadHashes == *opt).then_some(true)
                     }).unwrap_or(false),
                 },
                 mut_data: RwLock::new(TiFsMutable::new(block_size)),

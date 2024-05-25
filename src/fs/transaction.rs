@@ -1,14 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::iter::FromIterator;
-use std::ops::{Deref, DerefMut, Range};
+use std::ops::{Deref, DerefMut, Range, RangeInclusive};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
-use tikv_client::{Backoff, KvPair, RetryOptions, Transaction, TransactionOptions};
+use num_format::{Buffer, Locale};
+use tikv_client::{Backoff, Key, KvPair, RetryOptions, Transaction, TransactionOptions};
 use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
 use uuid::Uuid;
@@ -22,6 +23,7 @@ use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
+use super::hashed_block::HashedBlock;
 use super::index::Index;
 use super::inode::{self, BlockAddress, Inode, TiFsHash};
 use super::key::{ScopedKeyBuilder, ScopedKeyKind, ROOT_INODE};
@@ -403,10 +405,13 @@ impl<'a> Txn<'a> {
             }
         }
 
-        eprintln!("hb_read_data(ino: {ino}, start:{start}, size: {size}) - block_size: {}, blocks_count: {}, range: [{}..{}[ -> {} read", bs.block_size, bs.block_count, block_range.start, block_range.end, result.len());
+        let mut buf_start = Buffer::default();
+        buf_start.write_formatted(&start, &Locale::en);
+        eprintln!("hb_read_data(ino: {ino}, start:{buf_start}, size: {size}) - block_size: {}, blocks_count: {}, range: [{}..{}[ -> {} read", bs.block_size, bs.block_count, block_range.start, block_range.end, result.len());
 
         if result.len() < size as usize {
-            eprintln!("incomplete read - (ino: {ino}, start:{start}, size: {size}): len:{}, block_hashes:{:?}", result.len(), block_hashes);
+            let block_data_lengths = blocks_data.iter().map(|(key, data)|(key, data.len())).collect::<Vec<_>>();
+            eprintln!("incomplete read - (ino: {ino}, start:{buf_start}, size: {size}): len:{}, block_hashes:{:?}, block_lengths:{:?}", result.len(), block_hashes, block_data_lengths);
         }
 
         Ok(result)
@@ -576,6 +581,8 @@ impl<'a> Txn<'a> {
 
     pub async fn hb_get_block_data_by_hashes(&mut self, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, Arc<Vec<u8>>>>
     {
+        let mut watch = AutoStopWatch::start("get_hash_blocks_data");
+
         let mut result = HashMap::new();
         let mut keys = Vec::new();
         for hash in hash_list {
@@ -586,16 +593,37 @@ impl<'a> Txn<'a> {
             }
         }
 
+        watch.sync("cached");
+
+        let mut uncached_blocks = HashMap::new();
         let rcv_data_list = self.txn.batch_get(keys).await?;
         for pair in rcv_data_list {
             if let Some(hash) = self.key_builder.parse_key_hashed_block(pair.key().into()) {
                 let value = Arc::new(pair.into_value());
-                result.insert(hash, value.clone());
+                uncached_blocks.insert(hash, value.clone());
                 self.caches.block.insert(hash, value).await;
             } else {
                 tracing::error!("failed parsing hash from response!");
             }
         }
+
+        watch.sync("fetch");
+
+        if self.fs_config.validate_read_hashes {
+            for (hash, value) in uncached_blocks.iter() {
+                let actual_hash = HashedBlock::calculate_hash(&value);
+                if hash != &actual_hash {
+                    return Err(FsError::ChecksumMismatch{hash: hash.clone(), actual_hash});
+                }
+            }
+
+            watch.sync("validate");
+        }
+
+        result.extend(uncached_blocks.into_iter());
+
+        watch.sync("done");
+
         Ok(result)
     }
 
@@ -636,14 +664,27 @@ impl<'a> Txn<'a> {
         }
         watch.sync("ca");
 
-        let exists_keys_request = new_blocks.keys().map(|k| self.key_builder.hashed_block_exists(k)).collect::<Vec<_>>();
-        let exists_keys_response = self.batch_get(exists_keys_request).await?.collect::<Vec<_>>();
-        for KvPair(key, _) in exists_keys_response.into_iter() {
-            let key = (&key).into();
-            let hash = self.key_builder.parse_key_hashed_block(key).ok_or(FsError::UnknownError("failed parsing hash from response".into()))?;
-            new_blocks.remove(&hash);
+        if self.fs_config.validate_writes {
+            let ks = new_blocks.keys().map(|x|x.to_owned()).collect::<Vec<_>>();
+            for hash in ks {
+                let key = self.key_builder.hashed_block(&hash);
+                let key_range: RangeInclusive<Key> = key.into()..=key.into();
+                let result = self.scan_keys(key_range, 1).await?;
+                if result.count() > 0 {
+                    new_blocks.remove(&hash);
+                }
+            }
+            watch.sync("exv");
+        } else {
+            let exists_keys_request = new_blocks.keys().map(|k| self.key_builder.hashed_block_exists(k)).collect::<Vec<_>>();
+            let exists_keys_response = self.batch_get(exists_keys_request).await?.collect::<Vec<_>>();
+            for KvPair(key, _) in exists_keys_response.into_iter() {
+                let key = (&key).into();
+                let hash = self.key_builder.parse_key_hashed_block(key).ok_or(FsError::UnknownError("failed parsing hash from response".into()))?;
+                new_blocks.remove(&hash);
+            }
+            watch.sync("exb");
         }
-        watch.sync("ex");
 
         let mut mutations = Vec::<Mutation>::new();
         // upload new blocks:

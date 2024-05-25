@@ -143,6 +143,8 @@ define_options! { MountOption (FuseMountOption) {
     define Name(String),
     define HashedBlocks,
     define NoMtime,
+    define ValidateWrites,
+    define ValidateReadHashes,
 }}
 
 #[cfg(test)]
