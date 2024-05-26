@@ -133,7 +133,7 @@ pub struct TiFs {
     pub pd_endpoints: Vec<String>,
     pub client_config: Config,
     pub client: TransactionClientMux,
-    pub raw: tikv_client::RawClient,
+    pub raw: Arc<tikv_client::RawClient>,
     pub direct_io: bool,
     pub fs_config: TiFsConfig,
     mut_data: RwLock<TiFsMutable>,
@@ -156,7 +156,8 @@ impl TiFs {
     where
         S: Clone + Debug + Into<String>,
     {
-        let raw = tikv_client::RawClient::new_with_config(pd_endpoints.clone(), cfg.clone()).await?;
+        let raw_cfg = cfg.clone();
+        let raw = Arc::new(tikv_client::RawClient::new_with_config(pd_endpoints.clone(), raw_cfg).await?);
         let client = TransactionClientMux::new(pd_endpoints.clone().into_iter().map(|s|s.into()).collect::<Vec<_>>(), cfg.clone())
             .await
             .map_err(|err| anyhow!("{}", err))?;
@@ -312,7 +313,7 @@ impl TiFs {
             &key_builder,
             self.instance_id,
             &self.client,
-            &self.raw,
+            self.raw.clone(),
             &self.fs_config,
             block_cache,
             Self::MAX_NAME_LEN,

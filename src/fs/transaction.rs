@@ -7,7 +7,6 @@ use std::time::{Instant, SystemTime};
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
-use futures::future::join_all;
 use futures::FutureExt;
 use num_format::{Buffer, Locale};
 use tikv_client::{Backoff, Key, KvPair, RetryOptions, Transaction, TransactionOptions};
@@ -43,7 +42,7 @@ pub struct Txn<'ol> {
     key_builder: &'ol ScopedKeyBuilder<'ol>,
     _instance_id: Uuid,
     txn: Transaction,
-    raw: &'ol tikv_client::RawClient,
+    raw: Arc<tikv_client::RawClient>,
     fs_config: TiFsConfig,
     block_size: u64,            // duplicate of fs_config.block_size. Keep it to avoid refactoring efforts.
     max_blocks: Option<u64>,
@@ -75,7 +74,7 @@ impl<'a> Txn<'a> {
         key_builder: &'a ScopedKeyBuilder<'a>,
         instance_id: Uuid,
         client: &TransactionClientMux,
-        raw: &'a tikv_client::RawClient,
+        raw: Arc<tikv_client::RawClient>,
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
         max_name_len: u32,
@@ -651,17 +650,18 @@ impl<'a> Txn<'a> {
                         e
                     })?;
             } else {
-                let futures = mutations_raw.into_iter().map(|KvPair(k,v)| {
-                    self.raw.put(k, v)
-                });
-                for result in join_all(futures).await {
-                    result.map_err(|e| {
-                        eprintln!("single-hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,({input_block_hashes} skipped),wr_blk:{raw_cnt}raw/?-err:{e:?}", inode.ino, start, data.len(), self.fs_config.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
-                        e
-                    })?;
+                for KvPair(k,v) in mutations_raw.into_iter() {
+                    let raw_clone = self.raw.clone();
+                    let packed = async move ||{
+                        let k2 = k;
+                        let v2 = v;
+                        let raw_clone2 = raw_clone;
+                        raw_clone2.put(k2, v2).await
+                    };
+                    tokio::spawn(packed());
                 }
             }
-            watch.sync("rawbp");
+            watch.sync("rawbp-nw");
         }
 
         // remove outdated blocks:
