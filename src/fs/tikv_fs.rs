@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
-use std::iter::FromIterator;
 use std::matches;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
@@ -18,7 +17,7 @@ use futures::FutureExt;
 use libc::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET};
 use moka::future::Cache;
 use parse_size::parse_size;
-use tikv_client::{Config, Key};
+use tikv_client::Config;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
@@ -28,17 +27,14 @@ use super::async_fs::AsyncFileSystem;
 use super::dir::Directory;
 use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
-use super::hash_block::block_splitter::BlockSplitterRead;
 use super::inode::{Inode, TiFsHash};
 use super::key::{ScopedKeyBuilder, ROOT_INODE};
 use super::mode::make_mode;
-use super::parsers;
 use super::reply::{
     get_time, Attr, Create, Data, Dir, Entry, Lock, Lseek, Open, StatFs, Write, Xattr,
 };
 use super::transaction::Txn;
 use super::transaction_client_mux::TransactionClientMux;
-use super::utils::stop_watch::AutoStopWatch;
 use crate::MountOption;
 
 pub const DIR_SELF: ByteString = ByteString::from_static(".");
@@ -126,7 +122,8 @@ pub struct TiFsConfig {
     pub max_size: Option<u64>,
     pub validate_writes: bool,
     pub validate_read_hashes: bool,
-    pub raw_read: bool,
+    pub raw_hashed_blocks: bool,
+    pub batch_raw_block_write: bool,
 }
 
 pub struct TiFs {
@@ -227,8 +224,11 @@ impl TiFs {
                     validate_read_hashes: options.iter().find_map(|opt|{
                         (MountOption::ValidateReadHashes == *opt).then_some(true)
                     }).unwrap_or(false),
-                    raw_read: options.iter().find_map(|opt|{
-                        (MountOption::RawRead == *opt).then_some(true)
+                    raw_hashed_blocks: options.iter().find_map(|opt|{
+                        (MountOption::RawHashedBlocks == *opt).then_some(true)
+                    }).unwrap_or(false),
+                    batch_raw_block_write: options.iter().find_map(|opt|{
+                        (MountOption::BatchRawBlockWrite == *opt).then_some(true)
                     }).unwrap_or(false),
                 },
                 mut_data: RwLock::new(TiFsMutable::new(block_size)),
@@ -312,6 +312,7 @@ impl TiFs {
             &key_builder,
             self.instance_id,
             &self.client,
+            &self.raw,
             &self.fs_config,
             block_cache,
             Self::MAX_NAME_LEN,
@@ -455,44 +456,6 @@ impl TiFs {
             move |_, txn| txn.read(ino, offset, size).boxed())
             .await?;
         Ok(Data::new(data))
-    }
-
-    #[tracing::instrument]
-    async fn read_raw(
-        &self,
-        ino: u64,
-        start: u64,
-        size: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-    ) -> Result<Data> {
-        let mut watch = AutoStopWatch::start("read_raw");
-        let kb = ScopedKeyBuilder::new(&self.name);
-
-        let key: Key = kb.inode(ino).into();
-        let buffer = self.raw.get(key).await?.ok_or(FsError::InodeNotFound { inode: ino })?;
-        let inode = Inode::deserialize(&buffer)?;
-
-        let bs = BlockSplitterRead::new(self.fs_config.block_size, start, size);
-        let block_hashes = parsers::hb_get_block_hash_list_by_block_range(
-            &kb, ino, bs.block_range(), |range, limit|{
-                self.raw.scan(range, limit).boxed()
-            }).await?;
-        watch.sync("scan");
-        let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
-        let block_data = parsers::hb_get_block_data_by_hashes(
-            &self.fs_config,
-            &self.get_caches().await,
-            &kb, &block_hashes_set, |keys| {
-                self.raw.batch_get(keys).boxed()
-            }).await?;
-        watch.sync("get_blocks");
-        let result = parsers::hb_read_from_blocks(ino, &bs.block_range(), &bs, &block_hashes, &block_data)?;
-
-        eprintln!("rraw-block_hashes:{},block-data:{}", block_hashes.len(), block_data.len());
-
-        watch.sync("done");
-        Ok(Data::new(result))
     }
 }
 
@@ -691,12 +654,7 @@ impl AsyncFileSystem for TiFs {
             return Err(FsError::InvalidOffset { ino, offset: start });
         }
         let start = start as u64;
-
-        if self.fs_config.raw_read {
-            self.read_raw(ino, start, size as u64, _flags, _lock_owner).await
-        } else {
-            self.read_transaction(ino, start, size, _flags, _lock_owner).await
-        }
+        self.read_transaction(ino, start, size, _flags, _lock_owner).await
     }
 
     #[tracing::instrument(skip(data))]
@@ -714,7 +672,7 @@ impl AsyncFileSystem for TiFs {
         let file_handler = self.get_file_handler_checked(fh).await?;
         let len = self
             .spin_no_delay(&format!("write, ino:{ino}, fh:{fh}, offset:{offset}, data.len:{}", data.len()),
-            move |_, txn| Box::pin(txn.write(ino, file_handler.clone(), offset, data.clone())))
+            move |_me, txn| Box::pin(txn.write(ino, file_handler.clone(), offset, data.clone())))
             .await?;
         Ok(Write::new(len as u32))
     }

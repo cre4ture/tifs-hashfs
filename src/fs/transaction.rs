@@ -7,6 +7,7 @@ use std::time::{Instant, SystemTime};
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
+use futures::future::join_all;
 use futures::FutureExt;
 use num_format::{Buffer, Locale};
 use tikv_client::{Backoff, Key, KvPair, RetryOptions, Transaction, TransactionOptions};
@@ -15,7 +16,7 @@ use tikv_client::transaction::Mutation;
 use uuid::Uuid;
 
 use crate::fs::meta::StaticFsParameters;
-use crate::fs::utils::stop_watch::{AutoStopWatch, StopWatch};
+use crate::fs::utils::stop_watch::AutoStopWatch;
 
 use super::block::empty_block;
 use super::dir::Directory;
@@ -38,10 +39,11 @@ pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000
 pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000);
 pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
 
-pub struct Txn<'a> {
-    key_builder: &'a ScopedKeyBuilder<'a>,
+pub struct Txn<'ol> {
+    key_builder: &'ol ScopedKeyBuilder<'ol>,
     _instance_id: Uuid,
     txn: Transaction,
+    raw: &'ol tikv_client::RawClient,
     fs_config: TiFsConfig,
     block_size: u64,            // duplicate of fs_config.block_size. Keep it to avoid refactoring efforts.
     max_blocks: Option<u64>,
@@ -73,6 +75,7 @@ impl<'a> Txn<'a> {
         key_builder: &'a ScopedKeyBuilder<'a>,
         instance_id: Uuid,
         client: &TransactionClientMux,
+        raw: &'a tikv_client::RawClient,
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
         max_name_len: u32,
@@ -89,6 +92,7 @@ impl<'a> Txn<'a> {
             key_builder,
             _instance_id: instance_id,
             txn,
+            raw,
             fs_config: fs_config.clone(),
             block_size: fs_config.block_size,
             max_blocks: fs_config.max_size.map(|size| size / fs_config.block_size as u64),
@@ -375,7 +379,14 @@ impl<'a> Txn<'a> {
         let block_hashes = self.hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
         //eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
         let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
-        let blocks_data = self.hb_get_block_data_by_hashes(&block_hashes_set).await?;
+        let blocks_data = if self.fs_config.raw_hashed_blocks {
+            parsers::hb_get_block_data_by_hashes(&self.fs_config, &self.caches, self.key_builder, &block_hashes_set,
+                |keys| {
+                    self.raw.batch_get(keys).boxed()
+                }).await?
+        } else {
+            self.hb_get_block_data_by_hashes(&block_hashes_set).await?
+        };
 
         let result = parsers::hb_read_from_blocks(ino, &block_range, &bs, &block_hashes, &blocks_data)?;
 
@@ -556,11 +567,12 @@ impl<'a> Txn<'a> {
 
     pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<bool> {
 
-        let mut watch = StopWatch::start("hb_wrt");
+        let mut watch = AutoStopWatch::start("hb_wrt");
         let bs = BlockSplitterWrite::new(self.block_size, start, &data);
         let block_range = bs.get_range();
 
         let hash_list_prev = self.hb_get_block_hash_list_by_block_range(inode.ino, block_range.clone()).await?;
+        let input_block_hashes = hash_list_prev.len();
         watch.sync("hp");
 
         let mut pre_data_hash_request = HashSet::<inode::Hash>::new();
@@ -596,8 +608,12 @@ impl<'a> Txn<'a> {
             for hash in ks {
                 let key = self.key_builder.hashed_block(&hash);
                 let key_range: RangeInclusive<Key> = key.into()..=key.into();
-                let result = self.scan_keys(key_range, 1).await?;
-                if result.count() > 0 {
+                let result = if self.fs_config.raw_hashed_blocks {
+                    self.raw.scan_keys(key_range, 1).await?
+                } else {
+                    self.scan_keys(key_range, 1).await?.collect()
+                };
+                if result.len() > 0 {
                     new_blocks.remove(&hash);
                 }
             }
@@ -613,12 +629,39 @@ impl<'a> Txn<'a> {
             watch.sync("exb");
         }
 
-        let mut mutations = Vec::<Mutation>::new();
+        let mut mutations_txn = Vec::<Mutation>::new();
+        let mut mutations_raw = Vec::<KvPair>::new();
         // upload new blocks:
         let written_blocks = new_blocks.len();
         for (k, new_block) in new_blocks {
-            mutations.push(Mutation::Put(self.key_builder.hashed_block(&k).into(), new_block.deref().clone()));
-            mutations.push(Mutation::Put(self.key_builder.hashed_block_exists(&k).into(), vec![]));
+            if self.fs_config.raw_hashed_blocks {
+                mutations_raw.push(KvPair(self.key_builder.hashed_block(&k).into(), new_block.deref().clone()));
+            } else {
+                mutations_txn.push(Mutation::Put(self.key_builder.hashed_block(&k).into(), new_block.deref().clone()));
+            }
+            mutations_txn.push(Mutation::Put(self.key_builder.hashed_block_exists(&k).into(), vec![]));
+        }
+
+        let raw_cnt = mutations_raw.len();
+        if raw_cnt > 0 {
+            if self.fs_config.batch_raw_block_write {
+                self.raw.batch_put_with_ttl(mutations_raw, vec![0; raw_cnt]).await
+                    .map_err(|e| {
+                        eprintln!("batch-hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,({input_block_hashes} skipped),wr_blk:{raw_cnt}raw/?-err:{e:?}", inode.ino, start, data.len(), self.fs_config.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
+                        e
+                    })?;
+            } else {
+                let futures = mutations_raw.into_iter().map(|KvPair(k,v)| {
+                    self.raw.put(k, v)
+                });
+                for result in join_all(futures).await {
+                    result.map_err(|e| {
+                        eprintln!("single-hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,({input_block_hashes} skipped),wr_blk:{raw_cnt}raw/?-err:{e:?}", inode.ino, start, data.len(), self.fs_config.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
+                        e
+                    })?;
+                }
+            }
+            watch.sync("rawbp");
         }
 
         // remove outdated blocks:
@@ -626,7 +669,6 @@ impl<'a> Txn<'a> {
 
         // filter out unchanged blocks:
         let mut skipped_new_block_hashes = 0;
-        let input_block_hashes = hash_list_prev.len();
         for (address, prev_block_hash) in hash_list_prev.iter() {
             if let Some(new_block_hash) = new_block_hashes.get(&address) {
                 if prev_block_hash == new_block_hash {
@@ -639,19 +681,19 @@ impl<'a> Txn<'a> {
         // write new block mapping:
         let written_block_hashes = new_block_hashes.len();
         for (k, new_hash) in new_block_hashes {
-            mutations.push(Mutation::Put(self.key_builder.block_hash(k).into(), new_hash.as_bytes().to_vec()));
+            mutations_txn.push(Mutation::Put(self.key_builder.block_hash(k).into(), new_hash.as_bytes().to_vec()));
         }
 
         watch.sync("pm");
 
         // execute all
-        let was_modified = mutations.len() > 0;
+        let was_modified = mutations_txn.len() > 0;
         if was_modified {
-            self.batch_mutate(mutations).await?;
+            self.batch_mutate(mutations_txn).await?;
             watch.sync("m");
         }
 
-        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,wr_bl_hash:{written_block_hashes}({skipped_new_block_hashes}/{input_block_hashes} skipped),wr_blk:{written_blocks},{}", inode.ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end, watch);
+        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,wr_bl_hash:{written_block_hashes}({skipped_new_block_hashes}/{input_block_hashes} skipped),wr_blk:{raw_cnt}raw/{written_blocks}", inode.ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
 
         Ok(was_modified)
     }

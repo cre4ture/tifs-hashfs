@@ -3,10 +3,11 @@
 #![feature(async_closure)]
 #![feature(type_alias_impl_trait)]
 #![feature(async_fn_traits)]
+#![feature(iter_array_chunks)]
 
 pub mod fs;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use fs::async_fs::AsyncFs;
 use fs::client::TlsConfig;
@@ -148,7 +149,8 @@ define_options! { MountOption (FuseMountOption) {
     define NoMtime,
     define ValidateWrites,
     define ValidateReadHashes,
-    define RawRead,
+    define RawHashedBlocks,
+    define BatchRawBlockWrite,
 }}
 
 #[cfg(test)]
@@ -320,7 +322,8 @@ where
         Default::default()
     };
 
-    let client_cfg = client_cfg.with_default_keyspace();
+    let mut client_cfg = client_cfg.with_default_keyspace();
+    client_cfg.timeout = Duration::from_secs(60);
 
     let name_str = options.iter().find_map(|opt|{
         if let MountOption::Name(name) = opt {
