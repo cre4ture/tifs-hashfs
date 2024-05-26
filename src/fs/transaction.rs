@@ -260,15 +260,6 @@ impl<'a> Txn<'a> {
         self.read_data(ino, start, Some(size as u64), self.fs_config.enable_atime).await
     }
 
-    pub async fn write(&mut self, ino: u64, handler: FileHandler, offset: i64, data: Bytes) -> Result<usize> {
-        let start = handler.cursor as i64 + offset;
-        if start < 0 {
-            return Err(FsError::InvalidOffset { ino, offset: start });
-        }
-
-        self.write_data(ino, start as u64, data).await
-    }
-
     pub async fn reserve_new_ino(&mut self) -> Result<u64> {
         let mut meta = self
             .read_meta()
@@ -741,22 +732,23 @@ impl<'a> Txn<'a> {
         Ok(result)
     }
 
-    pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<bool> {
+    pub async fn hb_write_data(&mut self, fh: &Arc<FileHandler>, start: u64, data: &Bytes) -> Result<bool> {
 
         let mut watch = AutoStopWatch::start("hb_wrt");
         let bs = BlockSplitterWrite::new(self.block_size, start, &data);
         let block_range = bs.get_range();
+        let ino = fh.ino();
 
-        let hash_list_prev = self.hb_get_block_hash_list_by_block_range(inode.ino, block_range.clone()).await?;
+        let hash_list_prev = self.hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
         let input_block_hashes = hash_list_prev.len();
         watch.sync("hp");
 
         let mut pre_data_hash_request = HashSet::<inode::Hash>::new();
         let first_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
-            inode.ino, bs.first_data, bs.first_data_start_position, &hash_list_prev, &mut pre_data_hash_request
+            ino, bs.first_data, bs.first_data_start_position, &hash_list_prev, &mut pre_data_hash_request
         );
         let last_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
-            inode.ino, bs.last_data, 0, &hash_list_prev, &mut pre_data_hash_request
+            ino, bs.last_data, 0, &hash_list_prev, &mut pre_data_hash_request
         );
 
         let pre_data = self.hb_get_block_data_by_hashes(&pre_data_hash_request).await?;
@@ -770,7 +762,7 @@ impl<'a> Txn<'a> {
         for (index, chunk) in bs.mid_data.data.chunks(self.block_size as usize).enumerate() {
             let hash = blake3::hash(chunk);
             new_blocks.insert(hash, Arc::new(chunk.to_vec()));
-            new_block_hashes.insert(BlockAddress{ino: inode.ino, index: bs.mid_data.block_index + index as u64}, hash);
+            new_block_hashes.insert(BlockAddress{ino, index: bs.mid_data.block_index + index as u64}, hash);
         }
         watch.sync("h");
 
@@ -823,7 +815,7 @@ impl<'a> Txn<'a> {
             if self.fs_config.batch_raw_block_write {
                 self.raw.batch_put_with_ttl(mutations_raw, vec![0; raw_cnt]).await
                     .map_err(|e| {
-                        eprintln!("batch-hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,({input_block_hashes} skipped),wr_blk:{raw_cnt}raw/?-err:{e:?}", inode.ino, start, data.len(), self.fs_config.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
+                        eprintln!("batch-hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,({input_block_hashes} skipped),wr_blk:{raw_cnt}raw/?-err:{e:?}", ino, start, data.len(), self.fs_config.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
                         e
                     })?;
             } else {
@@ -870,14 +862,15 @@ impl<'a> Txn<'a> {
             watch.sync("m");
         }
 
-        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,wr_bl_hash:{written_block_hashes}({skipped_new_block_hashes}/{input_block_hashes} skipped),wr_blk:{raw_cnt}raw/{written_blocks}", inode.ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
+        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,wr_bl_hash:{written_block_hashes}({skipped_new_block_hashes}/{input_block_hashes} skipped),wr_blk:{raw_cnt}raw/{written_blocks}", ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
 
         Ok(was_modified)
     }
 
     #[instrument(skip(self, data))]
-    pub async fn write_data(&mut self, ino: u64, start: u64, data: Bytes) -> Result<usize> {
+    pub async fn write(&mut self, fh: Arc<FileHandler>, start: u64, data: Bytes) -> Result<usize> {
         let mut watch = AutoStopWatch::start("write_data");
+        let ino = fh.ino();
         debug!("write data at ({})[{}]", ino, start);
         //let meta = self.read_meta().await?.unwrap(); // TODO: is this needed?
         //self.check_space_left(&meta)?;
@@ -901,7 +894,7 @@ impl<'a> Txn<'a> {
         }
 
         let content_was_modified = if self.fs_config.hashed_blocks {
-            self.hb_write_data(&mut inode, start, &data).await?
+            self.hb_write_data(&fh, start, &data).await?
         } else {
             self.write_blocks_traditional(ino, start, &data).await?;
             true

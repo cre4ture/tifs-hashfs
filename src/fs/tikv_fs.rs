@@ -62,6 +62,16 @@ impl Drop for InoUse {
     }
 }
 
+impl InoUse {
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    pub fn get_tifs(&self) -> Option<Arc<TiFs>> {
+        self.instance.upgrade()
+    }
+}
+
 #[derive(Clone)] // Caches do only clone reference, not content
 pub struct TiFsCaches {
     pub block: TiFsBlockCache,
@@ -72,7 +82,7 @@ struct TiFsMutable {
     pub freed_fhs: HashSet<u64>,
     pub next_fh: u64,
     pub opened_ino: HashMap<u64, Weak<InoUse>>,
-    pub file_handlers: HashMap<u64, FileHandler>,
+    pub file_handlers: HashMap<u64, Arc<FileHandler>>,
     pub caches: TiFsCaches,
 }
 
@@ -268,12 +278,12 @@ impl TiFs {
         Ok(f(data.deref_mut()))
     }
 
-    async fn get_file_handler(&self, fh: u64) -> Option<FileHandler> {
+    async fn get_file_handler(&self, fh: u64) -> Option<Arc<FileHandler>> {
         let d = self.mut_data.read().await;
-        d.file_handlers.get(&fh).map(FileHandler::clone)
+        d.file_handlers.get(&fh).map(|x|x.clone())
     }
 
-    async fn get_file_handler_checked(&self, fh: u64) -> Result<FileHandler> {
+    async fn get_file_handler_checked(&self, fh: u64) -> Result<Arc<FileHandler>> {
         self.get_file_handler(fh).await.ok_or(FsError::FhNotFound { fh })
     }
 
@@ -462,6 +472,16 @@ impl TiFs {
             .await?;
         Ok(Data::new(data))
     }
+
+    pub async fn release_file_handler<'fl>(&self, _txn: &mut Txn<'fl>, fh: u64) -> Result<()>{
+        if let Some(_handler) = self.get_file_handler(fh).await {
+
+        }
+        self.with_mut_data(|d| {
+            d.release_file_handler(fh);
+        }).await?;
+        Ok(())
+    }
 }
 
 impl Debug for TiFs {
@@ -618,14 +638,10 @@ impl AsyncFileSystem for TiFs {
             return Err(FsError::UnknownError("failed to get ino_use!".into()));
         };
 
-        let file_handler = FileHandler{
-            cursor: 0,
-            ino_use,
-        };
-
+        let file_handler = FileHandler::new(ino_use, 0);
         let fh = self.with_mut_data(|d| {
             let new_fh = d.get_free_fh();
-            d.file_handlers.insert(new_fh, file_handler);
+            d.file_handlers.insert(new_fh, Arc::new(file_handler));
             new_fh
         }).await?;
 
@@ -653,7 +669,8 @@ impl AsyncFileSystem for TiFs {
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<Data> {
-        let file_handler = self.get_file_handler_checked(fh).await?;
+        let lock = self.get_file_handler_checked(fh).await?;
+        let file_handler = lock.mut_data.read().await;
         let start = file_handler.cursor as i64 + offset;
         if start < 0 {
             return Err(FsError::InvalidOffset { ino, offset: start });
@@ -675,9 +692,15 @@ impl AsyncFileSystem for TiFs {
     ) -> Result<Write> {
         let data: Bytes = data.into();
         let file_handler = self.get_file_handler_checked(fh).await?;
+        let file_handler_data = file_handler.mut_data.read().await;
+        let start = file_handler_data.cursor as i64 + offset;
+        drop(file_handler_data);
+        if start < 0 {
+            return Err(FsError::InvalidOffset { ino, offset: start });
+        }
         let len = self
             .spin_no_delay(&format!("write, ino:{ino}, fh:{fh}, offset:{offset}, data.len:{}", data.len()),
-            move |_me, txn| Box::pin(txn.write(ino, file_handler.clone(), offset, data.clone())))
+            move |_me, txn| Box::pin(txn.write(file_handler.clone(), start as u64, data.clone())))
             .await?;
         Ok(Write::new(len as u32))
     }
@@ -756,20 +779,24 @@ impl AsyncFileSystem for TiFs {
     async fn lseek(&self, ino: u64, fh: u64, offset: i64, whence: i32) -> Result<Lseek> {
         eprintln!("lseek-begin(ino:{ino},fh:{fh},offset:{offset},whence:{whence}");
         let file_handler = self.get_file_handler_checked(fh).await?;
-        let current_cursor = file_handler.cursor;
+        let file_handler_data = file_handler.mut_data.read().await;
+        let current_cursor = file_handler_data.cursor;
         let result = self.spin_no_delay("lseek", move |_, txn| {
             Box::pin(async move {
-                let inode = txn.read_inode(ino).await?;
+
                 let target_cursor = match whence {
                     SEEK_SET => offset,
                     SEEK_CUR => current_cursor as i64 + offset,
-                    SEEK_END => inode.size as i64 + offset,
+                    SEEK_END => {
+                        let inode = txn.read_inode(ino).await?;
+                        inode.size as i64 + offset
+                    }
                     _ => return Err(FsError::UnknownWhence { whence }),
                 };
 
                 if target_cursor < 0 {
                     return Err(FsError::InvalidOffset {
-                        ino: inode.ino,
+                        ino,
                         offset: target_cursor,
                     });
                 }
@@ -780,7 +807,7 @@ impl AsyncFileSystem for TiFs {
 
         self.with_mut_data(|d| -> Result<()> {
             let file_handler = d.file_handlers.get_mut(&fh).ok_or(FsError::FhNotFound { fh: fh })?;
-            file_handler.cursor = result.offset as u64;
+            file_handler.mut_data.blocking_write().cursor = result.offset as u64;
             Ok(())
         }).await??;
 
@@ -797,10 +824,11 @@ impl AsyncFileSystem for TiFs {
         _lock_owner: Option<u64>,
         _flush: bool,
     ) -> Result<()> {
-
-        self.with_mut_data(|d|{
-            d.release_file_handler(fh)
-        }).await?;
+        self.spin_no_delay(&format!("release fh {fh}"),
+            move |me, txn| {
+                Box::pin(me.release_file_handler(txn, fh))
+            })
+            .await?;
         Ok(())
     }
 
