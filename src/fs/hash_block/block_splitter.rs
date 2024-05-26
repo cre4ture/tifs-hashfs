@@ -100,6 +100,10 @@ impl BlockSplitterRead {
             end_block_index: first_block + block_count,
         }
     }
+
+    pub fn block_range(&self) -> Range<u64> {
+        self.first_block_index..self.end_block_index
+    }
 }
 
 

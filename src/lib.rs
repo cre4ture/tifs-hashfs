@@ -1,5 +1,8 @@
 #![feature(array_chunks)]
 #![feature(map_try_insert)]
+#![feature(async_closure)]
+#![feature(type_alias_impl_trait)]
+#![feature(async_fn_traits)]
 
 pub mod fs;
 
@@ -145,6 +148,7 @@ define_options! { MountOption (FuseMountOption) {
     define NoMtime,
     define ValidateWrites,
     define ValidateReadHashes,
+    define RawRead,
 }}
 
 #[cfg(test)]
@@ -309,12 +313,14 @@ where
         })
         .unwrap_or_else(default_tls_config_path)?;
 
-    let client_cfg = if metadata(&tls_cfg_path).await.is_ok() {
+    let client_cfg: tikv_client::Config = if metadata(&tls_cfg_path).await.is_ok() {
         let client_cfg_contents = read_to_string(tls_cfg_path).await?;
         toml::from_str::<TlsConfig>(&client_cfg_contents)?.into()
     } else {
         Default::default()
     };
+
+    let client_cfg = client_cfg.with_default_keyspace();
 
     let name_str = options.iter().find_map(|opt|{
         if let MountOption::Name(name) = opt {

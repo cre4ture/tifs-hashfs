@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::convert::TryInto;
 use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut, Range, RangeInclusive};
 use std::sync::Arc;
@@ -8,6 +7,7 @@ use std::time::{Instant, SystemTime};
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
+use futures::FutureExt;
 use num_format::{Buffer, Locale};
 use tikv_client::{Backoff, Key, KvPair, RetryOptions, Transaction, TransactionOptions};
 use tracing::{debug, instrument, trace};
@@ -23,12 +23,12 @@ use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
-use super::hashed_block::HashedBlock;
 use super::index::Index;
 use super::inode::{self, BlockAddress, Inode, TiFsHash};
 use super::key::{ScopedKeyBuilder, ScopedKeyKind, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::{as_file_kind, as_file_perm, make_mode};
+use super::parsers;
 use super::reply::{DirItem, StatFs};
 use super::tikv_fs::{TiFsCaches, TiFsConfig, DIR_PARENT, DIR_SELF};
 use super::transaction_client_mux::TransactionClientMux;
@@ -117,12 +117,8 @@ impl<'a> Txn<'a> {
         Ok(())
     }
 
-    pub async fn read(&mut self, ino: u64, handler: FileHandler, offset: i64, size: u32) -> Result<Vec<u8>> {
-        let start = handler.cursor as i64 + offset;
-        if start < 0 {
-            return Err(FsError::InvalidOffset { ino, offset: start });
-        }
-        self.read_data(ino, start as u64, Some(size as u64), self.fs_config.enable_atime).await
+    pub async fn read(&mut self, ino: u64, start: u64, size: u32) -> Result<Vec<u8>> {
+        self.read_data(ino, start, Some(size as u64), self.fs_config.enable_atime).await
     }
 
     pub async fn write(&mut self, ino: u64, handler: FileHandler, offset: i64, data: Bytes) -> Result<usize> {
@@ -374,36 +370,14 @@ impl<'a> Txn<'a> {
     async fn hb_read_data(&mut self, ino: u64, start: u64, size: u64) -> Result<Vec<u8>> {
 
         let bs = BlockSplitterRead::new(self.block_size, start, size);
-        let block_range = bs.first_block_index..bs.end_block_index;
+        let block_range = bs.block_range();
 
         let block_hashes = self.hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
         //eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
         let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
         let blocks_data = self.hb_get_block_data_by_hashes(&block_hashes_set).await?;
 
-        let mut result = Vec::new();
-        for block_index in block_range.clone() {
-            let rel_index = block_index - block_range.start;
-
-            let addr = BlockAddress{ino, index: block_index};
-            let block_data = if let Some(block_hash) = block_hashes.get(&addr) {
-                if let Some(data) = blocks_data.get(block_hash) {
-                    data.deref()
-                } else { &vec![] }
-            } else { &vec![] };
-
-            let (rd_start, rd_size) = match rel_index {
-                0 => (bs.first_block_read_offset as usize, bs.bytes_to_read_first_block as usize),
-                _ => (0, (bs.size as usize - result.len()).min(bs.block_size as usize)),
-            };
-
-            if rd_start < block_data.len() {
-                // do a copy, as some blocks might be used multiple times
-                let rd_end = (rd_start + rd_size).min(block_data.len());
-                //eprintln!("extend (result.len(): {}) from slice ({block_index}): {rd_start}..{rd_end}", result.len());
-                result.extend_from_slice(&block_data[rd_start..rd_end]);
-            }
-        }
+        let result = parsers::hb_read_from_blocks(ino, &block_range, &bs, &block_hashes, &blocks_data)?;
 
         let mut buf_start = Buffer::default();
         buf_start.write_formatted(&start, &Locale::en);
@@ -556,75 +530,28 @@ impl<'a> Txn<'a> {
 
     pub async fn hb_get_block_hash_list_by_block_range(&mut self, ino: u64, block_range: Range<u64>) -> Result<HashMap<BlockAddress, inode::Hash>>
     {
-        let range = self.key_builder.block_hash_range(ino, block_range.clone());
-        let iter = self
-            .scan(
-                range,
-                block_range.count() as u32,
-            )
-            .await?;
-        Ok(iter.filter_map(|pair| {
-            let Some(key) = self.key_builder.parse_key_block_address(pair.key().into()) else {
-                tracing::error!("failed parsing block address from response 1");
-                return None;
-            };
-            let hash = if pair.value().len() >= blake3::OUT_LEN {
-                let data: &[u8; blake3::OUT_LEN] = pair.value()[0..blake3::OUT_LEN].try_into().unwrap();
-                inode::Hash::from_bytes(data.to_owned())
-            } else {
-                tracing::error!("failed parsing hash value from response 2");
-                return None;
-            };
-            Some((key, hash))
-        }).collect())
+        Ok(parsers::hb_get_block_hash_list_by_block_range(
+            &self.key_builder, ino, block_range, |range, cnt| {
+                self.scan(range, cnt).map(|x| {
+                    x.map(|y|y.collect::<Vec<_>>())
+                }).boxed()
+        }).await?)
     }
 
     pub async fn hb_get_block_data_by_hashes(&mut self, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, Arc<Vec<u8>>>>
     {
-        let mut watch = AutoStopWatch::start("get_hash_blocks_data");
-
-        let mut result = HashMap::new();
-        let mut keys = Vec::new();
-        for hash in hash_list {
-            if let Some(cached) = self.caches.block.get(hash).await {
-                result.insert(*hash, cached);
-            } else {
-                keys.push(self.key_builder.hashed_block(hash));
-            }
-        }
-
-        watch.sync("cached");
-
-        let mut uncached_blocks = HashMap::new();
-        let rcv_data_list = self.txn.batch_get(keys).await?;
-        for pair in rcv_data_list {
-            if let Some(hash) = self.key_builder.parse_key_hashed_block(pair.key().into()) {
-                let value = Arc::new(pair.into_value());
-                uncached_blocks.insert(hash, value.clone());
-                self.caches.block.insert(hash, value).await;
-            } else {
-                tracing::error!("failed parsing hash from response!");
-            }
-        }
-
-        watch.sync("fetch");
-
-        if self.fs_config.validate_read_hashes {
-            for (hash, value) in uncached_blocks.iter() {
-                let actual_hash = HashedBlock::calculate_hash(&value);
-                if hash != &actual_hash {
-                    return Err(FsError::ChecksumMismatch{hash: hash.clone(), actual_hash});
-                }
-            }
-
-            watch.sync("validate");
-        }
-
-        result.extend(uncached_blocks.into_iter());
-
-        watch.sync("done");
-
-        Ok(result)
+        Ok(parsers::hb_get_block_data_by_hashes(
+            &self.fs_config.clone(),
+            &self.caches.clone(),
+            &self.key_builder,
+            hash_list,
+            |keys| {
+                self.txn.batch_get(keys).map(|r| {
+                    r.map(|iter| {
+                        iter.collect::<Vec<_>>()
+                    })
+                }).boxed()
+            }).await?)
     }
 
     pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<bool> {
