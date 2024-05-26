@@ -149,7 +149,16 @@ impl<'a> Txn<'a> {
         if let Some(txn) = self.txn.as_mut() {
             txn.put(key, value).await
         } else {
-            self.raw.put(key, value).await
+            let key2 = key.into();
+            let value2 = value.into();
+            let raw2 = self.raw.clone();
+            tokio::spawn((async move || {
+                let key3 = key2;
+                let value3 = value2;
+                let raw3 = raw2;
+                raw3.put(key3, value3).await
+            })());
+            Ok(())
         }
     }
 
@@ -165,16 +174,25 @@ impl<'a> Txn<'a> {
         if let Some(txn) = self.txn.as_mut() {
             txn.batch_mutate(mutations).await
         } else {
-            let mut puts = Vec::new();
             let mut deletes = Vec::new();
             for entry in mutations.into_iter() {
                 match entry {
                     Mutation::Delete(key) => deletes.push(key),
-                    Mutation::Put(key, value) => puts.push(KvPair(key, value)),
+                    Mutation::Put(key, value) => {
+                        let clone = self.raw.clone();
+                        tokio::spawn((async move || {
+                            let clone2 = clone;
+                            let key2 = key;
+                            let value2 = value;
+                            clone2.put(key2, value2).await
+                        })());
+                    }
                 }
             };
-            self.raw.batch_delete(deletes).await?;
-            self.raw.batch_put(puts).await
+            if deletes.len() > 0 {
+                self.raw.batch_delete(deletes).await?;
+            }
+            Ok(())
         }
     }
 
