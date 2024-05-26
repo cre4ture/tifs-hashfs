@@ -151,6 +151,7 @@ define_options! { MountOption (FuseMountOption) {
     define ValidateReadHashes,
     define RawHashedBlocks,
     define BatchRawBlockWrite,
+    define PureRaw,
 }}
 
 #[cfg(test)]

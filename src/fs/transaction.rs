@@ -1,15 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
-use std::ops::{Deref, DerefMut, Range, RangeInclusive};
+use std::ops::{Deref, Range, RangeInclusive};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
-use futures::FutureExt;
 use num_format::{Buffer, Locale};
-use tikv_client::{Backoff, Key, KvPair, RetryOptions, Transaction, TransactionOptions};
+use tikv_client::{Backoff, BoundRange, Key, KvPair, RetryOptions, Timestamp, Transaction, TransactionOptions, Value};
 use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
 use uuid::Uuid;
@@ -23,6 +22,7 @@ use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
+use super::hashed_block::HashedBlock;
 use super::index::Index;
 use super::inode::{self, BlockAddress, Inode, TiFsHash};
 use super::key::{ScopedKeyBuilder, ScopedKeyKind, ROOT_INODE};
@@ -33,6 +33,8 @@ use super::reply::{DirItem, StatFs};
 use super::tikv_fs::{TiFsCaches, TiFsConfig, DIR_PARENT, DIR_SELF};
 use super::transaction_client_mux::TransactionClientMux;
 
+use tikv_client::Result as TiKvResult;
+
 
 pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000, 100);
 pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000);
@@ -41,8 +43,9 @@ pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
 pub struct Txn<'ol> {
     key_builder: &'ol ScopedKeyBuilder<'ol>,
     _instance_id: Uuid,
-    txn: Transaction,
+    txn: Option<Transaction>,
     raw: Arc<tikv_client::RawClient>,
+    raw_txn: Option<Box<Txn<'ol>>>,
     fs_config: TiFsConfig,
     block_size: u64,            // duplicate of fs_config.block_size. Keep it to avoid refactoring efforts.
     max_blocks: Option<u64>,
@@ -79,25 +82,140 @@ impl<'a> Txn<'a> {
         caches: TiFsCaches,
         max_name_len: u32,
     ) -> Result<Self> {
-        let options = TransactionOptions::new_optimistic().use_async_commit();
-        let options = options.retry_options(RetryOptions {
-            region_backoff: DEFAULT_REGION_BACKOFF,
-            lock_backoff: OPTIMISTIC_BACKOFF,
-        });
-        let txn: Transaction = client.give_one()
-            .begin_with_options(options)
-            .await?;
+        let txn = if fs_config.pure_raw { None } else {
+            let options = TransactionOptions::new_optimistic().use_async_commit();
+            let options = options.retry_options(RetryOptions {
+                region_backoff: DEFAULT_REGION_BACKOFF,
+                lock_backoff: OPTIMISTIC_BACKOFF,
+            });
+            Some(client.give_one().begin_with_options(options).await?)
+        };
         Ok(Txn {
             key_builder,
             _instance_id: instance_id,
             txn,
-            raw,
+            raw: raw.clone(),
+            raw_txn: Some(Box::new(Txn::pure_raw(key_builder, instance_id, raw, fs_config, caches.clone(), max_name_len))),
             fs_config: fs_config.clone(),
             block_size: fs_config.block_size,
             max_blocks: fs_config.max_size.map(|size| size / fs_config.block_size as u64),
             max_name_len,
             caches,
         })
+    }
+
+    pub fn pure_raw(
+        key_builder: &'a ScopedKeyBuilder<'a>,
+        instance_id: Uuid,
+        raw: Arc<tikv_client::RawClient>,
+        fs_config: &TiFsConfig,
+        caches: TiFsCaches,
+        max_name_len: u32,
+    ) -> Self {
+        Txn {
+            key_builder,
+            _instance_id: instance_id,
+            txn: None,
+            raw,
+            raw_txn: None,
+            fs_config: fs_config.clone(),
+            block_size: fs_config.block_size,
+            max_blocks: fs_config.max_size.map(|size| size / fs_config.block_size as u64),
+            max_name_len,
+            caches,
+        }
+    }
+
+    pub async fn get(&mut self, key: impl Into<Key>) -> TiKvResult<Option<Value>> {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.get(key).await
+        } else {
+            self.raw.get(key).await
+        }
+    }
+
+    pub async fn batch_get(
+        &mut self,
+        keys: impl IntoIterator<Item = impl Into<Key>>,
+    ) -> TiKvResult<Vec<KvPair>> {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.batch_get(keys).await.map(|iter|iter.collect::<Vec<_>>())
+        } else {
+            self.raw.batch_get(keys).await
+        }
+    }
+
+    pub async fn put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> TiKvResult<()> {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.put(key, value).await
+        } else {
+            self.raw.put(key, value).await
+        }
+    }
+
+    pub async fn delete(&mut self, key: impl Into<Key>) -> TiKvResult<()> {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.delete(key).await
+        } else {
+            self.raw.delete(key).await
+        }
+    }
+
+    pub async fn batch_mutate(&mut self, mutations: impl IntoIterator<Item = Mutation>) -> TiKvResult<()> {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.batch_mutate(mutations).await
+        } else {
+            let mut puts = Vec::new();
+            let mut deletes = Vec::new();
+            for entry in mutations.into_iter() {
+                match entry {
+                    Mutation::Delete(key) => deletes.push(key),
+                    Mutation::Put(key, value) => puts.push(KvPair(key, value)),
+                }
+            };
+            self.raw.batch_delete(deletes).await?;
+            self.raw.batch_put(puts).await
+        }
+    }
+
+    pub async fn scan(
+        &mut self,
+        range: impl Into<BoundRange>,
+        limit: u32,
+    ) -> TiKvResult<Vec<KvPair>> {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.scan(range, limit).await.map(|iter|iter.collect::<Vec<_>>())
+        } else {
+            self.raw.scan(range, limit).await
+        }
+    }
+
+    pub async fn scan_keys(
+        &mut self,
+        range: impl Into<BoundRange>,
+        limit: u32,
+    ) -> TiKvResult<Vec<Key>> {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.scan_keys(range, limit).await.map(|iter|iter.collect::<Vec<_>>())
+        } else {
+            self.raw.scan_keys(range, limit).await
+        }
+    }
+
+    pub async fn commit(&mut self) -> TiKvResult<Option<Timestamp>> {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.commit().await
+        } else {
+            Ok(Some(Timestamp::default()))
+        }
+    }
+
+    pub async fn rollback(&mut self) -> TiKvResult<()> {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.rollback().await
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn open(&mut self, ino: u64, use_id: Uuid) -> Result<()> {
@@ -379,10 +497,7 @@ impl<'a> Txn<'a> {
         //eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
         let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
         let blocks_data = if self.fs_config.raw_hashed_blocks {
-            parsers::hb_get_block_data_by_hashes(&self.fs_config, &self.caches, self.key_builder, &block_hashes_set,
-                |keys| {
-                    self.raw.batch_get(keys).boxed()
-                }).await?
+            self.raw_txn.as_mut().unwrap().hb_get_block_data_by_hashes(&block_hashes_set).await?
         } else {
             self.hb_get_block_data_by_hashes(&block_hashes_set).await?
         };
@@ -414,7 +529,7 @@ impl<'a> Txn<'a> {
             )
             .await?;
 
-        let mut data = pairs
+        let mut data = pairs.into_iter()
             .enumerate()
             .flat_map(|(i, pair)| {
                 let key = if let Ok(ScopedKeyKind::Block { ino: _, block }) =
@@ -538,30 +653,74 @@ impl<'a> Txn<'a> {
         Ok(())
     }
 
-    pub async fn hb_get_block_hash_list_by_block_range(&mut self, ino: u64, block_range: Range<u64>) -> Result<HashMap<BlockAddress, inode::Hash>>
+    pub async fn hb_get_block_hash_list_by_block_range(&mut self, ino: u64, block_range: Range<u64>
+    ) -> Result<HashMap<BlockAddress, inode::Hash>>
     {
-        Ok(parsers::hb_get_block_hash_list_by_block_range(
-            &self.key_builder, ino, block_range, |range, cnt| {
-                self.scan(range, cnt).map(|x| {
-                    x.map(|y|y.collect::<Vec<_>>())
-                }).boxed()
-        }).await?)
+        let range = self.key_builder.block_hash_range(ino, block_range.clone());
+        let iter = self.scan(
+                range,
+                block_range.count() as u32,
+            )
+            .await?;
+        Ok(iter.into_iter().filter_map(|pair| {
+            let Some(key) = self.key_builder.parse_key_block_address(pair.key().into()) else {
+                tracing::error!("failed parsing block address from response 1");
+                return None;
+            };
+            let Some(hash) = ScopedKeyBuilder::parse_hash_from_dyn_sized_array(pair.value()) else {
+                tracing::error!("failed parsing hash value from response 2");
+                return None;
+            };
+            Some((key, hash))
+        }).collect())
     }
 
     pub async fn hb_get_block_data_by_hashes(&mut self, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, Arc<Vec<u8>>>>
     {
-        Ok(parsers::hb_get_block_data_by_hashes(
-            &self.fs_config.clone(),
-            &self.caches.clone(),
-            &self.key_builder,
-            hash_list,
-            |keys| {
-                self.txn.batch_get(keys).map(|r| {
-                    r.map(|iter| {
-                        iter.collect::<Vec<_>>()
-                    })
-                }).boxed()
-            }).await?)
+        let mut watch = AutoStopWatch::start("get_hash_blocks_data");
+
+        let mut result = HashMap::new();
+        let mut keys = Vec::<Key>::new();
+        for hash in hash_list {
+            if let Some(cached) = self.caches.block.get(hash).await {
+                result.insert(*hash, cached);
+            } else {
+                keys.push(self.key_builder.hashed_block(hash).into());
+            }
+        }
+
+        watch.sync("cached");
+
+        let mut uncached_blocks = HashMap::new();
+        let rcv_data_list = self.batch_get(keys).await?;
+        for pair in rcv_data_list {
+            if let Some(hash) = self.key_builder.parse_key_hashed_block(pair.key().into()) {
+                let value = Arc::new(pair.into_value());
+                uncached_blocks.insert(hash, value.clone());
+                self.caches.block.insert(hash, value).await;
+            } else {
+                tracing::error!("failed parsing hash from response!");
+            }
+        }
+
+        watch.sync("fetch");
+
+        if self.fs_config.validate_read_hashes {
+            for (hash, value) in uncached_blocks.iter() {
+                let actual_hash = HashedBlock::calculate_hash(&value);
+                if hash != &actual_hash {
+                    return Err(FsError::ChecksumMismatch{hash: hash.clone(), actual_hash});
+                }
+            }
+
+            watch.sync("validate");
+        }
+
+        result.extend(uncached_blocks.into_iter());
+
+        watch.sync("done");
+
+        Ok(result)
     }
 
     pub async fn hb_write_data(&mut self, inode: &mut Inode, start: u64, data: &Bytes) -> Result<bool> {
@@ -610,7 +769,7 @@ impl<'a> Txn<'a> {
                 let result = if self.fs_config.raw_hashed_blocks {
                     self.raw.scan_keys(key_range, 1).await?
                 } else {
-                    self.scan_keys(key_range, 1).await?.collect()
+                    self.scan_keys(key_range, 1).await?
                 };
                 if result.len() > 0 {
                     new_blocks.remove(&hash);
@@ -619,7 +778,7 @@ impl<'a> Txn<'a> {
             watch.sync("exv");
         } else {
             let exists_keys_request = new_blocks.keys().map(|k| self.key_builder.hashed_block_exists(k)).collect::<Vec<_>>();
-            let exists_keys_response = self.batch_get(exists_keys_request).await?.collect::<Vec<_>>();
+            let exists_keys_response = self.batch_get(exists_keys_request).await?;
             for KvPair(key, _) in exists_keys_response.into_iter() {
                 let key = (&key).into();
                 let hash = self.key_builder.parse_key_hashed_block(key).ok_or(FsError::UnknownError("failed parsing hash from response".into()))?;
@@ -934,7 +1093,7 @@ impl<'a> Txn<'a> {
                 (next_inode - ROOT_INODE) as u32,
             )
             .await?
-            .map(|pair| Inode::deserialize(pair.value()))
+            .into_iter().map(|pair| Inode::deserialize(pair.value()))
             .try_fold((0, 0), |(blocks, files), inode| {
                 Ok::<_, FsError>((blocks + inode?.blocks, files + 1))
             })?;
@@ -963,19 +1122,5 @@ impl<'a> Txn<'a> {
         meta.last_stat = Some(stat.clone());
         self.save_meta(&meta).await?;
         Ok(stat)
-    }
-}
-
-impl<'a> Deref for Txn<'a> {
-    type Target = Transaction;
-
-    fn deref(&self) -> &Self::Target {
-        &self.txn
-    }
-}
-
-impl<'a> DerefMut for Txn<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.txn
     }
 }

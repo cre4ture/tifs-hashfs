@@ -124,6 +124,7 @@ pub struct TiFsConfig {
     pub validate_read_hashes: bool,
     pub raw_hashed_blocks: bool,
     pub batch_raw_block_write: bool,
+    pub pure_raw: bool,
 }
 
 pub struct TiFs {
@@ -230,6 +231,9 @@ impl TiFs {
                     }).unwrap_or(false),
                     batch_raw_block_write: options.iter().find_map(|opt|{
                         (MountOption::BatchRawBlockWrite == *opt).then_some(true)
+                    }).unwrap_or(false),
+                    pure_raw: options.iter().find_map(|opt|{
+                        (MountOption::PureRaw == *opt).then_some(true)
                     }).unwrap_or(false),
                 },
                 mut_data: RwLock::new(TiFsMutable::new(block_size)),
