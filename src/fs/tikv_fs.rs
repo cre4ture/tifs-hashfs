@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
-use std::matches;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -16,7 +15,6 @@ use fuser::*;
 use futures::FutureExt;
 use libc::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET};
 use moka::future::Cache;
-use parse_size::parse_size;
 use tikv_client::Config;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -35,7 +33,7 @@ use super::reply::{
 };
 use super::transaction::Txn;
 use super::transaction_client_mux::TransactionClientMux;
-use crate::MountOption;
+use crate::{MountOption, TiFsConfig};
 
 pub const DIR_SELF: ByteString = ByteString::from_static(".");
 pub const DIR_PARENT: ByteString = ByteString::from_static("..");
@@ -123,20 +121,6 @@ impl TiFsMutable {
     }
 }
 
-#[derive(Clone)]
-pub struct TiFsConfig {
-    pub block_size: u64,
-    pub enable_atime: bool,
-    pub enable_mtime: bool,
-    pub hashed_blocks: bool,
-    pub max_size: Option<u64>,
-    pub validate_writes: bool,
-    pub validate_read_hashes: bool,
-    pub raw_hashed_blocks: bool,
-    pub batch_raw_block_write: bool,
-    pub pure_raw: bool,
-}
-
 pub struct TiFs {
     pub me: Weak<TiFs>,
     pub name: Vec<u8>,
@@ -154,7 +138,6 @@ pub type BoxedFuture<'a, T> = Pin<Box<dyn 'a + Send + Future<Output = Result<T>>
 
 impl TiFs {
     pub const SCAN_LIMIT: u32 = 1 << 10;
-    pub const DEFAULT_BLOCK_SIZE: u64 = 1 << 16;
     pub const MAX_NAME_LEN: u32 = 1 << 8;
 
     #[instrument]
@@ -174,22 +157,7 @@ impl TiFs {
             .map_err(|err| anyhow!("{}", err))?;
         info!("connected to pd endpoints: {:?}", pd_endpoints);
 
-        let block_size = options
-            .iter()
-            .find_map(|option| match option {
-                MountOption::BlkSize(size) => parse_size(size)
-                    .map_err(|err| {
-                        error!("fail to parse blksize({}): {}", size, err);
-                        err
-                    })
-                    .map(|size| {
-                        debug!("block size: {}", size);
-                        size
-                    })
-                    .ok(),
-                _ => None,
-            })
-            .unwrap_or(Self::DEFAULT_BLOCK_SIZE);
+        let fs_config = TiFsConfig::from_options(&options);
 
         let fs = Arc::new_cyclic(|me| {
             TiFs {
@@ -200,53 +168,9 @@ impl TiFs {
                 raw,
                 pd_endpoints: pd_endpoints.clone().into_iter().map(Into::into).collect(),
                 client_config: cfg,
-                direct_io: options
-                    .iter()
-                    .any(|option| matches!(option, MountOption::DirectIO)),
-                fs_config: TiFsConfig {
-                    block_size,
-                    max_size: options.iter().find_map(|option| match option {
-                        MountOption::MaxSize(size) => parse_size(size)
-                            .map_err(|err| {
-                                error!("fail to parse maxsize({}): {}", size, err);
-                                err
-                            })
-                            .map(|size| {
-                                debug!("max size: {}", size);
-                                size
-                            })
-                            .ok(),
-                        _ => None,
-                    }),
-                    enable_atime: options.iter().find_map(|option| match option {
-                        MountOption::NoAtime => Some(false),
-                        MountOption::Atime => Some(true),
-                        _ => None,
-                    }).unwrap_or(true),
-                    enable_mtime: options.iter().find_map(|option| match option {
-                        MountOption::NoMtime => Some(false),
-                        _ => None,
-                    }).unwrap_or(true),
-                    hashed_blocks: options.iter().find_map(|opt|{
-                        (MountOption::HashedBlocks == *opt).then_some(true)
-                    }).unwrap_or(false),
-                    validate_writes: options.iter().find_map(|opt|{
-                        (MountOption::ValidateWrites == *opt).then_some(true)
-                    }).unwrap_or(false),
-                    validate_read_hashes: options.iter().find_map(|opt|{
-                        (MountOption::ValidateReadHashes == *opt).then_some(true)
-                    }).unwrap_or(false),
-                    raw_hashed_blocks: options.iter().find_map(|opt|{
-                        (MountOption::RawHashedBlocks == *opt).then_some(true)
-                    }).unwrap_or(false),
-                    batch_raw_block_write: options.iter().find_map(|opt|{
-                        (MountOption::BatchRawBlockWrite == *opt).then_some(true)
-                    }).unwrap_or(false),
-                    pure_raw: options.iter().find_map(|opt|{
-                        (MountOption::PureRaw == *opt).then_some(true)
-                    }).unwrap_or(false),
-                },
-                mut_data: RwLock::new(TiFsMutable::new(block_size)),
+                direct_io: fs_config.direct_io,
+                mut_data: RwLock::new(TiFsMutable::new(fs_config.block_size)),
+                fs_config,
             }
         });
 

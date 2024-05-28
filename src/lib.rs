@@ -15,7 +15,8 @@ use fs::tikv_fs::TiFs;
 use fuser::MountOption as FuseMountOption;
 use paste::paste;
 use tokio::fs::{metadata, read_to_string};
-use tracing::debug;
+use tracing::{debug, error};
+use parse_size::parse_size;
 
 const DEFAULT_TLS_CONFIG_PATH: &str = "~/.tifs/tls.toml";
 
@@ -152,7 +153,95 @@ define_options! { MountOption (FuseMountOption) {
     define RawHashedBlocks,
     define BatchRawBlockWrite,
     define PureRaw,
+    define NoExistenceCheck,
 }}
+
+#[derive(Clone)]
+pub struct TiFsConfig {
+    pub block_size: u64,
+    pub enable_atime: bool,
+    pub enable_mtime: bool,
+    pub direct_io: bool,
+    pub hashed_blocks: bool,
+    pub max_size: Option<u64>,
+    pub validate_writes: bool,
+    pub validate_read_hashes: bool,
+    pub raw_hashed_blocks: bool,
+    pub batch_raw_block_write: bool,
+    pub pure_raw: bool,
+    pub existence_check: bool,
+}
+
+impl TiFsConfig {
+    pub const DEFAULT_BLOCK_SIZE: u64 = 1 << 16;
+
+    pub fn from_options(options: &Vec<MountOption>) -> Self {
+        let block_size = options
+        .iter()
+        .find_map(|option| match option {
+            MountOption::BlkSize(size) => parse_size(size)
+                .map_err(|err| {
+                    error!("fail to parse blksize({}): {}", size, err);
+                    err
+                })
+                .map(|size| {
+                    debug!("block size: {}", size);
+                    size
+                })
+                .ok(),
+            _ => None,
+        })
+        .unwrap_or(Self::DEFAULT_BLOCK_SIZE);
+
+        TiFsConfig {
+            block_size,
+            direct_io: options.iter().any(|option| matches!(option, MountOption::DirectIO)),
+            max_size: options.iter().find_map(|option| match option {
+                MountOption::MaxSize(size) => parse_size(size)
+                    .map_err(|err| {
+                        error!("fail to parse maxsize({}): {}", size, err);
+                        err
+                    })
+                    .map(|size| {
+                        debug!("max size: {}", size);
+                        size
+                    })
+                    .ok(),
+                _ => None,
+            }),
+            enable_atime: options.iter().find_map(|option| match option {
+                MountOption::NoAtime => Some(false),
+                MountOption::Atime => Some(true),
+                _ => None,
+            }).unwrap_or(true),
+            enable_mtime: options.iter().find_map(|option| match option {
+                MountOption::NoMtime => Some(false),
+                _ => None,
+            }).unwrap_or(true),
+            hashed_blocks: options.iter().find_map(|opt|{
+                (MountOption::HashedBlocks == *opt).then_some(true)
+            }).unwrap_or(false),
+            validate_writes: options.iter().find_map(|opt|{
+                (MountOption::ValidateWrites == *opt).then_some(true)
+            }).unwrap_or(false),
+            validate_read_hashes: options.iter().find_map(|opt|{
+                (MountOption::ValidateReadHashes == *opt).then_some(true)
+            }).unwrap_or(false),
+            raw_hashed_blocks: options.iter().find_map(|opt|{
+                (MountOption::RawHashedBlocks == *opt).then_some(true)
+            }).unwrap_or(false),
+            batch_raw_block_write: options.iter().find_map(|opt|{
+                (MountOption::BatchRawBlockWrite == *opt).then_some(true)
+            }).unwrap_or(false),
+            pure_raw: options.iter().find_map(|opt|{
+                (MountOption::PureRaw == *opt).then_some(true)
+            }).unwrap_or(false),
+            existence_check: options.iter().find_map(|opt|{
+                (MountOption::NoExistenceCheck == *opt).then_some(false)
+            }).unwrap_or(true),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

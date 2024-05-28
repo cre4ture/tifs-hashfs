@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::fs::meta::StaticFsParameters;
 use crate::fs::utils::stop_watch::AutoStopWatch;
+use crate::TiFsConfig;
 
 use super::block::empty_block;
 use super::dir::Directory;
@@ -30,7 +31,7 @@ use super::meta::Meta;
 use super::mode::{as_file_kind, as_file_perm, make_mode};
 use super::parsers;
 use super::reply::{DirItem, StatFs};
-use super::tikv_fs::{TiFsCaches, TiFsConfig, DIR_PARENT, DIR_SELF};
+use super::tikv_fs::{TiFsCaches, DIR_PARENT, DIR_SELF};
 use super::transaction_client_mux::TransactionClientMux;
 
 use tikv_client::Result as TiKvResult;
@@ -771,30 +772,32 @@ impl<'a> Txn<'a> {
         }
         watch.sync("ca");
 
-        if self.fs_config.validate_writes {
-            let ks = new_blocks.keys().map(|x|x.to_owned()).collect::<Vec<_>>();
-            for hash in ks {
-                let key = self.key_builder.hashed_block(&hash);
-                let key_range: RangeInclusive<Key> = key.into()..=key.into();
-                let result = if self.fs_config.raw_hashed_blocks {
-                    self.raw.scan_keys(key_range, 1).await?
-                } else {
-                    self.scan_keys(key_range, 1).await?
-                };
-                if result.len() > 0 {
+        if self.fs_config.existence_check {
+            if self.fs_config.validate_writes {
+                let ks = new_blocks.keys().map(|x|x.to_owned()).collect::<Vec<_>>();
+                for hash in ks {
+                    let key = self.key_builder.hashed_block(&hash);
+                    let key_range: RangeInclusive<Key> = key.into()..=key.into();
+                    let result = if self.fs_config.raw_hashed_blocks {
+                        self.raw.scan_keys(key_range, 1).await?
+                    } else {
+                        self.scan_keys(key_range, 1).await?
+                    };
+                    if result.len() > 0 {
+                        new_blocks.remove(&hash);
+                    }
+                }
+                watch.sync("exv");
+            } else {
+                let exists_keys_request = new_blocks.keys().map(|k| self.key_builder.hashed_block_exists(k)).collect::<Vec<_>>();
+                let exists_keys_response = self.batch_get(exists_keys_request).await?;
+                for KvPair(key, _) in exists_keys_response.into_iter() {
+                    let key = (&key).into();
+                    let hash = self.key_builder.parse_key_hashed_block(key).ok_or(FsError::UnknownError("failed parsing hash from response".into()))?;
                     new_blocks.remove(&hash);
                 }
+                watch.sync("exb");
             }
-            watch.sync("exv");
-        } else {
-            let exists_keys_request = new_blocks.keys().map(|k| self.key_builder.hashed_block_exists(k)).collect::<Vec<_>>();
-            let exists_keys_response = self.batch_get(exists_keys_request).await?;
-            for KvPair(key, _) in exists_keys_response.into_iter() {
-                let key = (&key).into();
-                let hash = self.key_builder.parse_key_hashed_block(key).ok_or(FsError::UnknownError("failed parsing hash from response".into()))?;
-                new_blocks.remove(&hash);
-            }
-            watch.sync("exb");
         }
 
         let mut mutations_txn = Vec::<Mutation>::new();
