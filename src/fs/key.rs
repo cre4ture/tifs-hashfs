@@ -154,51 +154,51 @@ impl<'a> ScopedKeyBuilder<'a> {
             return Err(FsError::UnknownError("key with invalid prefix!".into()));
         }
         let (scope, data) = key.split_first().ok_or_else(invalid_key)?;
-        match *scope {
-            ScopedKey::META => Ok(self.meta()),
+        let kind = match *scope {
+            ScopedKey::META => ScopedKeyKind::Meta,
             ScopedKey::INODE => {
                 let ino = u64::from_be_bytes(*data.array_chunks().next().ok_or_else(invalid_key)?);
-                Ok(self.inode(ino))
+                ScopedKeyKind::Inode(ino)
             }
             ScopedKey::BLOCK => {
                 let mut arrays = data.array_chunks();
                 let ino = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
                 let block = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                Ok(self.block(ino, block))
+                ScopedKeyKind::Block { ino, block }
             }
             ScopedKey::HANDLER => {
                 let mut arrays = data.array_chunks();
                 let ino = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
                 let handler = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                Ok(self.handler(ino, handler))
+                ScopedKeyKind::FileHandler { ino, handler }
             }
             ScopedKey::INDEX => {
                 let parent =
                     u64::from_be_bytes(*data.array_chunks().next().ok_or_else(invalid_key)?);
-                Ok(self.index(
-                    parent,
-                    std::str::from_utf8(&data[size_of::<u64>()..]).map_err(|_| invalid_key())?,
-                ))
+                let name = std::str::from_utf8(&data[size_of::<u64>()..]).map_err(|_| invalid_key())?;
+                ScopedKeyKind::FileIndex { parent, name }
             }
             ScopedKey::HASHED_BLOCK => {
-                Ok(ScopedKey{prefix, key_type: ScopedKeyKind::HashedBlock { hash: data }})
+                ScopedKeyKind::HashedBlock { hash: data }
             }
             ScopedKey::HASH_OF_BLOCK => {
                 let mut arrays = data.array_chunks();
                 let ino = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
                 let block = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                Ok(ScopedKey{prefix, key_type: ScopedKeyKind::HashOfBlock { ino, block }})
+                ScopedKeyKind::HashOfBlock { ino, block }
             }
             ScopedKey::HASHED_BLOCK_EXISTS => {
-                Ok(ScopedKey{prefix, key_type: ScopedKeyKind::HashedBlockExists { hash: data }})
+                ScopedKeyKind::HashedBlockExists { hash: data }
             }
             ScopedKey::OPENED_INODE => {
                 let ino = u64::from_be_bytes(*data.array_chunks().next().ok_or_else(invalid_key)?);
                 let uuid = data[size_of::<u64>()..].array_chunks().next().ok_or_else(invalid_key)?;
-                Ok(ScopedKey{prefix, key_type: ScopedKeyKind::OpenedInode { ino, uuid: uuid.clone() }})
+                ScopedKeyKind::OpenedInode { ino, uuid: uuid.clone() }
             }
-            _ => Err(invalid_key()),
-        }
+            _ => return Err(invalid_key()),
+        };
+
+        Ok(ScopedKey{key_type: kind, prefix})
     }
 }
 

@@ -1,26 +1,32 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
+use std::mem;
 use std::ops::{Deref, Range, RangeInclusive};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
+use futures::stream::FuturesUnordered;
+use futures::{Future, StreamExt, TryFutureExt};
+use multimap::MultiMap;
 use num_format::{Buffer, Locale};
 use tikv_client::{Backoff, BoundRange, Key, KvPair, RetryOptions, Timestamp, Transaction, TransactionOptions, Value};
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
 use uuid::Uuid;
 
 use crate::fs::meta::StaticFsParameters;
 use crate::fs::utils::stop_watch::AutoStopWatch;
-use crate::TiFsConfig;
 
 use super::block::empty_block;
 use super::dir::Directory;
 use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
+use super::fs_config::TiFsConfig;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::hashed_block::HashedBlock;
@@ -41,12 +47,75 @@ pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000
 pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000);
 pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
 
-pub struct Txn<'ol> {
-    key_builder: &'ol ScopedKeyBuilder<'ol>,
+pub fn make_chunks_hash_map<K,V>(input: HashMap<K,V>, max_chunk_size: usize) -> VecDeque<HashMap<K,V>>
+where
+    K: std::cmp::Eq,
+    K: std::hash::Hash,
+{
+    input.into_iter().fold(VecDeque::new(), |mut a,(k, v)|{
+        let last = a.back_mut();
+        if let Some(last) = last {
+            if last.len() < max_chunk_size {
+                last.insert(k, v);
+                return a;
+            }
+        }
+        let mut new_entry = HashMap::new();
+        new_entry.insert(k, v);
+        a.push_back(new_entry);
+        a
+    })
+}
+
+pub struct AsyncParallelPipeStage<F: Future + Send> {
+    pub in_progress_limit: usize,
+    pub in_progress: FuturesUnordered<JoinHandle<F::Output>>,
+    pub results: VecDeque<<F as Future>::Output>,
+    total: usize,
+}
+
+impl<F: Future + Send> AsyncParallelPipeStage<F>
+where
+    F: 'static,
+    F::Output: Send + 'static,
+{
+    pub fn new(in_progress_limit: usize) -> Self {
+        Self {
+            in_progress_limit,
+            in_progress: FuturesUnordered::new(),
+            results: VecDeque::new(),
+            total: 0
+        }
+    }
+
+    async fn push(&mut self, future: F) {
+        self.total += 1;
+        self.in_progress.push(tokio::spawn(future));
+
+        if self.in_progress.len() >= self.in_progress_limit {
+            let done = self.in_progress.next().await.unwrap().unwrap();
+            self.results.push_back(done);
+        }
+    }
+
+    async fn wait_finish_all(&mut self) {
+        for fut in mem::take(&mut self.in_progress).into_iter() {
+            let done = fut.await.unwrap();
+            self.results.push_back(done);
+        }
+    }
+
+    fn get_total(&self) -> usize {
+        self.total
+    }
+}
+
+pub struct Txn {
+    weak: Weak<Self>,
     _instance_id: Uuid,
-    txn: Option<Transaction>,
+    txn: Option<RwLock<Transaction>>,
     raw: Arc<tikv_client::RawClient>,
-    raw_txn: Option<Box<Txn<'ol>>>,
+    raw_txn: Option<TxnArc>,
     fs_config: TiFsConfig,
     block_size: u64,            // duplicate of fs_config.block_size. Keep it to avoid refactoring efforts.
     max_blocks: Option<u64>,
@@ -54,7 +123,9 @@ pub struct Txn<'ol> {
     caches: TiFsCaches,
 }
 
-impl<'a> Txn<'a> {
+pub type TxnArc = Arc<Txn>;
+
+impl Txn {
     const INLINE_DATA_THRESHOLD_BASE: u64 = 1 << 4;
 
     fn inline_data_threshold(&self) -> u64 {
@@ -65,7 +136,7 @@ impl<'a> Txn<'a> {
         self.block_size
     }
 
-    fn check_space_left(&self, meta: &Meta) -> Result<()> {
+    fn check_space_left(self: TxnArc, meta: &Meta) -> Result<()> {
         match meta.last_stat {
             Some(ref stat) if stat.bavail == 0 => {
                 Err(FsError::NoSpaceLeft(stat.bsize as u64 * stat.blocks))
@@ -75,14 +146,13 @@ impl<'a> Txn<'a> {
     }
 
     pub async fn begin_optimistic(
-        key_builder: &'a ScopedKeyBuilder<'a>,
         instance_id: Uuid,
         client: &TransactionClientMux,
         raw: Arc<tikv_client::RawClient>,
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
         max_name_len: u32,
-    ) -> Result<Self> {
+    ) -> Result<TxnArc> {
         let txn = if fs_config.pure_raw { None } else {
             let options = TransactionOptions::new_optimistic().use_async_commit();
             let options = options.retry_options(RetryOptions {
@@ -90,31 +160,31 @@ impl<'a> Txn<'a> {
                 lock_backoff: OPTIMISTIC_BACKOFF,
             });
             Some(client.give_one().begin_with_options(options).await?)
-        };
-        Ok(Txn {
-            key_builder,
-            _instance_id: instance_id,
-            txn,
-            raw: raw.clone(),
-            raw_txn: Some(Box::new(Txn::pure_raw(key_builder, instance_id, raw, fs_config, caches.clone(), max_name_len))),
-            fs_config: fs_config.clone(),
-            block_size: fs_config.block_size,
-            max_blocks: fs_config.max_size.map(|size| size / fs_config.block_size as u64),
-            max_name_len,
-            caches,
-        })
+        }.map(|x|RwLock::new(x));
+        Ok(TxnArc::new_cyclic(|weak| { Self {
+                weak: weak.clone(),
+                _instance_id: instance_id,
+                txn,
+                raw: raw.clone(),
+                raw_txn: Some(Txn::pure_raw(instance_id, raw, fs_config, caches.clone(), max_name_len)),
+                fs_config: fs_config.clone(),
+                block_size: fs_config.block_size,
+                max_blocks: fs_config.max_size.map(|size| size / fs_config.block_size as u64),
+                max_name_len,
+                caches,
+            }
+        }))
     }
 
     pub fn pure_raw(
-        key_builder: &'a ScopedKeyBuilder<'a>,
         instance_id: Uuid,
         raw: Arc<tikv_client::RawClient>,
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
         max_name_len: u32,
-    ) -> Self {
-        Txn {
-            key_builder,
+    ) -> TxnArc {
+        Arc::new_cyclic(|weak| Txn {
+            weak: weak.clone(),
             _instance_id: instance_id,
             txn: None,
             raw,
@@ -124,56 +194,56 @@ impl<'a> Txn<'a> {
             max_blocks: fs_config.max_size.map(|size| size / fs_config.block_size as u64),
             max_name_len,
             caches,
-        }
+        })
     }
 
-    pub async fn get(&mut self, key: impl Into<Key>) -> TiKvResult<Option<Value>> {
-        if let Some(txn) = self.txn.as_mut() {
-            txn.get(key).await
+    pub async fn get(self: TxnArc, key: impl Into<Key>) -> TiKvResult<Option<Value>> {
+        if let Some(txn) = &self.txn {
+            txn.write().await.get(key).await
         } else {
             self.raw.get(key).await
         }
     }
 
     pub async fn batch_get(
-        &mut self,
+        &self,
         keys: impl IntoIterator<Item = impl Into<Key>>,
     ) -> TiKvResult<Vec<KvPair>> {
-        if let Some(txn) = self.txn.as_mut() {
-            txn.batch_get(keys).await.map(|iter|iter.collect::<Vec<_>>())
+        if let Some(txn) = &self.txn {
+            txn.write().await.batch_get(keys).await.map(|iter|iter.collect::<Vec<_>>())
         } else {
             self.raw.batch_get(keys).await
         }
     }
 
-    pub async fn put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> TiKvResult<()> {
-        if let Some(txn) = self.txn.as_mut() {
-            txn.put(key, value).await
+    pub async fn put(self: TxnArc, key: impl Into<Key>, value: impl Into<Value>) -> TiKvResult<()> {
+        if let Some(txn) = &self.txn {
+            txn.write().await.put(key, value).await
         } else {
-            let key2 = key.into();
-            let value2 = value.into();
-            let raw2 = self.raw.clone();
-            tokio::spawn((async move || {
-                let key3 = key2;
-                let value3 = value2;
-                let raw3 = raw2;
-                raw3.put(key3, value3).await
-            })());
-            Ok(())
+            self.raw.put(key, value).await
         }
     }
 
-    pub async fn delete(&mut self, key: impl Into<Key>) -> TiKvResult<()> {
-        if let Some(txn) = self.txn.as_mut() {
-            txn.delete(key).await
+    pub async fn batch_put(me: Arc<Self>, pairs: Vec<KvPair>) -> TiKvResult<()> {
+        if let Some(txn) = &me.txn {
+            let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
+            txn.write().await.batch_mutate(mutations).await
+        } else {
+            me.raw.batch_put(pairs).await
+        }
+    }
+
+    pub async fn delete(self: TxnArc, key: impl Into<Key>) -> TiKvResult<()> {
+        if let Some(txn) = &self.txn {
+            txn.write().await.delete(key).await
         } else {
             self.raw.delete(key).await
         }
     }
 
-    pub async fn batch_mutate(&mut self, mutations: impl IntoIterator<Item = Mutation>) -> TiKvResult<()> {
-        if let Some(txn) = self.txn.as_mut() {
-            txn.batch_mutate(mutations).await
+    pub async fn batch_mutate(self: TxnArc, mutations: impl IntoIterator<Item = Mutation>) -> TiKvResult<()> {
+        if let Some(txn) = &self.txn {
+            txn.write().await.batch_mutate(mutations).await
         } else {
             let mut deletes = Vec::new();
             for entry in mutations.into_iter() {
@@ -198,78 +268,78 @@ impl<'a> Txn<'a> {
     }
 
     pub async fn scan(
-        &mut self,
+        &self,
         range: impl Into<BoundRange>,
         limit: u32,
     ) -> TiKvResult<Vec<KvPair>> {
-        if let Some(txn) = self.txn.as_mut() {
-            txn.scan(range, limit).await.map(|iter|iter.collect::<Vec<_>>())
+        if let Some(txn) = &self.txn {
+            txn.write().await.scan(range, limit).await.map(|iter|iter.collect::<Vec<_>>())
         } else {
             self.raw.scan(range, limit).await
         }
     }
 
     pub async fn scan_keys(
-        &mut self,
+        &self,
         range: impl Into<BoundRange>,
         limit: u32,
     ) -> TiKvResult<Vec<Key>> {
-        if let Some(txn) = self.txn.as_mut() {
-            txn.scan_keys(range, limit).await.map(|iter|iter.collect::<Vec<_>>())
+        if let Some(txn) = &self.txn {
+            txn.write().await.scan_keys(range, limit).await.map(|iter|iter.collect::<Vec<_>>())
         } else {
             self.raw.scan_keys(range, limit).await
         }
     }
 
-    pub async fn commit(&mut self) -> TiKvResult<Option<Timestamp>> {
-        if let Some(txn) = self.txn.as_mut() {
-            txn.commit().await
+    pub async fn commit(&self) -> TiKvResult<Option<Timestamp>> {
+        if let Some(txn) = &self.txn {
+            txn.write().await.commit().await
         } else {
             Ok(Some(Timestamp::default()))
         }
     }
 
-    pub async fn rollback(&mut self) -> TiKvResult<()> {
-        if let Some(txn) = self.txn.as_mut() {
-            txn.rollback().await
+    pub async fn rollback(&self) -> TiKvResult<()> {
+        if let Some(txn) = &self.txn {
+            txn.write().await.rollback().await
         } else {
             Ok(())
         }
     }
 
-    pub async fn open(&mut self, ino: u64, use_id: Uuid) -> Result<()> {
+    pub async fn open(self: Arc<Self>, ino: u64, use_id: Uuid) -> Result<()> {
         // check for existence
-        let _inode = self.read_inode(ino).await?;
+        let _inode = self.clone().read_inode(ino).await?;
         // publish opened state
-        let key = self.key_builder.opened_inode(ino, use_id);
-        self.put(key, &[]).await?;
+        let key = Key::from(self.key_builder().opened_inode(ino, use_id));
+        self.clone().put(key, &[]).await?;
         eprintln!("open-ino: {ino}, use_id: {use_id}");
         Ok(())
     }
 
-    pub async fn close(&mut self, ino: u64, use_id: Uuid) -> Result<()> {
+    pub async fn close(self: Arc<Self>, ino: u64, use_id: Uuid) -> Result<()> {
         // check for existence
-        let _inode = self.read_inode(ino).await?;
+        let _inode = self.clone().read_inode(ino).await?;
         // de-publish opened state
-        let key = self.key_builder.opened_inode(ino, use_id);
-        self.delete(key).await?;
+        let key = Key::from(self.key_builder().opened_inode(ino, use_id));
+        self.clone().delete(key).await?;
         eprintln!("close-ino: {ino}, use_id: {use_id}");
         Ok(())
     }
 
-    pub async fn read(&mut self, ino: u64, start: u64, size: u32) -> Result<Vec<u8>> {
-        self.read_data(ino, start, Some(size as u64), self.fs_config.enable_atime).await
+    pub async fn read(self: Arc<Self>, ino: u64, start: u64, size: u32) -> Result<Vec<u8>> {
+        self.clone().read_data(ino, start, Some(size as u64), self.fs_config.enable_atime).await
     }
 
-    pub async fn reserve_new_ino(&mut self) -> Result<u64> {
+    pub async fn reserve_new_ino(self: TxnArc) -> Result<u64> {
         let mut meta = self
-            .read_meta()
+            .clone().read_meta()
             .await?
             .unwrap_or_else(|| Meta::new(self.block_size as u64, StaticFsParameters{
                 hashed_blocks: self.fs_config.hashed_blocks
             }));
 
-        self.check_space_left(&meta)?;
+        self.clone().check_space_left(&meta)?;
 
         let ino = meta.inode_next;
         meta.inode_next += 1;
@@ -304,20 +374,20 @@ impl<'a> Txn<'a> {
         inode
     }
 
-    pub async fn check_if_dir_entry_exists(&mut self, parent: u64, name: &ByteString) -> Result<bool> {
+    pub async fn check_if_dir_entry_exists(self: Arc<Self>, parent: u64, name: &ByteString) -> Result<bool> {
         Ok(self.get_index(parent, name.clone()).await?.is_some())
     }
 
-    pub async fn connect_inode_to_directory(&mut self, parent: u64, name: &ByteString, inode: &Inode) -> Result<()> {
+    pub async fn connect_inode_to_directory(self: Arc<Self>, parent: u64, name: &ByteString, inode: &Inode) -> Result<()> {
         if parent >= ROOT_INODE {
-            if self.check_if_dir_entry_exists(parent, name).await? {
+            if self.clone().check_if_dir_entry_exists(parent, name).await? {
                 return Err(FsError::FileExist {
                     file: name.to_string(),
                 });
             }
-            self.set_index(parent, name.clone(), inode.ino).await?;
+            self.clone().set_index(parent, name.clone(), inode.ino).await?;
 
-            let mut dir = self.read_dir(parent).await?;
+            let mut dir = self.clone().read_dir(parent).await?;
             debug!("read dir({:?})", &dir);
 
             dir.push(DirItem {
@@ -333,7 +403,7 @@ impl<'a> Txn<'a> {
     }
 
     pub async fn make_inode(
-        &mut self,
+        self: TxnArc,
         parent: u64,
         name: ByteString,
         mode: u32,
@@ -341,11 +411,11 @@ impl<'a> Txn<'a> {
         uid: u32,
         rdev: u32,
     ) -> Result<Arc<Inode>> {
-        let ino = self.reserve_new_ino().await?;
+        let ino = self.clone().reserve_new_ino().await?;
 
         let inode = Self::initialize_inode(self.block_size, ino, mode, gid, uid, rdev);
 
-        self.connect_inode_to_directory(parent, &name, &inode).await?;
+        self.clone().connect_inode_to_directory(parent, &name, &inode).await?;
 
         let ptr = Arc::new(inode);
 
@@ -353,9 +423,9 @@ impl<'a> Txn<'a> {
         Ok(ptr)
     }
 
-    pub async fn get_index(&mut self, parent: u64, name: ByteString) -> Result<Option<u64>> {
-        let key = self.key_builder.index(parent, &name);
-        self.get(key)
+    pub async fn get_index(self: Arc<Self>, parent: u64, name: ByteString) -> Result<Option<u64>> {
+        let key = Key::from(self.key_builder().index(parent, &name));
+        self.clone().get(key)
             .await
             .map_err(FsError::from)
             .and_then(|value| {
@@ -365,20 +435,20 @@ impl<'a> Txn<'a> {
             })
     }
 
-    pub async fn set_index(&mut self, parent: u64, name: ByteString, ino: u64) -> Result<()> {
-        let key = self.key_builder.index(parent, &name);
+    pub async fn set_index(self: TxnArc, parent: u64, name: ByteString, ino: u64) -> Result<()> {
+        let key = Key::from(self.key_builder().index(parent, &name));
         let value = Index::new(ino).serialize()?;
-        Ok(self.put(key, value).await?)
+        Ok(self.clone().put(key, value).await?)
     }
 
-    pub async fn remove_index(&mut self, parent: u64, name: ByteString) -> Result<()> {
-        let key = self.key_builder.index(parent, &name);
-        Ok(self.delete(key).await?)
+    pub async fn remove_index(self: TxnArc, parent: u64, name: ByteString) -> Result<()> {
+        let key = Key::from(self.key_builder().index(parent, &name));
+        Ok(self.clone().delete(key).await?)
     }
 
-    pub async fn read_inode_uncached(&mut self, ino: u64) -> Result<Arc<Inode>> {
-        let key = self.key_builder.inode(ino);
-        let value = self
+    pub async fn read_inode_uncached(self: TxnArc, ino: u64) -> Result<Arc<Inode>> {
+        let key = Key::from(self.key_builder().inode(ino));
+        let value = self.clone()
             .get(key)
             .await?
             .ok_or(FsError::InodeNotFound { inode: ino })?;
@@ -387,7 +457,7 @@ impl<'a> Txn<'a> {
         Ok(inode)
     }
 
-    pub async fn read_inode(&mut self, ino: u64) -> Result<Arc<Inode>> {
+    pub async fn read_inode(self: TxnArc, ino: u64) -> Result<Arc<Inode>> {
         if let Some((time, value)) = self.caches.inode.get(&ino).await {
             if time.elapsed().as_secs() < 2 {
                 return Ok(value);
@@ -399,51 +469,59 @@ impl<'a> Txn<'a> {
         self.read_inode_uncached(ino).await
     }
 
-    pub async fn save_inode(&mut self, inode: &Arc<Inode>) -> Result<()> {
-        let key = self.key_builder.inode(inode.ino);
+    pub async fn read_inode_arc(self: Arc<Self>, ino: u64) -> Result<Arc<Inode>> {
+        self.read_inode(ino).await
+    }
+
+    pub async fn save_inode(self: TxnArc, inode: &Arc<Inode>) -> Result<()> {
+        let key = Key::from(self.key_builder().inode(inode.ino));
 
         if inode.nlink == 0 && inode.opened_fh == 0 {
-            self.delete(key).await?;
+            self.clone().delete(key).await?;
             self.caches.inode.remove(&inode.ino).await;
         } else {
-            self.put(key, inode.serialize()?).await?;
+            self.clone().put(key, inode.serialize()?).await?;
             self.caches.inode.insert(inode.ino, (Instant::now(), inode.clone())).await;
             debug!("save inode: {:?}", inode);
         }
         Ok(())
     }
 
-    pub async fn remove_inode(&mut self, ino: u64) -> Result<()> {
-        let key = self.key_builder.inode(ino);
-        self.delete(key).await?;
+    pub async fn remove_inode(self: TxnArc, ino: u64) -> Result<()> {
+        let key = Key::from(self.key_builder().inode(ino));
+        self.clone().delete(key).await?;
         self.caches.inode.remove(&ino).await;
         Ok(())
     }
 
-    pub async fn read_meta(&mut self) -> Result<Option<Meta>> {
-        let key = self.key_builder.meta();
-        let opt_data = self.get(key).await?;
+    pub fn key_builder(&self) -> ScopedKeyBuilder {
+        ScopedKeyBuilder::new(&self.fs_config.key_prefix)
+    }
+
+    pub async fn read_meta(self: TxnArc) -> Result<Option<Meta>> {
+        let key = Key::from(self.key_builder().meta());
+        let opt_data = self.clone().get(key).await?;
         opt_data.map(|data| Meta::deserialize(&data)).transpose()
     }
 
-    pub async fn save_meta(&mut self, meta: &Meta) -> Result<()> {
-        let key = self.key_builder.meta();
-        self.put(key, meta.serialize()?).await?;
+    pub async fn save_meta(self: TxnArc, meta: &Meta) -> Result<()> {
+        let key = Key::from(self.key_builder().meta());
+        self.clone().put(key, meta.serialize()?).await?;
         Ok(())
     }
 
-    async fn transfer_inline_data_to_block(&mut self, inode: &mut Inode) -> Result<()> {
+    async fn transfer_inline_data_to_block(self: TxnArc, inode: &mut Inode) -> Result<()> {
         debug_assert!(inode.size <= self.inline_data_threshold());
-        let key = self.key_builder.block(inode.ino, 0);
+        let key = Key::from(self.key_builder().block(inode.ino, 0));
         let mut data = inode.inline_data.clone().unwrap();
         data.resize(self.block_size as usize, 0);
-        self.put(key, data).await?;
+        self.clone().put(key, data).await?;
         inode.inline_data = None;
         Ok(())
     }
 
     async fn write_inline_data(
-        &mut self,
+        self: TxnArc,
         inode: &mut Inode,
         start: u64,
         data: &[u8],
@@ -472,13 +550,13 @@ impl<'a> Txn<'a> {
         inode.ctime = SystemTime::now();
         inode.set_size(inlined.len() as u64, self.block_size);
         inode.inline_data = Some(inlined);
-        self.save_inode(&Arc::new(inode.clone())).await?;
+        self.clone().save_inode(&Arc::new(inode.clone())).await?;
 
         Ok(size)
     }
 
     async fn read_inline_data(
-        &mut self,
+        &self,
         inode: &Inode,
         start: u64,
         size: u64,
@@ -498,18 +576,18 @@ impl<'a> Txn<'a> {
         Ok(data)
     }
 
-    async fn hb_read_data(&mut self, ino: u64, start: u64, size: u64) -> Result<Vec<u8>> {
+    async fn hb_read_data(self: TxnArc, ino: u64, start: u64, size: u64) -> Result<Vec<u8>> {
 
         let bs = BlockSplitterRead::new(self.block_size, start, size);
         let block_range = bs.block_range();
 
-        let block_hashes = self.hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
+        let block_hashes = self.clone().hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
         //eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
         let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
         let blocks_data = if self.fs_config.raw_hashed_blocks {
-            self.raw_txn.as_mut().unwrap().hb_get_block_data_by_hashes(&block_hashes_set).await?
+            self.raw_txn.as_ref().unwrap().clone().hb_get_block_data_by_hashes(&block_hashes_set).await?
         } else {
-            self.hb_get_block_data_by_hashes(&block_hashes_set).await?
+            self.clone().hb_get_block_data_by_hashes(&block_hashes_set).await?
         };
 
         let result = parsers::hb_read_from_blocks(ino, &block_range, &bs, &block_hashes, &blocks_data)?;
@@ -526,12 +604,12 @@ impl<'a> Txn<'a> {
         Ok(result)
     }
 
-    async fn read_data_traditional(&mut self, ino: u64, start: u64, size: u64) -> Result<Vec<u8>> {
+    async fn read_data_traditional(self: TxnArc, ino: u64, start: u64, size: u64) -> Result<Vec<u8>> {
         let target = start + size;
         let start_block = start / self.block_size as u64;
         let end_block = (target + self.block_size as u64 - 1) / self.block_size as u64;
 
-        let block_range = self.key_builder.block_range(ino, start_block..end_block);
+        let block_range = self.key_builder().block_range(ino, start_block..end_block);
         let pairs = self
             .scan(
                 block_range,
@@ -543,7 +621,7 @@ impl<'a> Txn<'a> {
             .enumerate()
             .flat_map(|(i, pair)| {
                 let key = if let Ok(ScopedKeyKind::Block { ino: _, block }) =
-                    self.key_builder.parse(pair.key().into()).map(|x|x.key_type)
+                    self.key_builder().parse(pair.key().into()).map(|x|x.key_type)
                 {
                     block
                 } else {
@@ -576,13 +654,13 @@ impl<'a> Txn<'a> {
     }
 
     pub async fn read_data(
-        &mut self,
+        self: Arc<Self>,
         ino: u64,
         start: u64,
         chunk_size: Option<u64>,
         update_atime: bool,
     ) -> Result<Vec<u8>> {
-        let attr = self.read_inode(ino).await?;
+        let attr = self.clone().read_inode(ino).await?;
         if start >= attr.size {
             return Ok(Vec::new());
         }
@@ -593,11 +671,11 @@ impl<'a> Txn<'a> {
         if update_atime {
             let mut attr = attr.deref().clone();
             attr.atime = SystemTime::now();
-            self.save_inode(&Arc::new(attr)).await?;
+            self.clone().save_inode(&Arc::new(attr)).await?;
         }
 
         if attr.inline_data.is_some() {
-            return self.read_inline_data(&attr, start, size).await;
+            return self.clone().read_inline_data(&attr, start, size).await;
         }
 
         if self.fs_config.hashed_blocks {
@@ -607,13 +685,13 @@ impl<'a> Txn<'a> {
         }
     }
 
-    pub async fn clear_data(&mut self, ino: u64) -> Result<u64> {
-        let mut attr = self.read_inode(ino).await?.deref().clone();
+    pub async fn clear_data(self: TxnArc, ino: u64) -> Result<u64> {
+        let mut attr = self.clone().read_inode(ino).await?.deref().clone();
         let end_block = (attr.size + self.block_size - 1) / self.block_size;
 
         for block in 0..end_block {
-            let key = self.key_builder.block(ino, block);
-            self.delete(key).await?;
+            let key = Key::from(self.key_builder().block(ino, block));
+            self.clone().delete(key).await?;
         }
 
         let clear_size = attr.size;
@@ -623,57 +701,57 @@ impl<'a> Txn<'a> {
         Ok(clear_size)
     }
 
-    pub async fn write_blocks_traditional(&mut self, ino: u64, start: u64, data: &Bytes) -> Result<()> {
+    pub async fn write_blocks_traditional(self: TxnArc, ino: u64, start: u64, data: &Bytes) -> Result<()> {
 
         let mut block_index = start / self.block_size;
-        let start_key = self.key_builder.block(ino, block_index);
+        let start_key = Key::from(self.key_builder().block(ino, block_index));
         let start_index = (start % self.block_size) as usize;
 
         let first_block_size = self.block_size as usize - start_index;
 
         let (first_block, mut rest) = data.split_at(first_block_size.min(data.len()));
 
-        let mut start_value = self
-            .get(start_key)
+        let mut start_value = self.clone()
+            .get(start_key.clone())
             .await?
             .unwrap_or_else(|| empty_block(self.block_size));
 
         start_value[start_index..start_index + first_block.len()].copy_from_slice(first_block);
 
-        self.put(start_key, start_value).await?;
+        self.clone().put(start_key, start_value).await?;
 
         while !rest.is_empty() {
             block_index += 1;
-            let key = self.key_builder.block(ino, block_index);
+            let key = Key::from(self.key_builder().block(ino, block_index));
             let (curent_block, current_rest) =
                 rest.split_at((self.block_size as usize).min(rest.len()));
             let mut value = curent_block.to_vec();
             if value.len() < self.block_size as usize {
-                let mut last_value = self
-                    .get(key)
+                let mut last_value = self.clone()
+                    .get(key.clone())
                     .await?
                     .unwrap_or_else(|| empty_block(self.block_size));
                 last_value[..value.len()].copy_from_slice(&value);
                 value = last_value;
             }
-            self.put(key, value).await?;
+            self.clone().put(key, value).await?;
             rest = current_rest;
         }
 
         Ok(())
     }
 
-    pub async fn hb_get_block_hash_list_by_block_range(&mut self, ino: u64, block_range: Range<u64>
+    pub async fn hb_get_block_hash_list_by_block_range(self: TxnArc, ino: u64, block_range: Range<u64>
     ) -> Result<HashMap<BlockAddress, inode::Hash>>
     {
-        let range = self.key_builder.block_hash_range(ino, block_range.clone());
+        let range = self.key_builder().block_hash_range(ino, block_range.clone());
         let iter = self.scan(
                 range,
                 block_range.count() as u32,
             )
             .await?;
         Ok(iter.into_iter().filter_map(|pair| {
-            let Some(key) = self.key_builder.parse_key_block_address(pair.key().into()) else {
+            let Some(key) = self.key_builder().parse_key_block_address(pair.key().into()) else {
                 tracing::error!("failed parsing block address from response 1");
                 return None;
             };
@@ -685,7 +763,7 @@ impl<'a> Txn<'a> {
         }).collect())
     }
 
-    pub async fn hb_get_block_data_by_hashes(&mut self, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, Arc<Vec<u8>>>>
+    pub async fn hb_get_block_data_by_hashes(self: TxnArc, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, Arc<Vec<u8>>>>
     {
         let mut watch = AutoStopWatch::start("get_hash_blocks_data");
 
@@ -695,7 +773,7 @@ impl<'a> Txn<'a> {
             if let Some(cached) = self.caches.block.get(hash).await {
                 result.insert(*hash, cached);
             } else {
-                keys.push(self.key_builder.hashed_block(hash).into());
+                keys.push(self.key_builder().hashed_block(hash).into());
             }
         }
 
@@ -704,7 +782,7 @@ impl<'a> Txn<'a> {
         let mut uncached_blocks = HashMap::new();
         let rcv_data_list = self.batch_get(keys).await?;
         for pair in rcv_data_list {
-            if let Some(hash) = self.key_builder.parse_key_hashed_block(pair.key().into()) {
+            if let Some(hash) = self.key_builder().parse_key_hashed_block(pair.key().into()) {
                 let value = Arc::new(pair.into_value());
                 uncached_blocks.insert(hash, value.clone());
                 self.caches.block.insert(hash, value).await;
@@ -733,14 +811,97 @@ impl<'a> Txn<'a> {
         Ok(result)
     }
 
-    pub async fn hb_write_data(&mut self, fh: &Arc<FileHandler>, start: u64, data: &Bytes) -> Result<bool> {
+    pub async fn hb_filter_existent_blocks(self: Arc<Self>, mut new_blocks: HashMap<TiFsHash, Arc<Vec<u8>>>) -> Result<HashMap<TiFsHash, Arc<Vec<u8>>>> {
+        if self.fs_config.existence_check {
+            if self.fs_config.validate_writes {
+                let key_list = new_blocks.keys().cloned().collect::<Vec<_>>();
+                for hash in key_list {
+                    let key = self.key_builder().hashed_block(&hash);
+                    let key_range: RangeInclusive<Key> = key.into()..=key.into();
+                    let result = if self.fs_config.raw_hashed_blocks {
+                        self.raw.scan_keys(key_range, 1).await?
+                    } else {
+                        self.scan_keys(key_range, 1).await?
+                    };
+                    if result.len() > 0 {
+                        new_blocks.remove(&hash);
+                    }
+                }
+            } else {
+                let exists_keys_request = new_blocks.keys().map(|k| self.key_builder().hashed_block_exists(k)).collect::<Vec<_>>();
+                let exists_keys_response = self.batch_get(exists_keys_request).await?;
+                for KvPair(key, _) in exists_keys_response.into_iter() {
+                    let key = (&key).into();
+                    let hash = self.key_builder().parse_key_hashed_block(key).ok_or(FsError::UnknownError("failed parsing hash from response".into()))?;
+                    new_blocks.remove(&hash);
+                }
+            }
+        }
+        Ok(new_blocks)
+    }
+
+
+    pub async fn hb_upload_new_blocks(self: Arc<Self>, new_blocks: HashMap<TiFsHash, Arc<Vec<u8>>>) -> Result<()> {
+        let mut mutations_txn = Vec::<Mutation>::new();
+        let mut mutations_raw = Vec::<KvPair>::new();
+
+        let new_blocks_len = new_blocks.len();
+        for (k, new_block) in new_blocks {
+            if self.fs_config.raw_hashed_blocks {
+                mutations_raw.push(KvPair(self.key_builder().hashed_block(&k).into(), new_block.deref().clone()));
+            } else {
+                mutations_txn.push(Mutation::Put(self.key_builder().hashed_block(&k).into(), new_block.deref().clone()));
+            }
+            mutations_txn.push(Mutation::Put(self.key_builder().hashed_block_exists(&k).into(), vec![]));
+        }
+
+        let raw_cnt = mutations_raw.len();
+        if raw_cnt > 0 {
+            if self.fs_config.batch_raw_block_write {
+                self.raw.batch_put_with_ttl(mutations_raw, vec![0; raw_cnt]).await
+                    .map_err(|e| {
+                        eprintln!("batch-hb_write_data(blocks: {}", new_blocks_len);
+                        e
+                    })?;
+            } else {
+                for KvPair(k,v) in mutations_raw.into_iter() {
+                    let raw_clone = self.raw.clone();
+                    let packed = async move ||{
+                        let k2 = k;
+                        let v2 = v;
+                        let raw_clone2 = raw_clone;
+                        raw_clone2.put(k2, v2).await
+                    };
+                    tokio::spawn(packed());
+                }
+            }
+        }
+
+        if mutations_txn.len() > 0 {
+            self.batch_mutate(mutations_txn).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn hb_upload_new_block_addresses(me: Arc<Self>, blocks_to_assign: VecDeque<(TiFsHash, Vec<BlockAddress>)>) -> Result<()> {
+        let mut kv_pairs = Vec::<KvPair>::new();
+        for (hash, addresses) in blocks_to_assign {
+            for addr in addresses {
+                kv_pairs.push(KvPair(me.key_builder().block_hash(addr).into(), hash.as_bytes().to_vec()));
+            }
+        }
+        Ok(Self::batch_put(me, kv_pairs).await?)
+    }
+
+    pub async fn hb_write_data(self: Arc<Self>, fh: Arc<FileHandler>, start: u64, data: Bytes) -> Result<bool> {
 
         let mut watch = AutoStopWatch::start("hb_wrt");
         let bs = BlockSplitterWrite::new(self.block_size, start, &data);
         let block_range = bs.get_range();
         let ino = fh.ino();
 
-        let hash_list_prev = self.hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
+        let hash_list_prev = self.clone().hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
         let input_block_hashes = hash_list_prev.len();
         watch.sync("hp");
 
@@ -752,7 +913,7 @@ impl<'a> Txn<'a> {
             ino, bs.last_data, 0, &hash_list_prev, &mut pre_data_hash_request
         );
 
-        let pre_data = self.hb_get_block_data_by_hashes(&pre_data_hash_request).await?;
+        let pre_data = self.clone().hb_get_block_data_by_hashes(&pre_data_hash_request).await?;
         watch.sync("pd");
         let mut new_blocks = HashMap::new();
         let mut new_block_hashes = HashMap::new();
@@ -772,72 +933,7 @@ impl<'a> Txn<'a> {
         }
         watch.sync("ca");
 
-        if self.fs_config.existence_check {
-            if self.fs_config.validate_writes {
-                let ks = new_blocks.keys().map(|x|x.to_owned()).collect::<Vec<_>>();
-                for hash in ks {
-                    let key = self.key_builder.hashed_block(&hash);
-                    let key_range: RangeInclusive<Key> = key.into()..=key.into();
-                    let result = if self.fs_config.raw_hashed_blocks {
-                        self.raw.scan_keys(key_range, 1).await?
-                    } else {
-                        self.scan_keys(key_range, 1).await?
-                    };
-                    if result.len() > 0 {
-                        new_blocks.remove(&hash);
-                    }
-                }
-                watch.sync("exv");
-            } else {
-                let exists_keys_request = new_blocks.keys().map(|k| self.key_builder.hashed_block_exists(k)).collect::<Vec<_>>();
-                let exists_keys_response = self.batch_get(exists_keys_request).await?;
-                for KvPair(key, _) in exists_keys_response.into_iter() {
-                    let key = (&key).into();
-                    let hash = self.key_builder.parse_key_hashed_block(key).ok_or(FsError::UnknownError("failed parsing hash from response".into()))?;
-                    new_blocks.remove(&hash);
-                }
-                watch.sync("exb");
-            }
-        }
-
-        let mut mutations_txn = Vec::<Mutation>::new();
-        let mut mutations_raw = Vec::<KvPair>::new();
-        // upload new blocks:
-        let written_blocks = new_blocks.len();
-        for (k, new_block) in new_blocks {
-            if self.fs_config.raw_hashed_blocks {
-                mutations_raw.push(KvPair(self.key_builder.hashed_block(&k).into(), new_block.deref().clone()));
-            } else {
-                mutations_txn.push(Mutation::Put(self.key_builder.hashed_block(&k).into(), new_block.deref().clone()));
-            }
-            mutations_txn.push(Mutation::Put(self.key_builder.hashed_block_exists(&k).into(), vec![]));
-        }
-
-        let raw_cnt = mutations_raw.len();
-        if raw_cnt > 0 {
-            if self.fs_config.batch_raw_block_write {
-                self.raw.batch_put_with_ttl(mutations_raw, vec![0; raw_cnt]).await
-                    .map_err(|e| {
-                        eprintln!("batch-hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,({input_block_hashes} skipped),wr_blk:{raw_cnt}raw/?-err:{e:?}", ino, start, data.len(), self.fs_config.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
-                        e
-                    })?;
-            } else {
-                for KvPair(k,v) in mutations_raw.into_iter() {
-                    let raw_clone = self.raw.clone();
-                    let packed = async move ||{
-                        let k2 = k;
-                        let v2 = v;
-                        let raw_clone2 = raw_clone;
-                        raw_clone2.put(k2, v2).await
-                    };
-                    tokio::spawn(packed());
-                }
-            }
-            watch.sync("rawbp-nw");
-        }
-
-        // remove outdated blocks:
-        // TODO!
+        let mut parallel_executor = AsyncParallelPipeStage::new(8);
 
         // filter out unchanged blocks:
         let mut skipped_new_block_hashes = 0;
@@ -849,42 +945,60 @@ impl<'a> Txn<'a> {
                 }
             }
         }
+        let new_block_hashes_len = new_block_hashes.len();
 
-        // write new block mapping:
-        let written_block_hashes = new_block_hashes.len();
-        for (k, new_hash) in new_block_hashes {
-            mutations_txn.push(Mutation::Put(self.key_builder.block_hash(k).into(), new_hash.as_bytes().to_vec()));
+        let mut mm = new_block_hashes.into_iter().map(|(k,v)| (v,k)).collect::<MultiMap<_,_>>();
+
+        let chunks: VecDeque<HashMap<TiFsHash, Arc<Vec<u8>>>> = make_chunks_hash_map(new_blocks, 4);
+
+        for chunk in chunks {
+            let blocks_to_assign = chunk.keys().filter_map(|hash| {
+                let values = mm.remove(hash);
+                values.map(|values|(hash.clone(), values))
+            }).collect::<VecDeque<_>>();
+
+            let r = self.weak.upgrade().unwrap();
+            let r2 = r.clone();
+
+            let fut = Self::hb_filter_existent_blocks(r.clone(), chunk)
+            .and_then(move |remaining_new_blocks|{
+                Self::hb_upload_new_blocks(r, remaining_new_blocks)
+            }).and_then(move |_|{
+                Self::hb_upload_new_block_addresses(r2, blocks_to_assign)
+            });
+
+            parallel_executor.push(fut).await;
         }
+
+        // remove outdated blocks:
+        // TODO!
+
+        parallel_executor.wait_finish_all().await;
+        let total_jobs = parallel_executor.get_total();
 
         watch.sync("pm");
 
-        // execute all
-        let was_modified = mutations_txn.len() > 0;
-        if was_modified {
-            self.batch_mutate(mutations_txn).await?;
-            watch.sync("m");
-        }
+        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,jobs:{total_jobs}({skipped_new_block_hashes}/{input_block_hashes} skipped)", ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
 
-        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,wr_bl_hash:{written_block_hashes}({skipped_new_block_hashes}/{input_block_hashes} skipped),wr_blk:{raw_cnt}raw/{written_blocks}", ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
-
+        let was_modified = new_block_hashes_len > 0;
         Ok(was_modified)
     }
 
     #[instrument(skip(self, data))]
-    pub async fn write(&mut self, fh: Arc<FileHandler>, start: u64, data: Bytes) -> Result<usize> {
+    pub async fn write(self: TxnArc, fh: Arc<FileHandler>, start: u64, data: Bytes) -> Result<usize> {
         let mut watch = AutoStopWatch::start("write_data");
         let ino = fh.ino();
         debug!("write data at ({})[{}]", ino, start);
         //let meta = self.read_meta().await?.unwrap(); // TODO: is this needed?
         //self.check_space_left(&meta)?;
 
-        let mut inode = self.read_inode(ino).await?.deref().clone();
+        let mut inode = self.clone().read_inode(ino).await?.deref().clone();
         let size = data.len();
         let target = start + size as u64;
         watch.sync("read_inode");
 
         if inode.inline_data.is_some() && target > self.inline_data_threshold() {
-            self.transfer_inline_data_to_block(&mut inode).await?;
+            self.clone().transfer_inline_data_to_block(&mut inode).await?;
             watch.sync("transfer_inline");
         }
 
@@ -897,9 +1011,9 @@ impl<'a> Txn<'a> {
         }
 
         let content_was_modified = if self.fs_config.hashed_blocks {
-            self.hb_write_data(&fh, start, &data).await?
+            self.clone().hb_write_data(fh, start, data).await?
         } else {
-            self.write_blocks_traditional(ino, start, &data).await?;
+            self.clone().write_blocks_traditional(ino, start, &data).await?;
             true
         };
 
@@ -924,37 +1038,37 @@ impl<'a> Txn<'a> {
         inode.blocks = 1;
     }
 
-    pub async fn write_link(&mut self, inode: &mut Inode, data: Bytes) -> Result<usize> {
+    pub async fn write_link(self: TxnArc, inode: &mut Inode, data: Bytes) -> Result<usize> {
         debug_assert!(inode.file_attr.kind == FileType::Symlink);
         inode.inline_data = None;
         inode.set_size(0, self.block_size);
         self.write_inline_data(inode, 0, &data).await
     }
 
-    pub async fn read_link(&mut self, ino: u64) -> Result<Vec<u8>> {
-        let inode = self.read_inode(ino).await?;
+    pub async fn read_link(self: TxnArc, ino: u64) -> Result<Vec<u8>> {
+        let inode = self.clone().read_inode(ino).await?;
         debug_assert!(inode.file_attr.kind == FileType::Symlink);
         let size = inode.size;
         if self.fs_config.enable_atime {
             let mut inode = inode.deref().clone();
             inode.atime = SystemTime::now();
-            self.save_inode(&Arc::new(inode)).await?;
+            self.clone().save_inode(&Arc::new(inode)).await?;
         }
         self.read_inline_data(&inode, 0, size).await
     }
 
-    pub async fn link(&mut self, ino: u64, newparent: u64, newname: ByteString) -> Result<Arc<Inode>> {
-        if let Some(old_ino) = self.get_index(newparent, newname.clone()).await? {
-            let inode = self.read_inode(old_ino).await?;
+    pub async fn link(self: TxnArc, ino: u64, newparent: u64, newname: ByteString) -> Result<Arc<Inode>> {
+        if let Some(old_ino) = self.clone().get_index(newparent, newname.clone()).await? {
+            let inode = self.clone().read_inode(old_ino).await?;
             match inode.kind {
-                FileType::Directory => self.rmdir(newparent, newname.clone()).await?,
-                _ => self.unlink(newparent, newname.clone()).await?,
+                FileType::Directory => self.clone().rmdir(newparent, newname.clone()).await?,
+                _ => self.clone().unlink(newparent, newname.clone()).await?,
             }
         }
-        self.set_index(newparent, newname.clone(), ino).await?;
+        self.clone().set_index(newparent, newname.clone(), ino).await?;
 
-        let mut inode = self.read_inode(ino).await?.deref().clone();
-        let mut dir = self.read_dir(newparent).await?;
+        let mut inode = self.clone().read_inode(ino).await?.deref().clone();
+        let mut dir = self.clone().read_dir(newparent).await?;
 
         dir.push(DirItem {
             ino,
@@ -962,7 +1076,7 @@ impl<'a> Txn<'a> {
             typ: inode.kind,
         });
 
-        self.save_dir(newparent, &dir).await?;
+        self.clone().save_dir(newparent, &dir).await?;
         inode.nlink += 1;
         inode.ctime = SystemTime::now();
         let ptr = Arc::new(inode);
@@ -970,36 +1084,36 @@ impl<'a> Txn<'a> {
         Ok(ptr)
     }
 
-    pub async fn unlink(&mut self, parent: u64, name: ByteString) -> Result<()> {
-        match self.get_index(parent, name.clone()).await? {
+    pub async fn unlink(self: TxnArc, parent: u64, name: ByteString) -> Result<()> {
+        match self.clone().get_index(parent, name.clone()).await? {
             None => Err(FsError::FileNotFound {
                 file: name.to_string(),
             }),
             Some(ino) => {
-                self.remove_index(parent, name.clone()).await?;
-                let parent_dir = self.read_dir(parent).await?;
+                self.clone().remove_index(parent, name.clone()).await?;
+                let parent_dir = self.clone().read_dir(parent).await?;
                 let new_parent_dir: Directory = parent_dir
                     .into_iter()
                     .filter(|item| item.name != *name)
                     .collect();
-                self.save_dir(parent, &new_parent_dir).await?;
+                self.clone().save_dir(parent, &new_parent_dir).await?;
 
-                let mut inode = self.read_inode(ino).await?.deref().clone();
+                let mut inode = self.clone().read_inode(ino).await?.deref().clone();
                 inode.nlink -= 1;
                 inode.ctime = SystemTime::now();
-                self.save_inode(&Arc::new(inode)).await?;
+                self.clone().save_inode(&Arc::new(inode)).await?;
                 Ok(())
             }
         }
     }
 
-    pub async fn rmdir(&mut self, parent: u64, name: ByteString) -> Result<()> {
-        match self.get_index(parent, name.clone()).await? {
+    pub async fn rmdir(self: TxnArc, parent: u64, name: ByteString) -> Result<()> {
+        match self.clone().get_index(parent, name.clone()).await? {
             None => Err(FsError::FileNotFound {
                 file: name.to_string(),
             }),
             Some(ino) => {
-                if self
+                if self.clone()
                     .read_dir(ino)
                     .await?
                     .iter()
@@ -1010,14 +1124,14 @@ impl<'a> Txn<'a> {
                     return Err(FsError::DirNotEmpty { dir: name_str });
                 }
 
-                self.unlink(ino, DIR_SELF).await?;
-                self.unlink(ino, DIR_PARENT).await?;
-                self.unlink(parent, name).await
+                self.clone().unlink(ino, DIR_SELF).await?;
+                self.clone().unlink(ino, DIR_PARENT).await?;
+                self.clone().unlink(parent, name).await
             }
         }
     }
 
-    pub async fn lookup(&mut self, parent: u64, name: ByteString) -> Result<u64> {
+    pub async fn lookup(self: TxnArc, parent: u64, name: ByteString) -> Result<u64> {
         self.get_index(parent, name.clone())
             .await?
             .ok_or_else(|| FsError::FileNotFound {
@@ -1025,7 +1139,7 @@ impl<'a> Txn<'a> {
             })
     }
 
-    pub async fn fallocate(&mut self, inode: &mut Inode, offset: i64, length: i64) -> Result<()> {
+    pub async fn fallocate(self: TxnArc, inode: &mut Inode, offset: i64, length: i64) -> Result<()> {
         let target_size = (offset + length) as u64;
         if target_size <= inode.size {
             return Ok(());
@@ -1035,10 +1149,10 @@ impl<'a> Txn<'a> {
             if target_size <= self.inline_data_threshold() {
                 let original_size = inode.size;
                 let data = vec![0; (target_size - original_size) as usize];
-                self.write_inline_data(inode, original_size, &data).await?;
+                self.clone().write_inline_data(inode, original_size, &data).await?;
                 return Ok(());
             } else {
-                self.transfer_inline_data_to_block(inode).await?;
+                self.clone().transfer_inline_data_to_block(inode).await?;
             }
         }
 
@@ -1049,7 +1163,7 @@ impl<'a> Txn<'a> {
     }
 
     pub async fn mkdir(
-        &mut self,
+        self:  TxnArc,
         parent: u64,
         name: ByteString,
         mode: u32,
@@ -1057,18 +1171,18 @@ impl<'a> Txn<'a> {
         uid: u32,
     ) -> Result<Arc<Inode>> {
         let dir_mode = make_mode(FileType::Directory, mode as _);
-        let inode = self.make_inode(parent, name, dir_mode, gid, uid, 0).await?;
-        self.save_dir(inode.ino, &Directory::new()).await?;
-        self.link(inode.ino, inode.ino, DIR_SELF).await?;
+        let inode = self.clone().make_inode(parent, name, dir_mode, gid, uid, 0).await?;
+        self.clone().save_dir(inode.ino, &Directory::new()).await?;
+        self.clone().link(inode.ino, inode.ino, DIR_SELF).await?;
         if parent >= ROOT_INODE {
-            self.link(parent, inode.ino, DIR_PARENT).await?;
+            self.clone().link(parent, inode.ino, DIR_PARENT).await?;
         }
-        self.read_inode(inode.ino).await
+        self.clone().read_inode(inode.ino).await
     }
 
-    pub async fn read_dir(&mut self, ino: u64) -> Result<Directory> {
-        let key = self.key_builder.block(ino, 0);
-        let data = self
+    pub async fn read_dir(self: Arc<Self>, ino: u64) -> Result<Directory> {
+        let key = Key::from(self.key_builder().block(ino, 0));
+        let data = self.clone()
             .get(key)
             .await?
             .ok_or(FsError::BlockNotFound {
@@ -1079,28 +1193,28 @@ impl<'a> Txn<'a> {
         super::dir::decode(&data)
     }
 
-    pub async fn save_dir(&mut self, ino: u64, dir: &[DirItem]) -> Result<Arc<Inode>> {
+    pub async fn save_dir(self: TxnArc, ino: u64, dir: &[DirItem]) -> Result<Arc<Inode>> {
         let data = super::dir::encode(dir)?;
-        let mut inode = self.read_inode(ino).await?.deref().clone();
+        let mut inode = self.clone().read_inode(ino).await?.deref().clone();
         inode.set_size(data.len() as u64, self.block_size);
         inode.atime = SystemTime::now();
         inode.mtime = SystemTime::now();
         inode.ctime = SystemTime::now();
         let ptr = Arc::new(inode);
-        self.save_inode(&ptr).await?;
-        let key = self.key_builder.block(ino, 0);
-        self.put(key, data).await?;
+        self.clone().save_inode(&ptr).await?;
+        let key = Key::from(self.key_builder().block(ino, 0));
+        self.clone().put(key, data).await?;
         Ok(ptr)
     }
 
-    pub async fn statfs(&mut self) -> Result<StatFs> {
+    pub async fn statfs(self: TxnArc) -> Result<StatFs> {
         let bsize = self.block_size as u32;
         let mut meta = self
-            .read_meta()
+            .clone().read_meta()
             .await?
             .expect("meta should not be none after fs initialized");
         let next_inode = meta.inode_next;
-        let range = self.key_builder.inode_range(ROOT_INODE..next_inode);
+        let range = self.key_builder().inode_range(ROOT_INODE..next_inode);
         let (used_blocks, files) = self
             .scan(
                 range,

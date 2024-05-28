@@ -1,5 +1,6 @@
 use clap::{crate_version, App, Arg};
-use tifs::{mount_tifs_daemonize, MountOption};
+use tifs::fs::fs_config::MountOption;
+use tifs::mount_tifs_daemonize;
 use tracing::{debug, info, trace};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
