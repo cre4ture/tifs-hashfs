@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
-use std::mem;
 use std::ops::{Deref, Range, RangeInclusive};
 use std::sync::{Arc, Weak};
 use std::time::{Instant, SystemTime};
@@ -8,19 +7,18 @@ use std::time::{Instant, SystemTime};
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
-use futures::stream::FuturesUnordered;
-use futures::{Future, StreamExt, TryFutureExt};
+use futures::TryFutureExt;
 use multimap::MultiMap;
-use num_format::{Buffer, Locale};
+use num_format::{Buffer, Locale, ToFormattedString};
 use tikv_client::{Backoff, BoundRange, Key, KvPair, RetryOptions, Timestamp, Transaction, TransactionOptions, Value};
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, trace};
 use tikv_client::transaction::Mutation;
 use uuid::Uuid;
 
 use crate::fs::meta::StaticFsParameters;
 use crate::fs::utils::stop_watch::AutoStopWatch;
+use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 use super::block::empty_block;
 use super::dir::Directory;
@@ -65,49 +63,6 @@ where
         a.push_back(new_entry);
         a
     })
-}
-
-pub struct AsyncParallelPipeStage<F: Future + Send> {
-    pub in_progress_limit: usize,
-    pub in_progress: FuturesUnordered<JoinHandle<F::Output>>,
-    pub results: VecDeque<<F as Future>::Output>,
-    total: usize,
-}
-
-impl<F: Future + Send> AsyncParallelPipeStage<F>
-where
-    F: 'static,
-    F::Output: Send + 'static,
-{
-    pub fn new(in_progress_limit: usize) -> Self {
-        Self {
-            in_progress_limit,
-            in_progress: FuturesUnordered::new(),
-            results: VecDeque::new(),
-            total: 0
-        }
-    }
-
-    async fn push(&mut self, future: F) {
-        self.total += 1;
-        self.in_progress.push(tokio::spawn(future));
-
-        if self.in_progress.len() >= self.in_progress_limit {
-            let done = self.in_progress.next().await.unwrap().unwrap();
-            self.results.push_back(done);
-        }
-    }
-
-    async fn wait_finish_all(&mut self) {
-        for fut in mem::take(&mut self.in_progress).into_iter() {
-            let done = fut.await.unwrap();
-            self.results.push_back(done);
-        }
-    }
-
-    fn get_total(&self) -> usize {
-        self.total
-    }
 }
 
 pub struct Txn {
@@ -978,13 +933,12 @@ impl Txn {
 
         watch.sync("pm");
 
-        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,jobs:{total_jobs}({skipped_new_block_hashes}/{input_block_hashes} skipped)", ino, start, data.len(), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
+        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,jobs:{total_jobs}({skipped_new_block_hashes}/{input_block_hashes} skipped)", ino, start.to_formatted_string(&Locale::en), data.len().to_formatted_string(&Locale::en), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
 
         let was_modified = new_block_hashes_len > 0;
         Ok(was_modified)
     }
 
-    #[instrument(skip(self, data))]
     pub async fn write(self: TxnArc, fh: Arc<FileHandler>, start: u64, data: Bytes) -> Result<usize> {
         let mut watch = AutoStopWatch::start("write_data");
         let ino = fh.ino();

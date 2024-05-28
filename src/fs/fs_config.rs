@@ -268,6 +268,7 @@ define_options! { MountOption (FuseMountOption) {
     define NoExistenceCheck,
     define ParallelJobs(String),
     define MaxChunkSize(String),
+    define WriteInProgressLimit(String),
 }}
 
 #[derive(Clone)]
@@ -287,6 +288,7 @@ pub struct TiFsConfig {
     pub existence_check: bool,
     pub parallel_jobs: usize,
     pub max_chunk_size: usize,
+    pub write_in_progress_limit: usize,
 }
 
 impl TiFsConfig {
@@ -380,6 +382,13 @@ impl TiFsConfig {
                     }).ok()
                 } else { None }
             }).unwrap_or(usize::MAX),
+            write_in_progress_limit: options.iter().find_map(|opt|{
+                if let MountOption::WriteInProgressLimit(value) = &opt {
+                    value.parse::<usize>().map_err(|err|{
+                        error!("fail to parse WriteInProgressLimit({}): {}", value, err);
+                    }).ok()
+                } else { None }
+            }).unwrap_or(0),
         }
     }
 }

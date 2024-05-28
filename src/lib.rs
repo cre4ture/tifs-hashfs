@@ -6,6 +6,7 @@
 #![feature(iter_array_chunks)]
 
 pub mod fs;
+pub mod utils;
 
 use std::{path::PathBuf, time::Duration};
 

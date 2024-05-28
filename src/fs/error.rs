@@ -79,6 +79,7 @@ pub enum FsError {
 }
 
 pub type Result<T> = std::result::Result<T, FsError>;
+pub type TiFsResult<T> = std::result::Result<T, FsError>;
 
 impl FsError {
     pub fn unimplemented() -> Self {
