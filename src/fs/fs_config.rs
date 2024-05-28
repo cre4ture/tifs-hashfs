@@ -266,6 +266,8 @@ define_options! { MountOption (FuseMountOption) {
     define BatchRawBlockWrite,
     define PureRaw,
     define NoExistenceCheck,
+    define ParallelJobs(String),
+    define MaxChunkSize(String),
 }}
 
 #[derive(Clone)]
@@ -283,6 +285,8 @@ pub struct TiFsConfig {
     pub batch_raw_block_write: bool,
     pub pure_raw: bool,
     pub existence_check: bool,
+    pub parallel_jobs: usize,
+    pub max_chunk_size: usize,
 }
 
 impl TiFsConfig {
@@ -362,6 +366,20 @@ impl TiFsConfig {
             existence_check: options.iter().find_map(|opt|{
                 (MountOption::NoExistenceCheck == *opt).then_some(false)
             }).unwrap_or(true),
+            parallel_jobs: options.iter().find_map(|opt|{
+                if let MountOption::ParallelJobs(value) = &opt {
+                    value.parse::<usize>().map_err(|err|{
+                        error!("fail to parse ParallelJobs({}): {}", value, err);
+                    }).ok()
+                } else { None }
+            }).unwrap_or(1),
+            max_chunk_size: options.iter().find_map(|opt|{
+                if let MountOption::MaxChunkSize(value) = &opt {
+                    value.parse::<usize>().map_err(|err|{
+                        error!("fail to parse MaxChunkSize({}): {}", value, err);
+                    }).ok()
+                } else { None }
+            }).unwrap_or(usize::MAX),
         }
     }
 }

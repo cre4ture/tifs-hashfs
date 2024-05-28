@@ -933,7 +933,7 @@ impl Txn {
         }
         watch.sync("ca");
 
-        let mut parallel_executor = AsyncParallelPipeStage::new(8);
+        let mut parallel_executor = AsyncParallelPipeStage::new(self.fs_config.parallel_jobs);
 
         // filter out unchanged blocks:
         let mut skipped_new_block_hashes = 0;
@@ -949,7 +949,7 @@ impl Txn {
 
         let mut mm = new_block_hashes.into_iter().map(|(k,v)| (v,k)).collect::<MultiMap<_,_>>();
 
-        let chunks: VecDeque<HashMap<TiFsHash, Arc<Vec<u8>>>> = make_chunks_hash_map(new_blocks, 4);
+        let chunks: VecDeque<HashMap<TiFsHash, Arc<Vec<u8>>>> = make_chunks_hash_map(new_blocks, self.fs_config.max_chunk_size);
 
         for chunk in chunks {
             let blocks_to_assign = chunk.keys().filter_map(|hash| {
