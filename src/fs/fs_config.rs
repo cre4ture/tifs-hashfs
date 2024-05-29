@@ -258,7 +258,9 @@ define_options! { MountOption (FuseMountOption) {
     define Tls(String),
 //    define "opt" OptionName(Display_Debug_Clone_PartialEq_FromStr_able)
     define Name(String),
+    define InodeCacheSize(String),
     define HashedBlocks,
+    define HashedBlocksCacheSize(String),
     define NoMtime,
     define ValidateWrites,
     define ValidateReadHashes,
@@ -269,6 +271,8 @@ define_options! { MountOption (FuseMountOption) {
     define ParallelJobs(String),
     define MaxChunkSize(String),
     define WriteInProgressLimit(String),
+    define ReadAheadSize(String),
+    define ReadAheadInProgressLimit(String),
 }}
 
 #[derive(Clone)]
@@ -278,7 +282,9 @@ pub struct TiFsConfig {
     pub enable_atime: bool,
     pub enable_mtime: bool,
     pub direct_io: bool,
+    pub inode_cache_size: u64,
     pub hashed_blocks: bool,
+    pub hashed_blocks_cache_size: u64,
     pub max_size: Option<u64>,
     pub validate_writes: bool,
     pub validate_read_hashes: bool,
@@ -289,6 +295,8 @@ pub struct TiFsConfig {
     pub parallel_jobs: usize,
     pub max_chunk_size: usize,
     pub write_in_progress_limit: usize,
+    pub read_ahead_size: u64,
+    pub read_ahead_in_progress_limit: usize,
 }
 
 impl TiFsConfig {
@@ -347,9 +355,23 @@ impl TiFsConfig {
                 MountOption::NoMtime => Some(false),
                 _ => None,
             }).unwrap_or(true),
+            inode_cache_size: options.iter().find_map(|opt|{
+                if let MountOption::InodeCacheSize(value) = &opt {
+                    parse_size(value).map_err(|err|{
+                        error!("fail to parse InodeCacheSize({}): {}", value, err);
+                    }).ok()
+                } else { None }
+            }).unwrap_or(10 << 20),
             hashed_blocks: options.iter().find_map(|opt|{
                 (MountOption::HashedBlocks == *opt).then_some(true)
             }).unwrap_or(false),
+            hashed_blocks_cache_size: options.iter().find_map(|opt|{
+                if let MountOption::HashedBlocksCacheSize(value) = &opt {
+                    parse_size(value).map_err(|err|{
+                        error!("fail to parse HashedBlocksCacheSize({}): {}", value, err);
+                    }).ok()
+                } else { None }
+            }).unwrap_or(200 << 20),
             validate_writes: options.iter().find_map(|opt|{
                 (MountOption::ValidateWrites == *opt).then_some(true)
             }).unwrap_or(false),
@@ -389,6 +411,20 @@ impl TiFsConfig {
                     }).ok()
                 } else { None }
             }).unwrap_or(0),
+            read_ahead_size: options.iter().find_map(|opt|{
+                if let MountOption::ReadAheadSize(value) = &opt {
+                    parse_size(value).map_err(|err|{
+                        error!("fail to parse WriteInProgressLimit({}): {}", value, err);
+                    }).ok()
+                } else { None }
+            }).unwrap_or(0),
+            read_ahead_in_progress_limit: options.iter().find_map(|opt|{
+                if let MountOption::ReadAheadInProgressLimit(value) = &opt {
+                    value.parse::<usize>().map_err(|err|{
+                        error!("fail to parse ReadAheadInProgressLimit({}): {}", value, err);
+                    }).ok()
+                } else { None }
+            }).unwrap_or(10),
         }
     }
 }

@@ -16,6 +16,7 @@ pub struct FileHandler {
     // TODO: add open flags
     pub mut_data: RwLock<FileHandlerMutData>,
     pub write_cache: RwLock<AsyncParallelPipeStage<BoxFuture<'static, TiFsResult<usize>>>>,
+    pub read_ahead: RwLock<AsyncParallelPipeStage<BoxFuture<'static, TiFsResult<()>>>>
 }
 
 impl FileHandler {
@@ -26,6 +27,7 @@ impl FileHandler {
                 cursor,
             }),
             write_cache: RwLock::new(AsyncParallelPipeStage::new(write_cache_in_progress_limit)),
+            read_ahead: RwLock::new(AsyncParallelPipeStage::new(2)),
         }
     }
 

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
+use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -86,15 +87,15 @@ struct TiFsMutable {
 
 impl TiFsMutable {
 
-    fn new(block_size: u64) -> Self {
+    fn new(fs_config: &TiFsConfig) -> Self {
         Self {
             freed_fhs: HashSet::new(),
             next_fh: 0,
             opened_ino: HashMap::new(),
             file_handlers: HashMap::new(),
             caches: TiFsCaches{
-                block: Cache::new((100 << 20) / block_size),
-                inode: Cache::new((10 << 20) / (block_size / 16)),
+                block: Cache::new(fs_config.hashed_blocks_cache_size as u64 / fs_config.block_size),
+                inode: Cache::new(fs_config.inode_cache_size as u64 / (fs_config.block_size / 16)),
             }
         }
     }
@@ -169,7 +170,7 @@ impl TiFs {
                 pd_endpoints: pd_endpoints.clone().into_iter().map(Into::into).collect(),
                 client_config: cfg,
                 direct_io: fs_config.direct_io,
-                mut_data: RwLock::new(TiFsMutable::new(fs_config.block_size)),
+                mut_data: RwLock::new(TiFsMutable::new(&fs_config)),
                 fs_config,
             }
         });
@@ -397,6 +398,18 @@ impl TiFs {
         ino: u64,
         offset: u64,
         size: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+    ) -> Result<Data> {
+        let arc = self.weak.upgrade().unwrap();
+        arc.read_transaction_arc(ino, offset, size, flags, lock_owner).await
+    }
+
+    async fn read_transaction_arc(
+        self: Arc<Self>,
+        ino: u64,
+        offset: u64,
+        size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<Data> {
@@ -610,17 +623,35 @@ impl AsyncFileSystem for TiFs {
         fh: u64,
         offset: i64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        flags: i32,
+        lock_owner: Option<u64>,
     ) -> Result<Data> {
-        let lock = self.get_file_handler_checked(fh).await?;
-        let file_handler = lock.mut_data.read().await;
-        let start = file_handler.cursor as i64 + offset;
+        let file_handler = self.get_file_handler_checked(fh).await?;
+        let lock = file_handler.mut_data.read().await;
+        let start = lock.cursor as i64 + offset;
         if start < 0 {
             return Err(FsError::InvalidOffset { ino, offset: start });
         }
+        mem::drop(lock);
+
+        let mut ra_lock = file_handler.read_ahead.write().await;
+        ra_lock.wait_finish_all().await;
+        ra_lock.get_results_so_far();
+        mem::drop(ra_lock);
+
         let start = start as u64;
-        self.read_transaction(ino, start, size, _flags, _lock_owner).await
+        let arc = self.weak.upgrade().unwrap();
+        let result = arc.clone().read_transaction_arc(ino, start, size, flags, lock_owner).await?;
+
+        if (self.fs_config.read_ahead_size > 0) && (result.data.len() == size as usize) {
+            let target = start + size as u64;
+            let read_ahead_size = self.fs_config.read_ahead_size;
+            let mut lock = file_handler.read_ahead.write().await;
+            lock.push(arc.read_transaction_arc(ino, target, read_ahead_size as u32, flags, lock_owner)
+                                .map(|d|{ d.map(|_|{}) }).boxed()).await;
+        }
+
+        Ok(result)
     }
 
     #[tracing::instrument(skip(data))]
