@@ -1,14 +1,14 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use futures::future::BoxFuture;
 use tokio::sync::RwLock;
 
-use super::{error::TiFsResult, inode::StorageIno, tikv_fs::InoUse};
+use super::{error::TiFsResult, inode::StorageIno, reply::InoKind, tikv_fs::InoUse};
 use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 #[derive(Debug)]
 pub struct FileHandlerMutData {
-    pub cursor: u64,
+    pub cursor: HashMap<InoKind, u64>,
 }
 
 pub struct FileHandler {
@@ -20,11 +20,11 @@ pub struct FileHandler {
 }
 
 impl FileHandler {
-    pub fn new(ino_use: Arc<InoUse>, cursor: u64, write_cache_in_progress_limit: usize) -> Self {
+    pub fn new(ino_use: Arc<InoUse>, write_cache_in_progress_limit: usize) -> Self {
         Self {
             ino_use,
             mut_data: RwLock::new(FileHandlerMutData {
-                cursor,
+               cursor: HashMap::new(),
             }),
             write_cache: RwLock::new(AsyncParallelPipeStage::new(write_cache_in_progress_limit)),
             read_ahead: RwLock::new(AsyncParallelPipeStage::new(2)),

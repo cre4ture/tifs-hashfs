@@ -20,7 +20,7 @@ use moka::future::Cache;
 use tikv_client::Config;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 use uuid::Uuid;
 use lazy_static::lazy_static;
 
@@ -238,6 +238,66 @@ impl TiFs {
         self.get_file_handler(fh).await.ok_or(FsError::FhNotFound { fh })
     }
 
+    async fn read_kind_regular(
+        &self,
+        ino: StorageIno,
+        file_handler: Arc<FileHandler>,
+        start: u64,
+        size: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+    ) -> Result<Data> {
+        let mut ra_lock = file_handler.read_ahead.write().await;
+        ra_lock.wait_finish_all().await;
+        ra_lock.get_results_so_far();
+        mem::drop(ra_lock);
+
+        let start = start as u64;
+        let arc = self.weak.upgrade().unwrap();
+        let result = arc.clone().read_transaction_arc(ino, start, size, flags, lock_owner).await?;
+
+        if (self.fs_config.read_ahead_size > 0) && (result.data.len() == size as usize) {
+            let target = start + size as u64;
+            let read_ahead_size = self.fs_config.read_ahead_size;
+            let mut lock = file_handler.read_ahead.write().await;
+            lock.push(arc.read_transaction_arc(ino, target, read_ahead_size as u32, flags, lock_owner)
+                                .map(|d|{ d.map(|_|{}) }).boxed()).await;
+        }
+
+        Ok(result)
+    }
+
+    async fn read_kind_hash(
+        &self,
+        ino: StorageIno,
+        start: u64,
+        size: u32,
+    ) -> Result<Data> {
+
+        let arc = self.weak.upgrade().unwrap();
+        let data = arc
+            .spin_no_delay(format!("read_kind_hash, ino:{ino}, start:{start}, size:{size}"),
+            move |_, txn| txn.read_hashes_of_file(ino, start, size).boxed())
+            .await?;
+        Ok(Data::new(data))
+    }
+
+    #[tracing::instrument]
+    async fn read_kind_hashes(
+        &self,
+        ino: StorageIno,
+        start: u64,
+        size: u32,
+    ) -> Result<Data> {
+
+        let arc = self.weak.upgrade().unwrap();
+        let data = arc
+            .spin_no_delay(format!("read_kind_hashes, ino:{ino}, start:{start}, size:{size}"),
+            move |_, txn| txn.read_hashes_of_file(ino, start, size).boxed())
+            .await?;
+        Ok(Data::new(data))
+    }
+
     #[instrument(skip(txn, f))]
     async fn process_txn<'b, F, T>(&self, txn: TxnArc, f: F) -> Result<T>
     where
@@ -290,6 +350,8 @@ impl TiFs {
         T: 'static + Send,
         F: for<'a> FnMut(&'a TiFs, TxnArc) -> BoxedFuture<'a, T>,
     {
+        trace!("spin-start: {msg}");
+
         let mut other_error_count = 0;
         loop {
             match self.with_optimistic(&mut f).await {
@@ -503,15 +565,15 @@ impl TiFs {
     async fn read_transaction_arc(
         self: Arc<Self>,
         ino: StorageIno,
-        offset: u64,
+        start: u64,
         size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<Data> {
         let arc = self.weak.upgrade().unwrap();
         let data = arc
-            .spin_no_delay(format!("read_txn, ino:{ino}, offset:{offset}, size:{size}"),
-            move |_, txn| txn.read(ino, offset, size).boxed())
+            .spin_no_delay(format!("read_txn, ino:{ino}, start:{start}, size:{size}"),
+            move |_, txn| txn.read(ino, start, size).boxed())
             .await?;
         Ok(Data::new(data))
     }
@@ -724,7 +786,7 @@ impl AsyncFileSystem for TiFs {
             return Err(FsError::UnknownError("failed to get ino_use!".into()));
         };
 
-        let file_handler = FileHandler::new(ino_use, 0, self.fs_config.write_in_progress_limit);
+        let file_handler = FileHandler::new(ino_use, self.fs_config.write_in_progress_limit);
         let fh = self.with_mut_data(|d| {
             let new_fh = d.get_free_fh();
             d.file_handlers.insert(new_fh, Arc::new(file_handler));
@@ -758,30 +820,21 @@ impl AsyncFileSystem for TiFs {
         let l_ino = LogicalIno::from_raw(ino);
         let file_handler = self.get_file_handler_checked(fh).await?;
         let lock = file_handler.mut_data.read().await;
-        let start = lock.cursor as i64 + offset;
+        let start = lock.cursor.get(&l_ino.kind).cloned().unwrap_or(0) as i64 + offset;
         if start < 0 {
             return Err(FsError::InvalidOffset { ino, offset: start });
         }
         mem::drop(lock);
 
-        let mut ra_lock = file_handler.read_ahead.write().await;
-        ra_lock.wait_finish_all().await;
-        ra_lock.get_results_so_far();
-        mem::drop(ra_lock);
+        let data = match l_ino.kind {
+            InoKind::Regular => self.read_kind_regular(l_ino.storage_ino(), file_handler, start as u64, size, flags, lock_owner).await,
+            InoKind::Hash => self.read_kind_hash(l_ino.storage_ino(), start as u64, size).await,
+            InoKind::Hashes => self.read_kind_hashes(l_ino.storage_ino(), start as u64, size).await,
+        }?;
 
-        let start = start as u64;
-        let arc = self.weak.upgrade().unwrap();
-        let result = arc.clone().read_transaction_arc(l_ino.storage_ino(), start, size, flags, lock_owner).await?;
+        trace!("read() result len: {}", data.data.len());
 
-        if (self.fs_config.read_ahead_size > 0) && (result.data.len() == size as usize) {
-            let target = start + size as u64;
-            let read_ahead_size = self.fs_config.read_ahead_size;
-            let mut lock = file_handler.read_ahead.write().await;
-            lock.push(arc.read_transaction_arc(l_ino.storage_ino(), target, read_ahead_size as u32, flags, lock_owner)
-                                .map(|d|{ d.map(|_|{}) }).boxed()).await;
-        }
-
-        Ok(result)
+        Ok(data)
     }
 
     #[tracing::instrument(skip(data))]
@@ -795,10 +848,11 @@ impl AsyncFileSystem for TiFs {
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<Write> {
+        let l_ino = LogicalIno::from_raw(ino);
         let data: Bytes = data.into();
         let file_handler = self.get_file_handler_checked(fh).await?;
         let file_handler_data = file_handler.mut_data.read().await;
-        let start = file_handler_data.cursor as i64 + offset;
+        let start = file_handler_data.cursor.get(&l_ino.kind).cloned().unwrap_or(0) as i64 + offset;
         let size = data.len();
         drop(file_handler_data);
         if start < 0 {
@@ -904,7 +958,7 @@ impl AsyncFileSystem for TiFs {
         eprintln!("lseek-begin(ino:{ino},fh:{fh},offset:{offset},whence:{whence}");
         let file_handler = self.get_file_handler_checked(fh).await?;
         let file_handler_data = file_handler.mut_data.read().await;
-        let current_cursor = file_handler_data.cursor;
+        let current_cursor = file_handler_data.cursor.get(&l_ino.kind).cloned().unwrap_or(0);
         let result = self.spin_no_delay(format!("lseek"), move |_, txn| {
             Box::pin(async move {
 
@@ -931,7 +985,7 @@ impl AsyncFileSystem for TiFs {
 
         self.with_mut_data(|d| -> Result<()> {
             let file_handler = d.file_handlers.get_mut(&fh).ok_or(FsError::FhNotFound { fh: fh })?;
-            file_handler.mut_data.blocking_write().cursor = result.offset as u64;
+            file_handler.mut_data.blocking_write().cursor.insert(l_ino.kind, result.offset as u64);
             Ok(())
         }).await??;
 

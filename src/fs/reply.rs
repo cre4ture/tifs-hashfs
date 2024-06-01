@@ -65,7 +65,7 @@ impl Data {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InoKind {
     Regular,
     Hash,

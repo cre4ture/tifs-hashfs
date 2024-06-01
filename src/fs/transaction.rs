@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
+use std::mem;
 use std::ops::{Deref, Range, RangeInclusive};
 use std::sync::{Arc, Weak};
 use std::time::{Instant, SystemTime};
@@ -11,7 +12,7 @@ use multimap::MultiMap;
 use num_format::{Buffer, Locale, ToFormattedString};
 use tikv_client::{Backoff, BoundRange, Key, KvPair, RetryOptions, Timestamp, Transaction, TransactionOptions, Value};
 use tokio::sync::RwLock;
-use tracing::{debug, trace};
+use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
 use uuid::Uuid;
 
@@ -43,6 +44,10 @@ use tikv_client::Result as TiKvResult;
 pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000, 100);
 pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000);
 pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
+
+lazy_static::lazy_static!{
+    static ref ZERO_HASH: TiFsHash = blake3::hash(&[]);
+}
 
 pub fn make_chunks_hash_map<K,V>(input: HashMap<K,V>, max_chunk_size: usize) -> VecDeque<HashMap<K,V>>
 where
@@ -279,6 +284,29 @@ impl Txn {
         self.clone().delete(key).await?;
         eprintln!("close-ino: {ino}, use_id: {use_id}");
         Ok(())
+    }
+
+    #[instrument(skip(self))]
+    pub async fn read_hashes_of_file(self: TxnArc, ino: StorageIno, offset: u64, size: u32) -> Result<Vec<u8>> {
+        let hash_size = mem::size_of::<TiFsHash>() as u64;
+        let first_block = offset / hash_size;
+        let first_block_offset = offset % hash_size;
+        let block_cnt = (first_block_offset + size as u64) / hash_size;
+        let remainder = (first_block_offset + size as u64) % hash_size;
+        let fetch_block_cnt = if remainder != 0 {block_cnt + 1} else {block_cnt};
+        let hashes = self.hb_get_block_hash_list_by_block_range(ino, first_block..(first_block+fetch_block_cnt)).await?;
+        let mut result = Vec::with_capacity((fetch_block_cnt * hash_size) as usize);
+        for block_id in first_block..(first_block+block_cnt) {
+            let block_hash = hashes.get(&BlockAddress { ino, index: block_id }).unwrap_or(&ZERO_HASH);
+            let offset = if block_id == first_block {first_block_offset} else {0};
+            result.extend_from_slice(&block_hash.as_bytes()[offset as usize..hash_size as usize]);
+        }
+        if remainder != 0 {
+            let block_hash = hashes.get(&BlockAddress { ino, index: block_cnt }).unwrap_or(&ZERO_HASH);
+            result.extend_from_slice(&block_hash.as_bytes()[0..remainder as usize]);
+        }
+        trace!("res-len-end: {}", result.len());
+        Ok(result)
     }
 
     pub async fn read(self: Arc<Self>, ino: StorageIno, start: u64, size: u32) -> Result<Vec<u8>> {
@@ -691,6 +719,7 @@ impl Txn {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn hb_get_block_hash_list_by_block_range(self: TxnArc, ino: StorageIno, block_range: Range<u64>
     ) -> Result<HashMap<BlockAddress, inode::Hash>>
     {
@@ -700,7 +729,7 @@ impl Txn {
                 block_range.count() as u32,
             )
             .await?;
-        Ok(iter.into_iter().filter_map(|pair| {
+        let result: HashMap<BlockAddress, inode::Hash> = iter.into_iter().filter_map(|pair| {
             let Some(key) = self.key_builder().parse_key_block_address(pair.key().into()) else {
                 tracing::error!("failed parsing block address from response 1");
                 return None;
@@ -710,7 +739,9 @@ impl Txn {
                 return None;
             };
             Some((key, hash))
-        }).collect())
+        }).collect();
+        trace!("result: len:{}", result.len());
+        Ok(result)
     }
 
     pub async fn hb_get_block_data_by_hashes(self: TxnArc, hash_list: &HashSet<TiFsHash>) -> Result<HashMap<inode::Hash, Arc<Vec<u8>>>>
