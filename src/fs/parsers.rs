@@ -1,12 +1,12 @@
 use std::{collections::HashMap, ops::{Deref, Range}, sync::Arc};
 
-use super::{hash_block::block_splitter::BlockSplitterRead, inode::{BlockAddress, TiFsHash}};
+use super::{hash_block::block_splitter::BlockSplitterRead, inode::{BlockAddress, StorageIno, TiFsHash}};
 
 use crate::fs::error::Result;
 
 
 pub fn hb_read_from_blocks(
-    ino: u64, block_range: &Range<u64>, bs: &BlockSplitterRead,
+    ino: StorageIno, block_range: &Range<u64>, bs: &BlockSplitterRead,
     block_hashes: &HashMap<BlockAddress, TiFsHash>,
     blocks_data: &HashMap<TiFsHash, Arc<Vec<u8>>>) -> Result<Vec<u8>> {
     let mut result = Vec::new();

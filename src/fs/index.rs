@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::error::{FsError, Result};
+use super::inode::StorageIno;
 use super::serialize::{deserialize, serialize, ENCODING};
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, Deserialize, Serialize)]
@@ -9,8 +10,12 @@ pub struct Index {
 }
 
 impl Index {
-    pub const fn new(ino: u64) -> Self {
-        Self { ino }
+    pub fn storage_ino(&self) -> StorageIno {
+        StorageIno(self.ino)
+    }
+
+    pub const fn new(ino: StorageIno) -> Self {
+        Self { ino: ino.0 }
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>> {

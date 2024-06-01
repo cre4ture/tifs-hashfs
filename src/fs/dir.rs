@@ -1,10 +1,10 @@
 use super::error::{FsError, Result};
-use super::reply::DirItem;
+use super::inode::StorageDirItem;
 use super::serialize::{deserialize, serialize, ENCODING};
 
-pub type Directory = Vec<DirItem>;
+pub type StorageDirectory = Vec<StorageDirItem>;
 
-pub fn encode(dir: &[DirItem]) -> Result<Vec<u8>> {
+pub fn encode(dir: &[StorageDirItem]) -> Result<Vec<u8>> {
     serialize(dir).map_err(|err| FsError::Serialize {
         target: "directory",
         typ: ENCODING,
@@ -12,7 +12,7 @@ pub fn encode(dir: &[DirItem]) -> Result<Vec<u8>> {
     })
 }
 
-pub fn decode(bytes: &[u8]) -> Result<Directory> {
+pub fn decode(bytes: &[u8]) -> Result<StorageDirectory> {
     deserialize(bytes).map_err(|err| FsError::Serialize {
         target: "directory",
         typ: ENCODING,
@@ -20,7 +20,7 @@ pub fn decode(bytes: &[u8]) -> Result<Directory> {
     })
 }
 
-pub fn encode_item(item: &DirItem) -> Result<Vec<u8>> {
+pub fn encode_item(item: &StorageDirItem) -> Result<Vec<u8>> {
     serialize(item).map_err(|err| FsError::Serialize {
         target: "dir item",
         typ: ENCODING,
@@ -28,7 +28,7 @@ pub fn encode_item(item: &DirItem) -> Result<Vec<u8>> {
     })
 }
 
-pub fn decode_item(bytes: &[u8]) -> Result<DirItem> {
+pub fn decode_item(bytes: &[u8]) -> Result<StorageDirItem> {
     deserialize(bytes).map_err(|err| FsError::Serialize {
         target: "dir item",
         typ: ENCODING,

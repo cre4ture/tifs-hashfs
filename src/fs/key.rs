@@ -4,10 +4,12 @@ use std::ops::Range;
 use tikv_client::Key;
 use uuid::Uuid;
 
-use super::inode::UInode;
+use super::inode::{StorageIno, UInode};
+use super::reply::LogicalIno;
 use super::{error::{FsError, Result}, inode::{self, BlockAddress, TiFsHash}};
 
-pub const ROOT_INODE: u64 = fuser::FUSE_ROOT_ID;
+pub const ROOT_INODE: StorageIno = StorageIno(fuser::FUSE_ROOT_ID);
+pub const ROOT_LOGICAL_INODE: LogicalIno = LogicalIno::from_raw(fuser::FUSE_ROOT_ID);
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
 pub enum ScopedKeyKind<'a> {
@@ -20,6 +22,7 @@ pub enum ScopedKeyKind<'a> {
     HashOfBlock { ino: u64, block: u64 },
     HashedBlockExists { hash: &'a[u8] },
     OpenedInode { ino: UInode, uuid: [u8; 16] },
+    //HashedBlockUsedBy { hash: &'a[u8], ino: u64, block: u64 },
 }
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
@@ -45,27 +48,27 @@ impl<'a> ScopedKeyBuilder<'a> {
         }
     }
 
-    pub const fn inode(&self, ino: u64) -> ScopedKey {
+    pub const fn inode(&self, ino: StorageIno) -> ScopedKey {
         ScopedKey{
-            prefix: self.prefix, key_type: ScopedKeyKind::Inode(ino),
+            prefix: self.prefix, key_type: ScopedKeyKind::Inode(ino.0),
         }
     }
 
-    pub const fn block(&self, ino: u64, block: u64) -> ScopedKey {
+    pub const fn block(&self, ino: StorageIno, block: u64) -> ScopedKey {
         ScopedKey{
-            prefix: self.prefix, key_type: ScopedKeyKind::Block { ino, block },
+            prefix: self.prefix, key_type: ScopedKeyKind::Block { ino: ino.0, block },
         }
     }
 
-    pub const fn opened_inode(&self, ino: u64, instance_id: Uuid) -> ScopedKey {
+    pub const fn opened_inode(&self, ino: StorageIno, instance_id: Uuid) -> ScopedKey {
         ScopedKey{
-            prefix: self.prefix, key_type: ScopedKeyKind::OpenedInode { ino, uuid: instance_id.into_bytes() },
+            prefix: self.prefix, key_type: ScopedKeyKind::OpenedInode { ino: ino.0, uuid: instance_id.into_bytes() },
         }
     }
 
     pub const fn block_hash(&self, addr: BlockAddress) -> ScopedKey {
         ScopedKey{
-            prefix: self.prefix, key_type: ScopedKeyKind::HashOfBlock { ino: addr.ino, block: addr.index },
+            prefix: self.prefix, key_type: ScopedKeyKind::HashOfBlock { ino: addr.ino.0, block: addr.index },
         }
     }
 
@@ -85,30 +88,30 @@ impl<'a> ScopedKeyBuilder<'a> {
         self.inode(ROOT_INODE)
     }
 
-    pub const fn handler(&self, ino: u64, handler: u64) -> ScopedKey {
+    pub const fn handler(&self, ino: StorageIno, handler: u64) -> ScopedKey {
         ScopedKey {
-            prefix: &self.prefix, key_type: ScopedKeyKind::FileHandler { ino, handler }
+            prefix: &self.prefix, key_type: ScopedKeyKind::FileHandler { ino: ino.0, handler }
         }
     }
 
-    pub fn index(&self, parent: u64, name: &'a str) -> ScopedKey {
+    pub fn index(&self, parent: StorageIno, name: &'a str) -> ScopedKey {
         ScopedKey {
-            prefix: &self.prefix, key_type: ScopedKeyKind::FileIndex { parent, name }
+            prefix: &self.prefix, key_type: ScopedKeyKind::FileIndex { parent: parent.0, name }
         }
     }
 
-    pub fn block_range(&self, ino: u64, block_range: Range<u64>) -> Range<Key> {
-        debug_assert_ne!(0, ino);
+    pub fn block_range(&self, ino: StorageIno, block_range: Range<u64>) -> Range<Key> {
+        debug_assert_ne!(0, ino.0);
         self.block(ino, block_range.start).into()..self.block(ino, block_range.end).into()
     }
 
-    pub fn block_hash_range(&self, ino: u64, block_range: Range<u64>) -> Range<Key> {
-        debug_assert_ne!(0, ino);
+    pub fn block_hash_range(&self, ino: StorageIno, block_range: Range<u64>) -> Range<Key> {
+        debug_assert_ne!(0, ino.0);
         self.block_hash(BlockAddress { ino, index: block_range.start, })
             .into()..self.block_hash(BlockAddress { ino, index: block_range.end }).into()
     }
 
-    pub fn inode_range(&self, ino_range: Range<u64>) -> Range<Key> {
+    pub fn inode_range(&self, ino_range: Range<StorageIno>) -> Range<Key> {
         self.inode(ino_range.start).into()..self.inode(ino_range.end).into()
     }
 
@@ -134,8 +137,8 @@ impl<'a> ScopedKeyBuilder<'a> {
         let o = self.parse(key);
         if let Ok(key) = o {
             match key.key_type {
-                ScopedKeyKind::Block { ino, block } => Some(BlockAddress{ino, index: block}),
-                ScopedKeyKind::HashOfBlock { ino, block } => Some(BlockAddress{ino, index: block}),
+                ScopedKeyKind::Block { ino, block } => Some(BlockAddress{ino: StorageIno(ino), index: block}),
+                ScopedKeyKind::HashOfBlock { ino, block } => Some(BlockAddress{ino: StorageIno(ino), index: block}),
                 other => {
                     tracing::error!("parse_key_block_address(): unexpected key_type: {:?}", other);
                     None

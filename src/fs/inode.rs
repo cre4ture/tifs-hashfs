@@ -1,8 +1,8 @@
 use std::collections::HashSet;
-use std::ops::{Deref, DerefMut};
+use std::fmt::Display;
+use std::time::SystemTime;
 
-use fuser::FileAttr;
-use libc::F_UNLCK;
+
 use serde::{Deserialize, Serialize};
 
 use super::error::{FsError, Result};
@@ -21,23 +21,80 @@ pub type Hash = blake3::Hash;
 pub type TiFsHash = blake3::Hash;
 pub type UInode = u64;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct BlockAddress {
-    pub ino: u64,
+    pub ino: StorageIno,
     pub index: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StorageIno(pub u64);
+
+impl Display for StorageIno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StorageDirItemKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageDirItem {
+    pub ino: StorageIno,
+    pub name: String,
+    pub typ: StorageDirItemKind,
+}
+
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize)]
+pub struct StorageFilePermission(pub u16);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize)]
+pub struct StorageFileAttr {
+    /// Time of last access
+    pub atime: SystemTime,
+    /// Time of last modification
+    pub mtime: SystemTime,
+    /// Time of last change
+    pub ctime: SystemTime,
+    /// Time of creation (macOS only)
+    pub crtime: SystemTime,
+    /// Permissions
+    pub perm: StorageFilePermission,
+    /// User id
+    pub uid: u32,
+    /// Group id
+    pub gid: u32,
+    /// Rdev
+    pub rdev: u32,
+    /// Flags (macOS only, see chflags(2))
+    pub flags: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Inode {
-    pub file_attr: FileAttr,
+    pub ino: StorageIno,
+    pub typ: StorageDirItemKind,
+    pub attr: StorageFileAttr,
     pub lock_state: LockState,
+    pub size: u64,
+    pub blocks: u64,
     pub inline_data: Option<Vec<u8>>,
     pub data_hash: Option<Hash>,
-    pub next_fh: Option<u64>,       // not used, deprecated. Keep to not get errors on old fs instances
-    pub opened_fh: u64,             // not used, deprecated. Keep to not get errors on old fs instances
 }
 
 impl Inode {
+    pub fn storage_ino(&self) -> StorageIno {
+        self.ino
+    }
+
     fn update_blocks(&mut self, block_size: u64) {
         self.blocks = (self.size + block_size - 1) / block_size;
     }
@@ -64,42 +121,9 @@ impl Inode {
     }
 }
 
-impl From<FileAttr> for Inode {
-    fn from(attr: FileAttr) -> Self {
-        Inode {
-            file_attr: attr,
-            lock_state: LockState::new(HashSet::new(), F_UNLCK),
-            inline_data: None,
-            data_hash: None,
-            next_fh: None,
-            opened_fh: 0,
-        }
-    }
-}
-
-impl From<Inode> for FileAttr {
-    fn from(inode: Inode) -> Self {
-        inode.file_attr
-    }
-}
-
 impl From<Inode> for LockState {
     fn from(inode: Inode) -> Self {
         inode.lock_state
-    }
-}
-
-impl Deref for Inode {
-    type Target = FileAttr;
-
-    fn deref(&self) -> &Self::Target {
-        &self.file_attr
-    }
-}
-
-impl DerefMut for Inode {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.file_attr
     }
 }
 

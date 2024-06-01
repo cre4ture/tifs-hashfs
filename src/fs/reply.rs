@@ -1,11 +1,13 @@
 use std::fmt::Debug;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fuser::*;
+use fuser::{FileAttr, FileType, ReplyAttr, ReplyBmap, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, trace};
 
 use super::error::Result;
+use super::inode::StorageIno;
+use super::key::ROOT_INODE;
 
 pub fn get_time() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
@@ -62,12 +64,72 @@ impl Data {
         Self { data }
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InoKind {
+    Regular,
+    Hash,
+    Hashes,
+}
+
+impl InoKind {
+    pub const fn kind_id(&self) -> u64 {
+        match self {
+            InoKind::Regular => 0u64,
+            InoKind::Hash => 1u64,
+            InoKind::Hashes => 2u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LogicalIno {
+    pub storage_ino: StorageIno,
+    pub kind: InoKind,
+}
+
+pub const LOGICAL_INO_FACTOR: u64 = 8;
+
+impl LogicalIno {
+    pub const fn from_raw(ino: u64) -> Self {
+        let (base_ino, kind_id) = {
+            let r = ino - ROOT_INODE.0;
+            let kind_id =  r % LOGICAL_INO_FACTOR;
+            let base_ino = r / LOGICAL_INO_FACTOR;
+            (1 + base_ino, kind_id)
+        };
+
+        let kind = match kind_id {
+            0 => InoKind::Regular,
+            1 => InoKind::Hash,
+            2 => InoKind::Hashes,
+            _ => InoKind::Regular,
+        };
+
+        Self {
+            storage_ino: StorageIno(base_ino),
+            kind,
+        }
+    }
+
+    pub const fn to_raw(&self) -> u64 {
+        let kind_id = self.kind.kind_id();
+        let ino = ROOT_INODE.0 + ((self.storage_ino.0 - 1) * LOGICAL_INO_FACTOR) + kind_id;
+        ino
+    }
+
+    pub const fn storage_ino(&self) -> StorageIno {
+        self.storage_ino
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct DirItem {
-    pub ino: u64,
+    pub ino: LogicalIno,
     pub name: String,
     pub typ: FileType,
 }
+
 #[derive(Debug, Default)]
 pub struct Dir {
     offset: usize,
@@ -90,6 +152,8 @@ impl Dir {
         self.items.push(item)
     }
 }
+
+pub type Directory = Vec<DirItem>;
 
 #[derive(Debug, Default)]
 pub struct DirPlus {
@@ -301,7 +365,7 @@ impl FsReply<Dir> for ReplyDirectory {
     fn reply_ok(mut self, dir: Dir) {
         for (index, item) in dir.items.into_iter().enumerate() {
             if self.add(
-                item.ino,
+                item.ino.to_raw(),
                 (index + 1 + dir.offset) as i64,
                 item.typ,
                 item.name,
@@ -320,7 +384,7 @@ impl FsReply<DirPlus> for ReplyDirectoryPlus {
     fn reply_ok(mut self, dir: DirPlus) {
         for (index, (item, entry)) in dir.items.into_iter().enumerate() {
             if self.add(
-                item.ino,
+                item.ino.to_raw(),
                 (dir.offset + index) as i64,
                 item.name,
                 &entry.time,
@@ -419,5 +483,69 @@ impl FsReply<()> for ReplyEmpty {
     }
     fn reply_err(self, err: libc::c_int) {
         self.error(err);
+    }
+}
+
+
+#[cfg(test)]
+mod test {
+    use crate::fs::{key::{ROOT_INODE, ROOT_LOGICAL_INODE}, reply::{InoKind, LOGICAL_INO_FACTOR}};
+
+    use super::LogicalIno;
+
+    #[test]
+    fn root_inode_check() {
+        assert_eq!(ROOT_LOGICAL_INODE.kind, InoKind::Regular);
+        assert_eq!(ROOT_LOGICAL_INODE.to_raw(), 1);
+        assert_eq!(ROOT_LOGICAL_INODE.storage_ino().0, 1);
+        assert_eq!(ROOT_INODE.0, 1);
+    }
+
+    #[test]
+    fn hash_kind_check_root_ino() {
+        let l_ino = LogicalIno::from_raw(2);
+        assert_eq!(l_ino.kind, InoKind::Hash);
+        assert_eq!(l_ino.to_raw(), 2);
+        assert_eq!(l_ino.storage_ino().0, 1);
+    }
+
+    #[test]
+    fn hashes_kind_check_root_ino() {
+        let l_ino = LogicalIno::from_raw(3);
+        assert_eq!(l_ino.kind, InoKind::Hashes);
+        assert_eq!(l_ino.to_raw(), 3);
+        assert_eq!(l_ino.storage_ino().0, 1);
+    }
+
+    #[test]
+    fn check_second_ino() {
+        let l_ino = LogicalIno::from_raw(1 + LOGICAL_INO_FACTOR);
+        let l_ino_hash = LogicalIno::from_raw(2 + LOGICAL_INO_FACTOR);
+        let l_ino_hashes = LogicalIno::from_raw(3 + LOGICAL_INO_FACTOR);
+        assert_eq!(l_ino.kind, InoKind::Regular);
+        assert_eq!(l_ino_hash.kind, InoKind::Hash);
+        assert_eq!(l_ino_hashes.kind, InoKind::Hashes);
+        assert_eq!(l_ino.to_raw(), 1 + LOGICAL_INO_FACTOR);
+        assert_eq!(l_ino_hash.to_raw(), 2 + LOGICAL_INO_FACTOR);
+        assert_eq!(l_ino_hashes.to_raw(), 3 + LOGICAL_INO_FACTOR);
+        assert_eq!(l_ino.storage_ino().0, 2);
+        assert_eq!(l_ino_hash.storage_ino().0, 2);
+        assert_eq!(l_ino_hashes.storage_ino().0, 2);
+    }
+
+    #[test]
+    fn check_3rd_ino() {
+        let l_ino = LogicalIno::from_raw(1 + LOGICAL_INO_FACTOR * 2);
+        let l_ino_hash = LogicalIno::from_raw(2 + LOGICAL_INO_FACTOR * 2);
+        let l_ino_hashes = LogicalIno::from_raw(3 + LOGICAL_INO_FACTOR * 2);
+        assert_eq!(l_ino.kind, InoKind::Regular);
+        assert_eq!(l_ino_hash.kind, InoKind::Hash);
+        assert_eq!(l_ino_hashes.kind, InoKind::Hashes);
+        assert_eq!(l_ino.to_raw(), 1 + LOGICAL_INO_FACTOR * 2);
+        assert_eq!(l_ino_hash.to_raw(), 2 + LOGICAL_INO_FACTOR * 2);
+        assert_eq!(l_ino_hashes.to_raw(), 3 + LOGICAL_INO_FACTOR * 2);
+        assert_eq!(l_ino.storage_ino().0, 3);
+        assert_eq!(l_ino_hash.storage_ino().0, 3);
+        assert_eq!(l_ino_hashes.storage_ino().0, 3);
     }
 }

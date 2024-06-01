@@ -37,7 +37,7 @@ pub struct Meta {
 impl Meta {
     pub const fn new(block_size: u64, config: StaticFsParameters) -> Self {
         Self {
-            inode_next: ROOT_INODE,
+            inode_next: ROOT_INODE.0,
             block_size,
             last_stat: None,
             config_flags: Some(config),

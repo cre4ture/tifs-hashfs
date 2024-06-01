@@ -3,7 +3,7 @@ use std::backtrace::Backtrace;
 use thiserror::Error;
 use tracing::error;
 
-use super::inode::TiFsHash;
+use super::inode::{StorageIno, TiFsHash};
 
 #[derive(Error, Debug)]
 pub enum FsError {
@@ -30,7 +30,7 @@ pub enum FsError {
     FileExist { file: String },
 
     #[error("cannot find inode({inode})")]
-    InodeNotFound { inode: u64 },
+    InodeNotFound { inode: StorageIno },
 
     #[error("cannot find fh({fh})")]
     FhNotFound { fh: u64 },
@@ -42,13 +42,16 @@ pub enum FsError {
     UnknownWhence { whence: i32 },
 
     #[error("cannot find block(<{inode}>[{block}])")]
-    BlockNotFound { inode: u64, block: u64 },
+    BlockNotFound { inode: StorageIno, block: u64 },
 
     #[error("dir({dir}) not empty")]
     DirNotEmpty { dir: String },
 
     #[error("invalid string")]
     InvalidStr,
+
+    #[error("wrong file type for this operation")]
+    WrongFileType,
 
     #[error("unknown file type")]
     UnknownFileType,

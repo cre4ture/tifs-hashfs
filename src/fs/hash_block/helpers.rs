@@ -1,12 +1,12 @@
 use std::{collections::{HashMap, HashSet}, ops::Deref, sync::Arc};
 
-use crate::fs::{hashed_block::HashedBlock, inode::{BlockAddress, TiFsHash}};
+use crate::fs::{hashed_block::HashedBlock, inode::{BlockAddress, StorageIno, TiFsHash}};
 
 use super::block_splitter::BlockIndexAndData;
 
 
 pub struct UpdateIrregularBlock<'ol> {
-    ino: u64,
+    ino: StorageIno,
     block_splitter_data: BlockIndexAndData<'ol>,
     block_splitter_data_start_position: usize,
     original_data_hash: Option<TiFsHash>,
@@ -14,7 +14,7 @@ pub struct UpdateIrregularBlock<'ol> {
 
 impl<'ol> UpdateIrregularBlock<'ol> {
     pub fn get_and_add_original_block_hash(
-        ino: u64,
+        ino: StorageIno,
         block_splitter_data: BlockIndexAndData<'ol>,
         block_splitter_data_start_position: usize,
         hash_list_prev: &HashMap<BlockAddress, TiFsHash>,

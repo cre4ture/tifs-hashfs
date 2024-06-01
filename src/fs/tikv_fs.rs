@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
-use std::mem;
+use std::mem::{self, size_of};
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use bimap::BiHashMap;
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::consts::FOPEN_DIRECT_IO;
@@ -21,17 +22,18 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+use lazy_static::lazy_static;
 
+use crate::fs::reply::{DirItem, InoKind};
 use super::async_fs::AsyncFileSystem;
-use super::dir::Directory;
 use super::error::{FsError, Result};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
-use super::inode::{Inode, TiFsHash};
+use super::inode::{Inode, StorageDirItem, StorageDirItemKind, StorageFilePermission, StorageIno, TiFsHash};
 use super::key::ROOT_INODE;
-use super::mode::make_mode;
+use super::mode::{as_file_kind, as_file_perm};
 use super::reply::{
-    get_time, Attr, Create, Data, Dir, Entry, Lock, Lseek, Open, StatFs, Write, Xattr,
+    get_time, Attr, Create, Data, Dir, Directory, Entry, LogicalIno, Lock, Lseek, Open, StatFs, Write, Xattr
 };
 use super::transaction::{Txn, TxnArc};
 use super::transaction_client_mux::TransactionClientMux;
@@ -40,12 +42,22 @@ pub const DIR_SELF: ByteString = ByteString::from_static(".");
 pub const DIR_PARENT: ByteString = ByteString::from_static("..");
 
 pub type TiFsBlockCache = Cache<TiFsHash, Arc<Vec<u8>>>;
-pub type TiFsInodeCache = Cache<u64, (Instant, Arc<Inode>)>;
+pub type TiFsInodeCache = Cache<StorageIno, (Instant, Arc<Inode>)>;
+
+lazy_static! {
+    static ref FILE_TYPE_MAP: BiHashMap<StorageDirItemKind, FileType> = {
+        let mut m = BiHashMap::new();
+        m.insert(StorageDirItemKind::Directory, FileType::Directory);
+        m.insert(StorageDirItemKind::File, FileType::RegularFile);
+        m.insert(StorageDirItemKind::Symlink, FileType::Symlink);
+        m
+    };
+}
 
 #[derive(Clone, Debug)]
 pub struct InoUse {
     instance: Weak<TiFs>,
-    ino: u64,
+    ino: StorageIno,
     use_id: Uuid,
 }
 
@@ -62,12 +74,26 @@ impl Drop for InoUse {
 }
 
 impl InoUse {
-    pub fn ino(&self) -> u64 {
+    pub fn ino(&self) -> StorageIno {
         self.ino
     }
 
     pub fn get_tifs(&self) -> Option<Arc<TiFs>> {
         self.instance.upgrade()
+    }
+}
+
+pub fn parse_filename(name: ByteString) -> (ByteString, InoKind) {
+    if (name.len() > 1) && (name.as_bytes()[0] == b'.') {
+        if name.as_bytes().ends_with(b".@hash") {
+            (name.slice_ref(&name[1..name.len()-b".@hash".len()]), InoKind::Hash)
+        } else if name.as_bytes().ends_with(b".@hashes") {
+            (name.slice_ref(&name[1..name.len()-b".@hashes".len()]), InoKind::Hashes)
+        } else {
+            (name, InoKind::Regular)
+        }
+    } else {
+        (name, InoKind::Regular)
     }
 }
 
@@ -308,23 +334,92 @@ impl TiFs {
         self.spin(msg, None, f).await
     }
 
-    async fn read_dir(&self, ino: u64) -> Result<Directory> {
-        let arc = self.weak.upgrade().unwrap();
-        arc.spin_no_delay(format!("read_dir"), move |_, txn| Box::pin(txn.read_dir(ino)))
-            .await
+    fn map_storage_dir_item_kind_to_file_type(kind: StorageDirItemKind) -> FileType {
+        FILE_TYPE_MAP.get_by_left(&kind).unwrap().clone()
     }
 
-    async fn read_inode(&self, ino: u64) -> Result<FileAttr> {
+    fn map_file_type_to_storage_dir_item_kind(typ: FileType) -> Result<StorageDirItemKind> {
+        FILE_TYPE_MAP.get_by_right(&typ).cloned().ok_or(FsError::WrongFileType)
+    }
+
+    fn map_storage_attr_to_fuser(&self, ino_kind: InoKind, ino_data: &Inode) -> FileAttr {
+        let mut stat = FileAttr {
+            ino: LogicalIno {
+                kind: ino_kind,
+                storage_ino: ino_data.storage_ino(),
+            }.to_raw(),
+            size: ino_data.size,
+            blocks: ino_data.blocks,
+            atime: ino_data.attr.atime,
+            mtime: ino_data.attr.mtime,
+            ctime: ino_data.attr.ctime,
+            crtime: ino_data.attr.crtime,
+            kind: Self::map_storage_dir_item_kind_to_file_type(ino_data.typ),
+            perm: ino_data.attr.perm.0,
+            nlink: 1,
+            uid: ino_data.attr.uid,
+            gid: ino_data.attr.gid,
+            rdev: ino_data.attr.rdev,
+            blksize: self.fs_config.block_size as u32,
+            flags: ino_data.attr.flags
+        };
+        self.adapt_inode(&mut stat);
+        stat
+    }
+
+    #[tracing::instrument]
+    async fn read_dir1(&self, ino: StorageIno) -> Result<Directory> {
+        let arc = self.weak.upgrade().unwrap();
+        let dir = arc.spin_no_delay(format!("read_dir"), move |_, txn| Box::pin(txn.read_dir(ino)))
+            .await?;
+
+        let mut dir_complete = Vec::with_capacity(dir.len() * 3);
+        for StorageDirItem{ino, name, typ} in dir.into_iter() {
+            if typ == StorageDirItemKind::File {
+                let full_hash_entry = DirItem {
+                    ino: LogicalIno{
+                        storage_ino: ino,
+                        kind: InoKind::Hash,
+                    },
+                    name: format!(".{}.@hash", &name),
+                    typ: FileType::RegularFile,
+                };
+                let block_hashes_entry = DirItem {
+                    ino: LogicalIno{
+                        storage_ino: ino,
+                        kind: InoKind::Hashes,
+                    },
+                    name: format!(".{}.@hashes", &name),
+                    typ: FileType::RegularFile,
+                };
+                dir_complete.push(full_hash_entry);
+                dir_complete.push(block_hashes_entry);
+            }
+            let regular_entry = DirItem {
+                ino: LogicalIno{
+                    storage_ino: ino,
+                    kind: InoKind::Regular,
+                },
+                name,
+                typ: Self::map_storage_dir_item_kind_to_file_type(typ),
+            };
+            dir_complete.push(regular_entry);
+        }
+
+        Ok(dir_complete)
+    }
+
+    async fn read_inode(&self, ino: StorageIno) -> Result<Arc<Inode>> {
         let arc = self.weak.upgrade().unwrap();
         let ino = arc
             .spin_no_delay(format!("read_inode"), move |_, txn| Box::pin(txn.read_inode_arc(ino)))
             .await?;
-        Ok(ino.file_attr)
+        Ok(ino)
     }
 
     async fn setlkw(
         &self,
-        ino: u64,
+        ino: StorageIno,
         lock_owner: u64,
         #[cfg(target_os = "linux")] typ: i32,
         #[cfg(any(target_os = "freebsd", target_os = "macos"))] typ: i16,
@@ -382,7 +477,7 @@ impl TiFs {
         }
     }
 
-    async fn release_inode_use(&self, ino: u64, use_id: Uuid) {
+    async fn release_inode_use(&self, ino: StorageIno, use_id: Uuid) {
         let arc = self.weak.upgrade().unwrap();
         let result = arc.spin_no_delay(format!("release, ino:{ino}"),
         move |_, txn| Box::pin(txn.close(ino, use_id)))
@@ -395,7 +490,7 @@ impl TiFs {
     #[tracing::instrument]
     async fn read_transaction(
         &self,
-        ino: u64,
+        ino: StorageIno,
         offset: u64,
         size: u32,
         flags: i32,
@@ -407,7 +502,7 @@ impl TiFs {
 
     async fn read_transaction_arc(
         self: Arc<Self>,
-        ino: u64,
+        ino: StorageIno,
         offset: u64,
         size: u32,
         _flags: i32,
@@ -438,11 +533,25 @@ impl TiFs {
 
         Ok(())
     }
+
+    pub fn adapt_inode(&self, stat: &mut FileAttr) {
+        match LogicalIno::from_raw(stat.ino).kind {
+            InoKind::Regular => {},
+            InoKind::Hash => {
+                stat.size = size_of::<TiFsHash>() as u64;
+                stat.blocks = 0;
+            }
+            InoKind::Hashes => {
+                stat.size = size_of::<TiFsHash>() as u64 * stat.blocks;
+                stat.blocks = 0;
+            }
+        }
+    }
 }
 
 impl Debug for TiFs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_fmt(format_args!("tifs({:?})", self.pd_endpoints))
+        f.write_fmt(format_args!("TiFs"))
     }
 }
 
@@ -474,9 +583,9 @@ impl AsyncFileSystem for TiFs {
                 if let Err(FsError::InodeNotFound { inode: _ }) = root_inode {
                     let attr = txn
                         .mkdir(
-                            0,
+                            StorageIno(0),
                             Default::default(),
-                            make_mode(FileType::Directory, 0o777),
+                            StorageFilePermission(0o777),
                             gid,
                             uid,
                         )
@@ -493,20 +602,35 @@ impl AsyncFileSystem for TiFs {
 
     #[tracing::instrument]
     async fn lookup(&self, parent: u64, name: ByteString) -> Result<Entry> {
-        Self::check_file_name(&name)?;
-        self.spin_no_delay(format!("lookup, parent: {parent}, name: {}", name.escape_debug()), move |_, txn| {
-            let name = name.clone();
+        let p_ino = LogicalIno::from_raw(parent);
+
+        let (filename, kind) = parse_filename(name);
+
+        Self::check_file_name(&filename)?;
+        let ino_data = self.spin_no_delay(format!("lookup, parent: {parent}, name: {}", filename.escape_debug()), move |_, txn| {
+            let filename = filename.clone();
             Box::pin(async move {
-                let ino = txn.clone().lookup(parent, name).await?;
-                Ok(Entry::new(txn.read_inode(ino).await?.deref().clone().into(), 0))
+                let ino = txn.clone().lookup(p_ino.storage_ino(), filename).await?;
+                Ok(txn.read_inode(ino).await?.deref().clone())
             })
         })
-        .await
+        .await?;
+
+        let entry = Entry {
+            generation: 0,
+            time: Duration::from_millis(0),
+            stat: self.map_storage_attr_to_fuser(kind, &ino_data),
+        };
+
+        Ok(entry)
     }
 
     #[tracing::instrument]
     async fn getattr(&self, ino: u64) -> Result<Attr> {
-        Ok(Attr::new(self.read_inode(ino).await?))
+        let l_ino = LogicalIno::from_raw(ino);
+        let ino_data = self.read_inode(l_ino.storage_ino()).await?;
+        let stat = self.map_storage_attr_to_fuser(l_ino.kind, &ino_data);
+        Ok(Attr::new(stat))
     }
 
     #[tracing::instrument]
@@ -526,43 +650,47 @@ impl AsyncFileSystem for TiFs {
         _bkuptime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> Result<Attr> {
-        self.spin_no_delay(format!("setattr"), move |_, txn| {
+        let l_ino = LogicalIno::from_raw(ino);
+        let ino_data = self.spin_no_delay(format!("setattr"), move |_, txn| {
             Box::pin(async move {
                 // TODO: how to deal with fh, chgtime, bkuptime?
-                let mut attr = txn.clone().read_inode(ino).await?.deref().clone();
-                attr.perm = match mode {
-                    Some(m) => m as _,
-                    None => attr.perm,
+                let mut inode_data = txn.clone().read_inode(l_ino.storage_ino()).await?.deref().clone();
+                inode_data.attr.perm = match mode {
+                    Some(m) => StorageFilePermission(as_file_perm(m)),
+                    None => inode_data.attr.perm,
                 };
-                attr.uid = uid.unwrap_or(attr.uid);
-                attr.gid = gid.unwrap_or(attr.gid);
-                attr.set_size(size.unwrap_or(attr.size), txn.block_size());
-                attr.atime = match atime {
-                    None => attr.atime,
+                inode_data.attr.uid = uid.unwrap_or(inode_data.attr.uid);
+                inode_data.attr.gid = gid.unwrap_or(inode_data.attr.gid);
+                inode_data.set_size(size.unwrap_or(inode_data.size), txn.block_size());
+                inode_data.attr.atime = match atime {
+                    None => inode_data.attr.atime,
                     Some(TimeOrNow::SpecificTime(t)) => t,
                     Some(TimeOrNow::Now) => SystemTime::now(),
                 };
-                attr.mtime = match mtime {
+                inode_data.attr.mtime = match mtime {
                     Some(TimeOrNow::SpecificTime(t)) => t,
                     Some(TimeOrNow::Now) | None => SystemTime::now(),
                 };
-                attr.ctime = ctime.unwrap_or_else(SystemTime::now);
-                attr.crtime = crtime.unwrap_or(attr.crtime);
-                attr.flags = flags.unwrap_or(attr.flags);
-                txn.save_inode(&Arc::new(attr.clone())).await?;
-                Ok(Attr {
-                    time: get_time(),
-                    attr: attr.into(),
-                })
+                inode_data.attr.ctime = ctime.unwrap_or_else(SystemTime::now);
+                inode_data.attr.crtime = crtime.unwrap_or(inode_data.attr.crtime);
+                inode_data.attr.flags = flags.unwrap_or(inode_data.attr.flags);
+                txn.save_inode(&Arc::new(inode_data.clone())).await?;
+                Ok(inode_data)
             })
         })
-        .await
+        .await?;
+
+        Ok(Attr {
+            time: get_time(),
+            attr: self.map_storage_attr_to_fuser(l_ino.kind, &ino_data),
+        })
     }
 
     #[tracing::instrument]
     async fn readdir(&self, ino: u64, _fh: u64, offset: i64) -> Result<Dir> {
+        let l_ino = LogicalIno::from_raw(ino);
         let mut dir = Dir::offset(offset as usize);
-        let directory = self.read_dir(ino).await?;
+        let directory = self.read_dir1(l_ino.storage_ino()).await?;
         for item in directory.into_iter().skip(offset as usize) {
             dir.push(item)
         }
@@ -573,18 +701,19 @@ impl AsyncFileSystem for TiFs {
     #[tracing::instrument]
     async fn open(&self, ino: u64, flags: i32) -> Result<Open> {
         // TODO: deal with flags
+        let l_ino = LogicalIno::from_raw(ino);
         let mut ino_use = self.with_mut_data(|d| d.get_ino_use(ino)).await?;
         if ino_use.is_none() {
             // not opened yet on this instance. open it:
             let new_use_id = Uuid::new_v4();
             self
                 .spin_no_delay(format!("open ino: {ino}, flags: {flags}"),
-                move |_, txn| Box::pin(txn.open(ino, new_use_id)))
+                move |_, txn| Box::pin(txn.open(l_ino.storage_ino(), new_use_id)))
                 .await?;
             // file exists and registration was successful, register use locally:
             let new_ino_use = Arc::new(InoUse{
                 instance: self.weak.to_owned(),
-                ino,
+                ino: l_ino.storage_ino(),
                 use_id: new_use_id
             });
             self.with_mut_data(|d: &mut TiFsMutable| d.opened_ino.insert(ino, Arc::downgrade(&new_ino_use))).await?;
@@ -626,6 +755,7 @@ impl AsyncFileSystem for TiFs {
         flags: i32,
         lock_owner: Option<u64>,
     ) -> Result<Data> {
+        let l_ino = LogicalIno::from_raw(ino);
         let file_handler = self.get_file_handler_checked(fh).await?;
         let lock = file_handler.mut_data.read().await;
         let start = lock.cursor as i64 + offset;
@@ -641,13 +771,13 @@ impl AsyncFileSystem for TiFs {
 
         let start = start as u64;
         let arc = self.weak.upgrade().unwrap();
-        let result = arc.clone().read_transaction_arc(ino, start, size, flags, lock_owner).await?;
+        let result = arc.clone().read_transaction_arc(l_ino.storage_ino(), start, size, flags, lock_owner).await?;
 
         if (self.fs_config.read_ahead_size > 0) && (result.data.len() == size as usize) {
             let target = start + size as u64;
             let read_ahead_size = self.fs_config.read_ahead_size;
             let mut lock = file_handler.read_ahead.write().await;
-            lock.push(arc.read_transaction_arc(ino, target, read_ahead_size as u32, flags, lock_owner)
+            lock.push(arc.read_transaction_arc(l_ino.storage_ino(), target, read_ahead_size as u32, flags, lock_owner)
                                 .map(|d|{ d.map(|_|{}) }).boxed()).await;
         }
 
@@ -703,17 +833,20 @@ impl AsyncFileSystem for TiFs {
         uid: u32,
         _umask: u32,
     ) -> Result<Entry> {
+        let p_ino = LogicalIno::from_raw(parent);
         Self::check_file_name(&name)?;
-        let attr = self
-            .spin_no_delay(format!("mkdir"), move |_, txn| Box::pin(txn.mkdir(parent, name.clone(), mode, gid, uid)))
+        let perm = StorageFilePermission(as_file_perm(mode));
+        let ino_data = self
+            .spin_no_delay(format!("mkdir"), move |_, txn| Box::pin(txn.mkdir(p_ino.storage_ino(), name.clone(), perm, gid, uid)))
             .await?;
-        Ok(Entry::new(attr.file_attr, 0))
+        Ok(Entry::new(self.map_storage_attr_to_fuser(InoKind::Regular, &ino_data), 0))
     }
 
     #[tracing::instrument]
     async fn rmdir(&self, parent: u64, raw_name: ByteString) -> Result<()> {
+        let p_ino = LogicalIno::from_raw(parent);
         Self::check_file_name(&raw_name)?;
-        self.spin_no_delay(format!("rmdir"), move |_, txn| Box::pin(txn.rmdir(parent, raw_name.clone())))
+        self.spin_no_delay(format!("rmdir"), move |_, txn| Box::pin(txn.rmdir(p_ino.storage_ino(), raw_name.clone())))
             .await
     }
 
@@ -728,13 +861,16 @@ impl AsyncFileSystem for TiFs {
         _umask: u32,
         rdev: u32,
     ) -> Result<Entry> {
+        let p_ino = LogicalIno::from_raw(parent);
+        let perm = StorageFilePermission(as_file_perm(mode));
+        let typ = Self::map_file_type_to_storage_dir_item_kind(as_file_kind(mode))?;
         Self::check_file_name(&name)?;
-        let attr = self
+        let ino_data = self
             .spin_no_delay(format!("mknod"), move |_, txn| {
-                Box::pin(txn.make_inode(parent, name.clone(), mode, gid, uid, rdev))
+                Box::pin(txn.make_inode(p_ino.storage_ino(), name.clone(), typ, perm, gid, uid, rdev))
             })
             .await?;
-        Ok(Entry::new(attr.file_attr, 0))
+        Ok(Entry::new(self.map_storage_attr_to_fuser(InoKind::Regular, &ino_data), 0))
     }
 
     #[tracing::instrument]
@@ -764,6 +900,7 @@ impl AsyncFileSystem for TiFs {
     }
 
     async fn lseek(&self, ino: u64, fh: u64, offset: i64, whence: i32) -> Result<Lseek> {
+        let l_ino = LogicalIno::from_raw(ino);
         eprintln!("lseek-begin(ino:{ino},fh:{fh},offset:{offset},whence:{whence}");
         let file_handler = self.get_file_handler_checked(fh).await?;
         let file_handler_data = file_handler.mut_data.read().await;
@@ -775,7 +912,7 @@ impl AsyncFileSystem for TiFs {
                     SEEK_SET => offset,
                     SEEK_CUR => current_cursor as i64 + offset,
                     SEEK_END => {
-                        let inode = txn.read_inode(ino).await?;
+                        let inode = txn.read_inode(l_ino.storage_ino()).await?;
                         inode.size as i64 + offset
                     }
                     _ => return Err(FsError::UnknownWhence { whence }),
@@ -820,17 +957,20 @@ impl AsyncFileSystem for TiFs {
     }
 
     /// Create a hard link.
-    async fn link(&self, ino: u64, newparent: u64, newname: ByteString) -> Result<Entry> {
-        Self::check_file_name(&newname)?;
+    async fn link(&self, ino: u64, new_parent: u64, new_name: ByteString) -> Result<Entry> {
+        let l_ino = LogicalIno::from_raw(ino);
+        let p_ino = LogicalIno::from_raw(new_parent);
+        Self::check_file_name(&new_name)?;
         let inode = self
-            .spin_no_delay(format!("link"), move |_, txn| Box::pin(txn.link(ino, newparent, newname.clone())))
+            .spin_no_delay(format!("link"), move |_, txn| Box::pin(txn.link(l_ino.storage_ino(), p_ino.storage_ino(), new_name.clone())))
             .await?;
-        Ok(Entry::new(inode.file_attr, 0))
+        Ok(Entry::new(self.map_storage_attr_to_fuser(l_ino.kind, &inode), 0))
     }
 
     async fn unlink(&self, parent: u64, raw_name: ByteString) -> Result<()> {
+        let p_ino = LogicalIno::from_raw(parent);
         self.spin_no_delay(format!("unlink, parent:{parent}, raw_name:{}", raw_name.escape_debug()),
-            move |_, txn| Box::pin(txn.unlink(parent, raw_name.clone())))
+            move |_, txn| Box::pin(txn.unlink(p_ino.storage_ino(), raw_name.clone())))
             .await
     }
 
@@ -838,23 +978,25 @@ impl AsyncFileSystem for TiFs {
         &self,
         parent: u64,
         raw_name: ByteString,
-        newparent: u64,
+        new_parent: u64,
         new_raw_name: ByteString,
         _flags: u32,
     ) -> Result<()> {
+        let p_ino = LogicalIno::from_raw(parent);
+        let np_ino = LogicalIno::from_raw(new_parent);
         Self::check_file_name(&raw_name)?;
         Self::check_file_name(&new_raw_name)?;
         self.spin_no_delay(format!("rename"), move |_, txn| {
             let name = raw_name.clone();
             let new_name = new_raw_name.clone();
             Box::pin(async move {
-                let ino = txn.clone().lookup(parent, name.clone()).await?;
-                txn.clone().link(ino, newparent, new_name).await?;
-                txn.clone().unlink(parent, name).await?;
+                let ino = txn.clone().lookup(p_ino.storage_ino(), name.clone()).await?;
+                txn.clone().link(ino, np_ino.storage_ino(), new_name).await?;
+                txn.clone().unlink(p_ino.storage_ino(), name).await?;
                 let inode = txn.clone().read_inode(ino).await?;
-                if inode.file_attr.kind == FileType::Directory {
+                if inode.typ == StorageDirItemKind::Directory {
                     txn.clone().unlink(ino, DIR_PARENT).await?;
-                    txn.link(newparent, ino, DIR_PARENT).await?;
+                    txn.link(np_ino.storage_ino(), ino, DIR_PARENT).await?;
                 }
                 Ok(())
             })
@@ -871,12 +1013,13 @@ impl AsyncFileSystem for TiFs {
         name: ByteString,
         link: ByteString,
     ) -> Result<Entry> {
+        let p_ino = LogicalIno::from_raw(parent);
         Self::check_file_name(&name)?;
         let name_clone1 = name.clone();
         let ino = self.spin_no_delay(format!("inode for symlink"), move |_, txn| {
             let name = name_clone1.clone();
             Box::pin(async move {
-                if txn.clone().check_if_dir_entry_exists(parent, &name).await? {
+                if txn.clone().check_if_dir_entry_exists(p_ino.storage_ino(), &name).await? {
                     return Err(FsError::FileExist {
                         file: name.to_string(),
                     });
@@ -885,8 +1028,7 @@ impl AsyncFileSystem for TiFs {
             })
         }).await?;
 
-        let mode = make_mode(FileType::Symlink, 0o777);
-        let mut inode = Txn::initialize_inode(self.fs_config.block_size, ino, mode, gid, uid, 0);
+        let mut inode = Txn::initialize_inode(ino, StorageDirItemKind::Symlink, StorageFilePermission(0o777), gid, uid, 0);
         Txn::set_fresh_inode_to_link(&mut inode, link.into_bytes());
         let ptr = Arc::new(inode);
         let ptr_clone1 = ptr.clone();
@@ -896,17 +1038,18 @@ impl AsyncFileSystem for TiFs {
             let ptr = ptr_clone1.clone();
             Box::pin(async move {
                 txn.clone().save_inode(&ptr).await?;
-                txn.connect_inode_to_directory(parent, &name, ptr.deref()).await
+                txn.connect_inode_to_directory(p_ino.storage_ino(), &name, ptr.deref()).await
             })
         }).await?;
 
-        Ok(Entry::new(ptr.file_attr, 0))
+        Ok(Entry::new(self.map_storage_attr_to_fuser(InoKind::Regular, &ptr), 0))
     }
 
     async fn readlink(&self, ino: u64) -> Result<Data> {
+        let l_ino = LogicalIno::from_raw(ino);
         let arc = self.weak.upgrade().unwrap();
         arc.spin(format!("readlink"), None, move |_, txn| {
-            Box::pin(async move { Ok(Data::new(txn.read_link(ino).await?)) })
+            Box::pin(async move { Ok(Data::new(txn.read_link(l_ino.storage_ino()).await?)) })
         })
         .await
     }
@@ -920,9 +1063,10 @@ impl AsyncFileSystem for TiFs {
         length: i64,
         _mode: i32,
     ) -> Result<()> {
+        let l_ino = LogicalIno::from_raw(ino);
         self.spin_no_delay(format!("fallocate"), move |_, txn| {
             Box::pin(async move {
-                let mut inode = txn.clone().read_inode(ino).await?.deref().clone();
+                let mut inode = txn.clone().read_inode(l_ino.storage_ino()).await?.deref().clone();
                 txn.fallocate(&mut inode, offset, length).await
             })
         })
@@ -947,13 +1091,14 @@ impl AsyncFileSystem for TiFs {
         pid: u32,
         sleep: bool,
     ) -> Result<()> {
+        let l_ino = LogicalIno::from_raw(ino);
         #[cfg(any(target_os = "freebsd", target_os = "macos"))]
         let typ = typ as i16;
         let not_again = self.spin_no_delay(format!("setlk"), move |_, txn| {
             Box::pin(async move {
-                let mut inode = txn.clone().read_inode(ino).await?.deref().clone();
+                let mut inode = txn.clone().read_inode(l_ino.storage_ino()).await?.deref().clone();
                 warn!("setlk, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
-                if inode.file_attr.kind == FileType::Directory {
+                if inode.typ == StorageDirItemKind::Directory {
                     return Err(FsError::InvalidLock);
                 }
                 match typ {
@@ -1016,7 +1161,7 @@ impl AsyncFileSystem for TiFs {
         .await?;
 
         if !not_again {
-            self.setlkw(ino, lock_owner, typ).await
+            self.setlkw(l_ino.storage_ino(), lock_owner, typ).await
         } else {
             Ok(())
         }
@@ -1033,10 +1178,11 @@ impl AsyncFileSystem for TiFs {
         _typ: i32,
         pid: u32,
     ) -> Result<Lock> {
+        let l_ino = LogicalIno::from_raw(ino);
         // TODO: read only operation need not txn?
         self.spin_no_delay(format!("getlk"), move |_, txn| {
             Box::pin(async move {
-                let inode = txn.read_inode(ino).await?;
+                let inode = txn.read_inode(l_ino.storage_ino()).await?;
                 warn!("getlk, inode:{:?}, pid:{:?}", inode, pid);
                 Ok(Lock::_new(0, 0, inode.lock_state.lk_type as i32, 0))
             })

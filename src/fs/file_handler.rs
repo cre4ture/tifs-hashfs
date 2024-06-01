@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use tokio::sync::RwLock;
 
-use super::{error::TiFsResult, tikv_fs::InoUse};
+use super::{error::TiFsResult, inode::StorageIno, tikv_fs::InoUse};
 use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 #[derive(Debug)]
@@ -31,7 +31,7 @@ impl FileHandler {
         }
     }
 
-    pub fn ino(&self) -> u64 {
+    pub fn ino(&self) -> StorageIno {
         self.ino_use.ino()
     }
 }
