@@ -16,7 +16,7 @@ use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
 use uuid::Uuid;
 
-use crate::fs::inode::{LockState, StorageDirItem, StorageDirItemKind, StorageIno};
+use crate::fs::inode::{StorageDirItem, StorageDirItemKind, StorageIno};
 use crate::fs::meta::StaticFsParameters;
 use crate::fs::utils::stop_watch::AutoStopWatch;
 use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
@@ -287,6 +287,35 @@ impl Txn {
     }
 
     #[instrument(skip(self))]
+    pub async fn read_hash_of_file(self: TxnArc, ino: StorageIno, offset: u64, size: u64) -> Result<Vec<u8>> {
+
+        let hash_size = mem::size_of::<TiFsHash>() as u64;
+        let offset = offset.clamp(0, hash_size);
+        let remaining = hash_size - offset;
+        let size = size.clamp(0, remaining);
+
+        let mut result = Vec::with_capacity(hash_size as usize);
+        let mut ino_data = self.clone().read_inode(ino).await?;
+        if ino_data.data_hash.is_none() {
+            let size_in_blocks = ino_data.size().div_ceil(self.fs_config.block_size);
+            let hash_data = self.clone().read_hashes_of_file(ino, 0, (size_in_blocks * hash_size) as u32).await?;
+            let full_data_hash = blake3::hash(&hash_data);
+            ino_data = self.clone().read_inode(ino).await?;
+            let mut ino_data_mut = ino_data.deref().clone();
+            ino_data_mut.data_hash = Some(full_data_hash);
+            ino_data = Arc::new(ino_data_mut);
+            self.save_inode(&ino_data).await?;
+        }
+
+        if let Some(precalculated_hash) = ino_data.data_hash {
+            result.extend_from_slice(&precalculated_hash.as_bytes()[offset as usize..(offset+size) as usize]);
+            return Ok(result);
+        }
+
+        unreachable!();
+    }
+
+    #[instrument(skip(self))]
     pub async fn read_hashes_of_file(self: TxnArc, ino: StorageIno, offset: u64, size: u32) -> Result<Vec<u8>> {
         let hash_size = mem::size_of::<TiFsHash>() as u64;
         let first_block = offset / hash_size;
@@ -294,7 +323,7 @@ impl Txn {
         let block_cnt = (first_block_offset + size as u64) / hash_size;
         let remainder = (first_block_offset + size as u64) % hash_size;
         let fetch_block_cnt = if remainder != 0 {block_cnt + 1} else {block_cnt};
-        let hashes = self.hb_get_block_hash_list_by_block_range(ino, first_block..(first_block+fetch_block_cnt)).await?;
+        let hashes = self.hb_get_block_hash_list_by_block_range_chunked(ino, first_block..(first_block+fetch_block_cnt)).await?;
         let mut result = Vec::with_capacity((fetch_block_cnt * hash_size) as usize);
         for block_id in first_block..(first_block+block_cnt) {
             let block_hash = hashes.get(&BlockAddress { ino, index: block_id }).unwrap_or(&ZERO_HASH);
@@ -329,32 +358,6 @@ impl Txn {
         debug!("get ino({})", ino);
         self.save_meta(&meta).await?;
         Ok(StorageIno(ino))
-    }
-
-    pub fn initialize_inode(ino: StorageIno, typ: StorageDirItemKind, perm: StorageFilePermission, gid: u32, uid: u32, rdev: u32,) -> Inode {
-        let inode = Inode {
-            ino,
-            typ,
-            size: 0,
-            blocks: 0,
-            attr: inode::StorageFileAttr {
-                atime: SystemTime::now(),
-                mtime: SystemTime::now(),
-                ctime: SystemTime::now(),
-                crtime: SystemTime::now(),
-                perm,
-                uid,
-                gid,
-                rdev,
-                flags: 0,
-            },
-            lock_state: LockState::new(HashSet::new(), 0),
-            inline_data: None,
-            data_hash: None,
-        };
-
-        debug!("made inode ({:?})", &inode);
-        inode
     }
 
     pub async fn check_if_dir_entry_exists(self: Arc<Self>, parent: StorageIno, name: &ByteString) -> Result<bool> {
@@ -397,7 +400,7 @@ impl Txn {
     ) -> Result<Arc<Inode>> {
         let ino = self.clone().reserve_new_ino().await?;
 
-        let inode = Self::initialize_inode(ino, typ, perm, gid, uid, rdev);
+        let inode = Inode::new(ino, typ, perm, gid, uid, rdev);
 
         self.clone().connect_inode_to_directory(parent, &name, &inode).await?;
 
@@ -490,12 +493,10 @@ impl Txn {
     }
 
     async fn transfer_inline_data_to_block(self: TxnArc, inode: &mut Inode) -> Result<()> {
-        debug_assert!(inode.size <= self.inline_data_threshold());
+        debug_assert!(inode.size() <= self.inline_data_threshold());
         let key = Key::from(self.key_builder().block(inode.storage_ino(), 0));
-        let mut data = inode.inline_data.clone().unwrap();
-        data.resize(self.block_size as usize, 0);
+        let data = inode.take_inline_data().unwrap();
         self.clone().put(key, data).await?;
-        inode.inline_data = None;
         Ok(())
     }
 
@@ -505,7 +506,7 @@ impl Txn {
         start: u64,
         data: &[u8],
     ) -> Result<usize> {
-        debug_assert!(inode.size <= self.inline_data_threshold());
+        debug_assert!(inode.size() <= self.inline_data_threshold());
         let size = data.len() as u64;
         debug_assert!(
             start + size <= self.inline_data_threshold(),
@@ -518,7 +519,7 @@ impl Txn {
         let size = data.len();
         let start = start as usize;
 
-        let mut inlined = inode.inline_data.take().unwrap_or_else(Vec::new);
+        let mut inlined = inode.take_inline_data().unwrap_or_else(Vec::new);
         if start + size > inlined.len() {
             inlined.resize(start + size, 0);
         }
@@ -528,7 +529,7 @@ impl Txn {
         inode.attr.mtime = SystemTime::now();
         //inode.file_attr.ctime = SystemTime::now();
         inode.set_size(inlined.len() as u64, self.block_size);
-        inode.inline_data = Some(inlined);
+        inode.set_inline_data(inlined);
         self.clone().save_inode(&Arc::new(inode.clone())).await?;
 
         Ok(size)
@@ -543,8 +544,8 @@ impl Txn {
         let start = start as usize;
         let size = size as usize;
 
-        let inlined = inode.inline_data.as_ref().unwrap();
-        debug_assert!(inode.size as usize == inlined.len());
+        let inlined = inode.inline_data().unwrap();
+        debug_assert!(inode.size() as usize == inlined.len());
         let mut data = vec![0; size];
         if inlined.len() > start {
             let to_copy = size.min(inlined.len() - start);
@@ -637,22 +638,22 @@ impl Txn {
         chunk_size: Option<u64>,
         update_atime: bool,
     ) -> Result<Vec<u8>> {
-        let attr = self.clone().read_inode(ino).await?;
-        if start >= attr.size {
+        let ino_data = self.clone().read_inode(ino).await?;
+        if start >= ino_data.size() {
             return Ok(Vec::new());
         }
 
-        let max_size = attr.size - start;
+        let max_size = ino_data.size() - start;
         let size = chunk_size.unwrap_or(max_size).min(max_size);
 
         if update_atime {
-            let mut attr = attr.deref().clone();
+            let mut attr = ino_data.deref().clone();
             attr.attr.atime = SystemTime::now();
             self.clone().save_inode(&Arc::new(attr)).await?;
         }
 
-        if attr.inline_data.is_some() {
-            return self.clone().read_inline_data(&attr, start, size).await;
+        if ino_data.inline_data().is_some() {
+            return self.clone().read_inline_data(&ino_data, start, size).await;
         }
 
         if self.fs_config.hashed_blocks {
@@ -664,15 +665,21 @@ impl Txn {
 
     pub async fn clear_data(self: TxnArc, ino: StorageIno) -> Result<u64> {
         let mut attr = self.clone().read_inode(ino).await?.deref().clone();
-        let end_block = (attr.size + self.block_size - 1) / self.block_size;
+        let block_cnt = attr.size().div_ceil(self.block_size);
 
-        for block in 0..end_block {
-            let key = Key::from(self.key_builder().block(ino, block));
-            self.clone().delete(key).await?;
+        let mut deletes = Vec::with_capacity(block_cnt as usize);
+        for block in 0..block_cnt {
+            let key = if self.fs_config.hashed_blocks {
+                Key::from(self.key_builder().block_hash(BlockAddress { ino, index: block }))
+            } else {
+                Key::from(self.key_builder().block(ino, block))
+            };
+            deletes.push(Mutation::Delete(key));
         }
+        self.clone().batch_mutate(deletes).await?;
 
-        let clear_size = attr.size;
-        attr.size = 0;
+        let clear_size = attr.size();
+        attr.set_size(0, self.fs_config.block_size);
         attr.attr.atime = SystemTime::now();
         attr.attr.mtime = SystemTime::now();
         self.save_inode(&Arc::new(attr)).await?;
@@ -740,6 +747,24 @@ impl Txn {
             };
             Some((key, hash))
         }).collect();
+        trace!("result: len:{}", result.len());
+        Ok(result)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn hb_get_block_hash_list_by_block_range_chunked(self: TxnArc, ino: StorageIno, block_range: Range<u64>
+    ) -> Result<HashMap<BlockAddress, inode::Hash>> {
+        let mut i = block_range.start;
+        let max_chunk_size = 10240;
+        let mut result = HashMap::with_capacity(block_range.clone().count());
+        while i < block_range.end {
+            let chunk_start = i;
+            let chunk_end = (chunk_start+max_chunk_size).min(block_range.end);
+            i = chunk_end;
+
+            let chunk = self.clone().hb_get_block_hash_list_by_block_range(ino, chunk_start..chunk_end).await?;
+            result.extend(chunk.into_iter());
+        }
         trace!("result: len:{}", result.len());
         Ok(result)
     }
@@ -977,12 +1002,12 @@ impl Txn {
         let target = start + size as u64;
         watch.sync("read_inode");
 
-        if inode.inline_data.is_some() && target > self.inline_data_threshold() {
+        if inode.inline_data().is_some() && target > self.inline_data_threshold() {
             self.clone().transfer_inline_data_to_block(&mut inode).await?;
             watch.sync("transfer_inline");
         }
 
-        if (inode.inline_data.is_some() || inode.size == 0)
+        if (inode.inline_data().is_some() || inode.size() == 0)
             && target <= self.inline_data_threshold()
         {
             let result = self.write_inline_data(&mut inode, start, &data).await;
@@ -999,30 +1024,29 @@ impl Txn {
 
         watch.sync("write impl");
 
-        let size_changed = inode.size < target;
+        let size_changed = inode.size() < target;
         if size_changed || (self.fs_config.enable_mtime && content_was_modified) {
             inode.attr.atime = SystemTime::now();
             inode.attr.mtime = SystemTime::now();
             // inode.ctime = SystemTime::now(); TODO: bug?
-            inode.set_size(inode.size.max(target), self.block_size);
+            inode.set_size(inode.size().max(target), self.block_size);
             self.save_inode(&Arc::new(inode)).await?;
             watch.sync("save inode");
         }
         Ok(size)
     }
 
-    pub fn set_fresh_inode_to_link(inode: &mut Inode, data: Bytes) {
+    pub fn set_fresh_inode_to_link(block_size: u64, inode: &mut Inode, data: Bytes) {
         inode.typ = StorageDirItemKind::Symlink;
-        inode.inline_data = Some(data.to_vec());
-        inode.size = data.len() as u64;
-        inode.blocks = 1;
+        inode.set_inline_data(data.to_vec());
+        inode.set_size(data.len() as u64, block_size);
     }
 
     pub async fn write_link(self: TxnArc, inode: &mut Inode, data: Bytes) -> Result<usize> {
         if inode.typ != StorageDirItemKind::Symlink {
             return Err(FsError::WrongFileType)
         }
-        inode.inline_data = None;
+        inode.take_inline_data();
         inode.set_size(0, self.block_size);
         self.write_inline_data(inode, 0, &data).await
     }
@@ -1030,7 +1054,7 @@ impl Txn {
     pub async fn read_link(self: TxnArc, ino: StorageIno) -> Result<Vec<u8>> {
         let inode = self.clone().read_inode(ino).await?;
         debug_assert!(inode.typ == StorageDirItemKind::Symlink);
-        let size = inode.size;
+        let size = inode.size();
         if self.fs_config.enable_atime {
             let mut inode = inode.deref().clone();
             inode.attr.atime = SystemTime::now();
@@ -1121,13 +1145,13 @@ impl Txn {
 
     pub async fn fallocate(self: TxnArc, inode: &mut Inode, offset: i64, length: i64) -> Result<()> {
         let target_size = (offset + length) as u64;
-        if target_size <= inode.size {
+        if target_size <= inode.size() {
             return Ok(());
         }
 
-        if inode.inline_data.is_some() {
+        if inode.inline_data().is_some() {
             if target_size <= self.inline_data_threshold() {
-                let original_size = inode.size;
+                let original_size = inode.size();
                 let data = vec![0; (target_size - original_size) as usize];
                 self.clone().write_inline_data(inode, original_size, &data).await?;
                 return Ok(());
@@ -1202,7 +1226,7 @@ impl Txn {
             .await?
             .into_iter().map(|pair| Inode::deserialize(pair.value()))
             .try_fold((0, 0), |(blocks, files), inode| {
-                Ok::<_, FsError>((blocks + inode?.blocks, files + 1))
+                Ok::<_, FsError>((blocks + inode?.blocks(), files + 1))
             })?;
         let ffree = std::u64::MAX - next_inode.0;
         let bfree = match self.max_blocks {

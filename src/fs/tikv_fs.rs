@@ -277,7 +277,7 @@ impl TiFs {
         let arc = self.weak.upgrade().unwrap();
         let data = arc
             .spin_no_delay(format!("read_kind_hash, ino:{ino}, start:{start}, size:{size}"),
-            move |_, txn| txn.read_hashes_of_file(ino, start, size).boxed())
+            move |_, txn| txn.read_hash_of_file(ino, start, size as u64).boxed())
             .await?;
         Ok(Data::new(data))
     }
@@ -410,8 +410,8 @@ impl TiFs {
                 kind: ino_kind,
                 storage_ino: ino_data.storage_ino(),
             }.to_raw(),
-            size: ino_data.size,
-            blocks: ino_data.blocks,
+            size: ino_data.size(),
+            blocks: ino_data.blocks(),
             atime: ino_data.attr.atime,
             mtime: ino_data.attr.mtime,
             ctime: ino_data.attr.ctime,
@@ -723,7 +723,7 @@ impl AsyncFileSystem for TiFs {
                 };
                 inode_data.attr.uid = uid.unwrap_or(inode_data.attr.uid);
                 inode_data.attr.gid = gid.unwrap_or(inode_data.attr.gid);
-                inode_data.set_size(size.unwrap_or(inode_data.size), txn.block_size());
+                inode_data.set_size(size.unwrap_or(inode_data.size()), txn.block_size());
                 inode_data.attr.atime = match atime {
                     None => inode_data.attr.atime,
                     Some(TimeOrNow::SpecificTime(t)) => t,
@@ -967,7 +967,7 @@ impl AsyncFileSystem for TiFs {
                     SEEK_CUR => current_cursor as i64 + offset,
                     SEEK_END => {
                         let inode = txn.read_inode(l_ino.storage_ino()).await?;
-                        inode.size as i64 + offset
+                        inode.size() as i64 + offset
                     }
                     _ => return Err(FsError::UnknownWhence { whence }),
                 };
@@ -1082,8 +1082,8 @@ impl AsyncFileSystem for TiFs {
             })
         }).await?;
 
-        let mut inode = Txn::initialize_inode(ino, StorageDirItemKind::Symlink, StorageFilePermission(0o777), gid, uid, 0);
-        Txn::set_fresh_inode_to_link(&mut inode, link.into_bytes());
+        let mut inode = Inode::new(ino, StorageDirItemKind::Symlink, StorageFilePermission(0o777), gid, uid, 0);
+        Txn::set_fresh_inode_to_link(self.fs_config.block_size, &mut inode, link.into_bytes());
         let ptr = Arc::new(inode);
         let ptr_clone1 = ptr.clone();
 

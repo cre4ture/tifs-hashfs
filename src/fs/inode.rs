@@ -84,24 +84,71 @@ pub struct Inode {
     pub typ: StorageDirItemKind,
     pub attr: StorageFileAttr,
     pub lock_state: LockState,
-    pub size: u64,
-    pub blocks: u64,
-    pub inline_data: Option<Vec<u8>>,
+    size: u64,
+    blocks: u64,
+    inline_data: Option<Vec<u8>>,
     pub data_hash: Option<Hash>,
 }
 
 impl Inode {
+    pub fn new(ino: StorageIno, typ: StorageDirItemKind, perm: StorageFilePermission, gid: u32, uid: u32, rdev: u32,) -> Self {
+        let inode = Self {
+            ino,
+            typ,
+            size: 0,
+            blocks: 0,
+            attr: StorageFileAttr {
+                atime: SystemTime::now(),
+                mtime: SystemTime::now(),
+                ctime: SystemTime::now(),
+                crtime: SystemTime::now(),
+                perm,
+                uid,
+                gid,
+                rdev,
+                flags: 0,
+            },
+            lock_state: LockState::new(HashSet::new(), 0),
+            inline_data: None,
+            data_hash: None,
+        };
+        inode
+    }
+
     pub fn storage_ino(&self) -> StorageIno {
         self.ino
     }
 
     fn update_blocks(&mut self, block_size: u64) {
-        self.blocks = (self.size + block_size - 1) / block_size;
+        self.blocks = self.size.div_ceil(block_size);
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn blocks(&self) -> u64 {
+        self.blocks
     }
 
     pub fn set_size(&mut self, size: u64, block_size: u64) {
         self.size = size;
         self.update_blocks(block_size);
+        self.data_hash = None;
+    }
+
+    pub fn inline_data(&self) -> Option<&Vec<u8>> {
+        self.inline_data.as_ref()
+    }
+
+    pub fn take_inline_data(&mut self) -> Option<Vec<u8>> {
+        self.data_hash = None;
+        self.inline_data.take()
+    }
+
+    pub fn set_inline_data(&mut self, data: Vec<u8>) {
+        self.inline_data = Some(data);
+        self.data_hash = None;
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>> {
