@@ -22,7 +22,7 @@ use uuid::Uuid;
 use lazy_static::lazy_static;
 
 use crate::fs::reply::{DirItem, InoKind};
-use super::error::{FsError, Result};
+use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
 use super::inode::{Inode, StorageDirItem, StorageDirItemKind, StorageIno, TiFsHash};
@@ -572,8 +572,8 @@ impl TiFs {
         Ok(Data::new(data))
     }
 
-    #[instrument(skip(self, _txn))]
-    pub async fn release_file_handler<'fl>(&self, _txn: Arc<Txn>, fh: u64) -> Result<()>{
+    #[instrument(skip(self))]
+    pub async fn release_file_handler<'fl>(&self, fh: u64) -> Result<()>{
         let released_handler = self.with_mut_data(|d| {
             d.release_file_handler(fh)
         }).await?;
@@ -605,6 +605,17 @@ impl TiFs {
                 stat.blocks = 0;
             }
         }
+    }
+
+    pub async fn flush_write_cache(&self, fh: u64) -> TiFsResult<()> {
+        let file_handler = self.get_file_handler_checked(fh).await?;
+        let mut write_cache = file_handler.write_cache.write().await;
+        write_cache.wait_finish_all().await;
+        let results = write_cache.get_results_so_far();
+        for r in results {
+            r?;
+        }
+        Ok(())
     }
 }
 

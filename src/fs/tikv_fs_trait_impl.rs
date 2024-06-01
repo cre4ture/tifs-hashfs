@@ -203,7 +203,13 @@ impl AsyncFileSystem for TiFs {
         Ok(Open::new(fh, open_flags))
     }
 
+    async fn fsync(&self, _ino: u64, fh: u64, _datasync: bool) -> Result<()> {
+        self.flush_write_cache(fh).await
+    }
 
+    async fn flush(&self, _ino: u64, fh: u64, _lock_owner: u64) -> Result<()> {
+        self.flush_write_cache(fh).await
+    }
 
     #[tracing::instrument]
     async fn read(
@@ -400,12 +406,8 @@ impl AsyncFileSystem for TiFs {
         _lock_owner: Option<u64>,
         _flush: bool,
     ) -> Result<()> {
-        self.spin_no_delay(format!("release fh {fh}"),
-            move |me, txn| {
-                Box::pin(me.release_file_handler(txn, fh))
-            })
-            .await?;
-        Ok(())
+        self.flush_write_cache(fh).await?;
+        self.release_file_handler(fh).await
     }
 
     /// Create a hard link.
