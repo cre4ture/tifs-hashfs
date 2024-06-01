@@ -578,6 +578,7 @@ impl TiFs {
         Ok(Data::new(data))
     }
 
+    #[instrument(skip(self, _txn))]
     pub async fn release_file_handler<'fl>(&self, _txn: Arc<Txn>, fh: u64) -> Result<()>{
         let released_handler = self.with_mut_data(|d| {
             d.release_file_handler(fh)
@@ -586,7 +587,9 @@ impl TiFs {
         if let Some(handler) = released_handler {
             let mut lock = handler.write_cache.write().await;
             lock.wait_finish_all().await;
-            for result in lock.get_results_so_far() {
+            let results = lock.get_results_so_far();
+            trace!("got results of {} pending tasks", results.len());
+            for result in &results {
                 if let Err(err) = result {
                     error!("error finishing cached writes: {err}");
                 }
