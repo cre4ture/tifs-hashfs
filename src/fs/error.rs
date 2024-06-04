@@ -3,7 +3,7 @@ use std::backtrace::Backtrace;
 use thiserror::Error;
 use tracing::error;
 
-use super::inode::{StorageIno, TiFsHash};
+use super::{inode::{StorageIno, TiFsHash}, reply::InoKind};
 
 #[derive(Error, Debug)]
 pub enum FsError {
@@ -77,8 +77,17 @@ pub enum FsError {
     #[error("no space left: MaxSize({0})")]
     NoSpaceLeft(u64),
 
-    #[error("Read checksum mismatch: hash: {hash} vs. actual: {actual_hash}")]
+    #[error("Read checksum mismatch: hash: {hash:?} vs. actual: {actual_hash:?}")]
     ChecksumMismatch{hash: TiFsHash, actual_hash: TiFsHash},
+
+    #[error("Requested operation not supported by this ino kind ({0:?})")]
+    InoKindNotSupported(InoKind),
+
+    #[error("failed parsing config: {msg}")]
+    ConfigParsingFailed{msg: String},
+
+    #[error("db-key not found")]
+    KeyNotFound,
 }
 
 pub type Result<T> = std::result::Result<T, FsError>;

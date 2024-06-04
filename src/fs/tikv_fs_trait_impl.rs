@@ -6,12 +6,13 @@ use bytestring::ByteString;
 use fuser::{consts::FOPEN_DIRECT_IO, KernelConfig, TimeOrNow};
 use futures::FutureExt;
 use libc::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::fs::{error::{FsError, Result}, inode::{StorageFilePermission, StorageIno}, key::ROOT_INODE, reply::InoKind};
 
-use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::{Inode, StorageDirItemKind}, mode::{as_file_kind, as_file_perm}, reply::{get_time, Attr, Create, Data, Dir, Entry, Lock, LogicalIno, Lseek, Open, StatFs, Write, Xattr}, tikv_fs::{parse_filename, InoUse, TiFs, TiFsMutable, DIR_PARENT}, transaction::Txn};
+use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::StorageDirItemKind, mode::{as_file_kind, as_file_perm}, reply::{get_time, Attr, Create, Data, Dir, Entry, Lock, LogicalIno, Lseek, Open, StatFs, Write, Xattr}, tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable, DIR_PARENT}};
 
 
 
@@ -64,22 +65,15 @@ impl AsyncFileSystem for TiFs {
     async fn lookup(&self, parent: u64, name: ByteString) -> Result<Entry> {
         let p_ino = LogicalIno::from_raw(parent);
 
-        let (filename, kind) = parse_filename(name);
+        let (filename, _kind) = parse_filename(name);
 
         Self::check_file_name(&filename)?;
-        let ino_data = self.spin_no_delay(format!("lookup, parent: {parent}, name: {}", filename.escape_debug()), move |_, txn| {
-            let filename = filename.clone();
-            Box::pin(async move {
-                let ino = txn.clone().lookup(p_ino.storage_ino(), filename).await?;
-                Ok(txn.read_inode(ino).await?.deref().clone())
-            })
-        })
-        .await?;
+        let stat = self.lookup_all_info(p_ino.storage_ino(), filename).await?;
 
         let entry = Entry {
             generation: 0,
             time: Duration::from_millis(0),
-            stat: self.map_storage_attr_to_fuser(kind, &ino_data),
+            stat,
         };
 
         Ok(entry)
@@ -88,8 +82,7 @@ impl AsyncFileSystem for TiFs {
     #[tracing::instrument]
     async fn getattr(&self, ino: u64) -> Result<Attr> {
         let l_ino = LogicalIno::from_raw(ino);
-        let ino_data = self.read_inode(l_ino.storage_ino()).await?;
-        let stat = self.map_storage_attr_to_fuser(l_ino.kind, &ino_data);
+        let stat = self.get_all_file_attributes(l_ino.storage_ino()).await?;
         Ok(Attr::new(stat))
     }
 
@@ -111,38 +104,36 @@ impl AsyncFileSystem for TiFs {
         flags: Option<u32>,
     ) -> Result<Attr> {
         let l_ino = LogicalIno::from_raw(ino);
-        let ino_data = self.spin_no_delay(format!("setattr"), move |_, txn| {
+        if l_ino.kind != InoKind::Regular {
+            return Err(FsError::InoKindNotSupported(l_ino.kind));
+        }
+
+        self.spin_no_delay(format!("setattr"), move |_, txn| {
             Box::pin(async move {
-                // TODO: how to deal with fh, chgtime, bkuptime?
-                let mut inode_data = txn.clone().read_inode(l_ino.storage_ino()).await?.deref().clone();
-                inode_data.attr.perm = match mode {
-                    Some(m) => StorageFilePermission(as_file_perm(m)),
-                    None => inode_data.attr.perm,
-                };
-                inode_data.attr.uid = uid.unwrap_or(inode_data.attr.uid);
-                inode_data.attr.gid = gid.unwrap_or(inode_data.attr.gid);
-                inode_data.set_size(size.unwrap_or(inode_data.size()), txn.block_size());
-                inode_data.attr.atime = match atime {
-                    None => inode_data.attr.atime,
-                    Some(TimeOrNow::SpecificTime(t)) => t,
-                    Some(TimeOrNow::Now) => SystemTime::now(),
-                };
-                inode_data.attr.mtime = match mtime {
-                    Some(TimeOrNow::SpecificTime(t)) => t,
-                    Some(TimeOrNow::Now) | None => SystemTime::now(),
-                };
-                inode_data.attr.ctime = ctime.unwrap_or_else(SystemTime::now);
-                inode_data.attr.crtime = crtime.unwrap_or(inode_data.attr.crtime);
-                inode_data.attr.flags = flags.unwrap_or(inode_data.attr.flags);
-                txn.save_inode(&Arc::new(inode_data.clone())).await?;
-                Ok(inode_data)
+                txn.set_attributes(
+                    l_ino.storage_ino(),
+                    mode,
+                    uid,
+                    gid,
+                    size,
+                    atime,
+                    mtime,
+                    ctime,
+                    _fh,
+                    crtime,
+                    _chgtime,
+                    _bkuptime,
+                    flags,
+                ).await
             })
         })
         .await?;
 
+        let attr = self.get_all_file_attributes(l_ino.storage_ino()).await?;
+
         Ok(Attr {
             time: get_time(),
-            attr: self.map_storage_attr_to_fuser(l_ino.kind, &ino_data),
+            attr,
         })
     }
 
@@ -174,7 +165,8 @@ impl AsyncFileSystem for TiFs {
             let new_ino_use = Arc::new(InoUse{
                 instance: self.weak.to_owned(),
                 ino: l_ino.storage_ino(),
-                use_id: new_use_id
+                use_id: new_use_id,
+                ino_size_lock: RwLock::new(()),
             });
             self.with_mut_data(|d: &mut TiFsMutable| d.opened_ino.insert(ino, Arc::downgrade(&new_ino_use))).await?;
             ino_use = Some(new_ino_use);
@@ -294,10 +286,14 @@ impl AsyncFileSystem for TiFs {
         let p_ino = LogicalIno::from_raw(parent);
         Self::check_file_name(&name)?;
         let perm = StorageFilePermission(as_file_perm(mode));
-        let ino_data = self
-            .spin_no_delay(format!("mkdir"), move |_, txn| Box::pin(txn.mkdir(p_ino.storage_ino(), name.clone(), perm, gid, uid)))
-            .await?;
-        Ok(Entry::new(self.map_storage_attr_to_fuser(InoKind::Regular, &ino_data), 0))
+        let (i_desc, i_size, i_attr) = self
+            .spin_no_delay(format!("mkdir"), move |_, txn| {
+                Box::pin(txn.mkdir(p_ino.storage_ino(), name.clone(), perm, gid, uid))
+                }).await?;
+        Ok(Entry::new(self.map_storage_attr_to_fuser(
+            InoKind::Regular, &i_desc, &i_size, &i_attr,
+            Some(i_size.last_change) // TODO: fetch real atime?
+        ), 0))
     }
 
     #[tracing::instrument]
@@ -321,14 +317,16 @@ impl AsyncFileSystem for TiFs {
     ) -> Result<Entry> {
         let p_ino = LogicalIno::from_raw(parent);
         let perm = StorageFilePermission(as_file_perm(mode));
-        let typ = Self::map_file_type_to_storage_dir_item_kind(as_file_kind(mode))?;
+        let typ = map_file_type_to_storage_dir_item_kind(as_file_kind(mode))?;
         Self::check_file_name(&name)?;
-        let ino_data = self
+        let (i_desc, i_size, i_attr) = self
             .spin_no_delay(format!("mknod"), move |_, txn| {
-                Box::pin(txn.make_inode(p_ino.storage_ino(), name.clone(), typ, perm, gid, uid, rdev))
+                Box::pin(txn.make_inode(p_ino.storage_ino(), name.clone(), typ, perm, gid, uid, rdev, None))
             })
             .await?;
-        Ok(Entry::new(self.map_storage_attr_to_fuser(InoKind::Regular, &ino_data), 0))
+        Ok(Entry::new(self.map_storage_attr_to_fuser(
+            InoKind::Regular, &i_desc, &i_size, &i_attr, Some(i_size.last_change) // TODO: fetch real atime?
+        ), 0))
     }
 
     #[tracing::instrument]
@@ -370,7 +368,7 @@ impl AsyncFileSystem for TiFs {
                     SEEK_SET => offset,
                     SEEK_CUR => current_cursor as i64 + offset,
                     SEEK_END => {
-                        let inode = txn.read_inode(l_ino.storage_ino()).await?;
+                        let inode = txn.read_ino_size(l_ino.storage_ino()).await?;
                         inode.size() as i64 + offset
                     }
                     _ => return Err(FsError::UnknownWhence { whence }),
@@ -415,10 +413,15 @@ impl AsyncFileSystem for TiFs {
         let l_ino = LogicalIno::from_raw(ino);
         let p_ino = LogicalIno::from_raw(new_parent);
         Self::check_file_name(&new_name)?;
-        let inode = self
+        let _inode = self
             .spin_no_delay(format!("link"), move |_, txn| Box::pin(txn.link(l_ino.storage_ino(), p_ino.storage_ino(), new_name.clone())))
             .await?;
-        Ok(Entry::new(self.map_storage_attr_to_fuser(l_ino.kind, &inode), 0))
+        let (i_desc, i_attr,
+             i_size, atime) = self
+            .spin_no_delay(format!("link"), move |_, txn| Box::pin(txn.get_all_ino_data(l_ino.storage_ino())))
+            .await?;
+        Ok(Entry::new(self.map_storage_attr_to_fuser(l_ino.kind, &i_desc, &i_size, &i_attr,
+             Some(atime.0)), 0))
     }
 
     async fn unlink(&self, parent: u64, raw_name: ByteString) -> Result<()> {
@@ -444,7 +447,7 @@ impl AsyncFileSystem for TiFs {
             let name = raw_name.clone();
             let new_name = new_raw_name.clone();
             Box::pin(async move {
-                let ino = txn.clone().lookup(p_ino.storage_ino(), name.clone()).await?;
+                let ino = txn.clone().lookup_ino(p_ino.storage_ino(), name.clone()).await?;
                 txn.clone().link(ino, np_ino.storage_ino(), new_name).await?;
                 txn.clone().unlink(p_ino.storage_ino(), name).await?;
                 let inode = txn.clone().read_inode(ino).await?;
@@ -468,35 +471,32 @@ impl AsyncFileSystem for TiFs {
         link: ByteString,
     ) -> Result<Entry> {
         let p_ino = LogicalIno::from_raw(parent);
+        let link_data_vec = link.as_bytes().to_vec();
         Self::check_file_name(&name)?;
         let name_clone1 = name.clone();
-        let ino = self.spin_no_delay(format!("inode for symlink"), move |_, txn| {
+        let (i_desc, i_size, i_attr ) =
+            self.spin_no_delay(format!("inode for symlink"), move |_, txn| {
             let name = name_clone1.clone();
+            let link_data_vec = link_data_vec.clone();
             Box::pin(async move {
                 if txn.clone().check_if_dir_entry_exists(p_ino.storage_ino(), &name).await? {
                     return Err(FsError::FileExist {
                         file: name.to_string(),
                     });
                 }
-                txn.clone().reserve_new_ino().await
+                txn.clone().make_inode(
+                    p_ino.storage_ino(),
+                    name,
+                    StorageDirItemKind::Symlink,
+                    StorageFilePermission(0o777),
+                    gid, uid, 0,
+                    Some(link_data_vec),
+                ).await
             })
         }).await?;
 
-        let mut inode = Inode::new(ino, StorageDirItemKind::Symlink, StorageFilePermission(0o777), gid, uid, 0);
-        Txn::set_fresh_inode_to_link(self.fs_config.block_size, &mut inode, link.into_bytes());
-        let ptr = Arc::new(inode);
-        let ptr_clone1 = ptr.clone();
-
-        self.spin_no_delay(format!("symlink inode"), move |_, txn| {
-            let name = name.clone();
-            let ptr = ptr_clone1.clone();
-            Box::pin(async move {
-                txn.clone().save_inode(&ptr).await?;
-                txn.connect_inode_to_directory(p_ino.storage_ino(), &name, ptr.deref()).await
-            })
-        }).await?;
-
-        Ok(Entry::new(self.map_storage_attr_to_fuser(InoKind::Regular, &ptr), 0))
+        Ok(Entry::new(self.map_storage_attr_to_fuser(InoKind::Regular, &i_desc, &i_size, &i_attr,
+            Some(i_size.last_change)), 0)) // TODO: use real atime?
     }
 
     async fn readlink(&self, ino: u64) -> Result<Data> {
@@ -512,16 +512,20 @@ impl AsyncFileSystem for TiFs {
     async fn fallocate(
         &self,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         length: i64,
         _mode: i32,
     ) -> Result<()> {
-        let l_ino = LogicalIno::from_raw(ino);
+        let l_ino: LogicalIno = LogicalIno::from_raw(ino);
+        if l_ino.kind != InoKind::Regular {
+            return Err(FsError::InoKindNotSupported(l_ino.kind));
+        }
+        let fh = self.get_file_handler_checked(fh).await?;
         self.spin_no_delay(format!("fallocate"), move |_, txn| {
+            let fh = fh.clone();
             Box::pin(async move {
-                let mut inode = txn.clone().read_inode(l_ino.storage_ino()).await?.deref().clone();
-                txn.fallocate(&mut inode, offset, length).await
+                txn.f_allocate(fh.clone(), l_ino.storage_ino(), offset, length).await
             })
         })
         .await?;
@@ -550,62 +554,63 @@ impl AsyncFileSystem for TiFs {
         let typ = typ as i16;
         let not_again = self.spin_no_delay(format!("setlk"), move |_, txn| {
             Box::pin(async move {
-                let mut inode = txn.clone().read_inode(l_ino.storage_ino()).await?.deref().clone();
-                warn!("setlk, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
-                if inode.typ == StorageDirItemKind::Directory {
+                let i_desc = txn.clone().read_inode(l_ino.storage_ino()).await?.deref().clone();
+                let mut i_lock_state = txn.clone().read_ino_lock_state(l_ino.storage_ino()).await?.deref().clone();
+                warn!("setlk, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", i_lock_state, pid, typ, i_lock_state.lk_type, lock_owner, sleep);
+                if i_desc.typ == StorageDirItemKind::Directory {
                     return Err(FsError::InvalidLock);
                 }
                 match typ {
-                    F_RDLCK if inode.lock_state.lk_type == F_WRLCK => {
+                    F_RDLCK if i_lock_state.lk_type == F_WRLCK => {
                         if sleep {
-                            warn!("setlk F_RDLCK return sleep, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
+                            warn!("setlk F_RDLCK return sleep, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", i_lock_state, pid, typ, i_lock_state.lk_type, lock_owner, sleep);
                             Ok(false)
                         } else {
                             Err(FsError::InvalidLock)
                         }
                     }
                     F_RDLCK => {
-                        inode.lock_state.owner_set.insert(lock_owner);
-                        inode.lock_state.lk_type = F_RDLCK;
-                        warn!("setlk F_RDLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
-                        txn.clone().save_inode(&Arc::new(inode)).await?;
+                        i_lock_state.owner_set.insert(lock_owner);
+                        i_lock_state.lk_type = F_RDLCK;
+                        warn!("setlk F_RDLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", i_lock_state, pid, typ, i_lock_state.lk_type, lock_owner, sleep);
+                        txn.clone().write_ino_lock_state(l_ino.storage_ino(), i_lock_state).await?;
                         Ok(true)
                     }
-                    F_WRLCK => match inode.lock_state.lk_type {
-                        F_RDLCK if inode.lock_state.owner_set.len() == 1
-                        && inode.lock_state.owner_set.get(&lock_owner) == Some(&lock_owner)  => {
-                            inode.lock_state.lk_type = F_WRLCK;
-                            warn!("setlk F_WRLCK on F_RDLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
-                            txn.save_inode(&Arc::new(inode)).await?;
+                    F_WRLCK => match i_lock_state.lk_type {
+                        F_RDLCK if i_lock_state.owner_set.len() == 1
+                        && i_lock_state.owner_set.get(&lock_owner) == Some(&lock_owner)  => {
+                            i_lock_state.lk_type = F_WRLCK;
+                            warn!("setlk F_WRLCK on F_RDLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", i_lock_state, pid, typ, i_lock_state.lk_type, lock_owner, sleep);
+                            txn.clone().write_ino_lock_state(l_ino.storage_ino(), i_lock_state).await?;
                             Ok(true)
                         }
                         F_RDLCK if sleep => {
-                            warn!("setlk F_WRLCK on F_RDLCK sleep return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
+                            warn!("setlk F_WRLCK on F_RDLCK sleep return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", i_lock_state, pid, typ, i_lock_state.lk_type, lock_owner, sleep);
                             Ok(false)
                         },
                         F_RDLCK => Err(FsError::InvalidLock),
                         F_UNLCK => {
-                            inode.lock_state.owner_set.clear();
-                            inode.lock_state.owner_set.insert(lock_owner);
-                            inode.lock_state.lk_type = F_WRLCK;
-                            warn!("setlk F_WRLCK on F_UNLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
-                            txn.save_inode(&Arc::new(inode)).await?;
+                            i_lock_state.owner_set.clear();
+                            i_lock_state.owner_set.insert(lock_owner);
+                            i_lock_state.lk_type = F_WRLCK;
+                            warn!("setlk F_WRLCK on F_UNLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", i_lock_state, pid, typ, i_lock_state.lk_type, lock_owner, sleep);
+                            txn.clone().write_ino_lock_state(l_ino.storage_ino(), i_lock_state).await?;
                             Ok(true)
                         },
                         F_WRLCK if sleep => {
-                            warn!("setlk F_WRLCK on F_WRLCK return sleep, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
+                            warn!("setlk F_WRLCK on F_WRLCK return sleep, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", i_lock_state, pid, typ, i_lock_state.lk_type, lock_owner, sleep);
                             Ok(false)
                         }
                         F_WRLCK => Err(FsError::InvalidLock),
                         _ => Err(FsError::InvalidLock),
                     },
                     F_UNLCK => {
-                        inode.lock_state.owner_set.remove(&lock_owner);
-                        if inode.lock_state.owner_set.is_empty() {
-                            inode.lock_state.lk_type = F_UNLCK;
+                        i_lock_state.owner_set.remove(&lock_owner);
+                        if i_lock_state.owner_set.is_empty() {
+                            i_lock_state.lk_type = F_UNLCK;
                         }
-                        warn!("setlk F_UNLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", inode, pid, typ, inode.lock_state.lk_type, lock_owner, sleep);
-                        txn.save_inode(&Arc::new(inode)).await?;
+                        warn!("setlk F_UNLCK return, inode:{:?}, pid:{:?}, typ para: {:?}, state type: {:?}, owner: {:?}, sleep: {:?},", i_lock_state, pid, typ, i_lock_state.lk_type, lock_owner, sleep);
+                        txn.clone().write_ino_lock_state(l_ino.storage_ino(), i_lock_state).await?;
                         Ok(true)
                     }
                     _ => Err(FsError::InvalidLock),
@@ -636,9 +641,9 @@ impl AsyncFileSystem for TiFs {
         // TODO: read only operation need not txn?
         self.spin_no_delay(format!("getlk"), move |_, txn| {
             Box::pin(async move {
-                let inode = txn.read_inode(l_ino.storage_ino()).await?;
-                warn!("getlk, inode:{:?}, pid:{:?}", inode, pid);
-                Ok(Lock::_new(0, 0, inode.lock_state.lk_type as i32, 0))
+                let ino_lock_state = txn.read_ino_lock_state(l_ino.storage_ino()).await?;
+                warn!("getlk, inode:{:?}, pid:{:?}", ino_lock_state, pid);
+                Ok(Lock::_new(0, 0, ino_lock_state.lk_type as i32, 0))
             })
         })
         .await

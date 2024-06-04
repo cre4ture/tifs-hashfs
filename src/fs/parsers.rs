@@ -1,6 +1,6 @@
 use std::{collections::HashMap, ops::{Deref, Range}, sync::Arc};
 
-use super::{hash_block::block_splitter::BlockSplitterRead, inode::{BlockAddress, StorageIno, TiFsHash}};
+use super::{hash_block::block_splitter::BlockSplitterRead, inode::{StorageIno, TiFsHash}, key::BlockAddress};
 
 use crate::fs::error::Result;
 

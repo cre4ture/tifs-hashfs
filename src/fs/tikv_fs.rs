@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::mem::{self, size_of};
-use std::ops::{Deref, DerefMut};
+use std::ops::DerefMut;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -12,7 +12,7 @@ use bimap::BiHashMap;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
 use futures::FutureExt;
-use libc::{F_RDLCK, F_WRLCK};
+
 use moka::future::Cache;
 use tikv_client::Config;
 use tokio::sync::RwLock;
@@ -25,18 +25,18 @@ use crate::fs::reply::{DirItem, InoKind};
 use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
-use super::inode::{Inode, StorageDirItem, StorageDirItemKind, StorageIno, TiFsHash};
+use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageDirItem, StorageDirItemKind, StorageFileAttr, StorageIno, TiFsHash};
 use super::reply::{
     Data, Directory, LogicalIno
 };
-use super::transaction::{Txn, TxnArc};
+use super::transaction::{Txn, TxnArc, TxnDataCache};
 use super::transaction_client_mux::TransactionClientMux;
 
 pub const DIR_SELF: ByteString = ByteString::from_static(".");
 pub const DIR_PARENT: ByteString = ByteString::from_static("..");
 
 pub type TiFsBlockCache = Cache<TiFsHash, Arc<Vec<u8>>>;
-pub type TiFsInodeCache = Cache<StorageIno, (Instant, Arc<Inode>)>;
+pub type TiFsInodeCache = Cache<StorageIno, (Instant, Arc<InoDescription>)>;
 
 lazy_static! {
     static ref FILE_TYPE_MAP: BiHashMap<StorageDirItemKind, FileType> = {
@@ -48,11 +48,20 @@ lazy_static! {
     };
 }
 
-#[derive(Clone, Debug)]
+fn map_storage_dir_item_kind_to_file_type(kind: StorageDirItemKind) -> FileType {
+    FILE_TYPE_MAP.get_by_left(&kind).unwrap().clone()
+}
+
+pub fn map_file_type_to_storage_dir_item_kind(typ: FileType) -> Result<StorageDirItemKind> {
+    FILE_TYPE_MAP.get_by_right(&typ).cloned().ok_or(FsError::WrongFileType)
+}
+
+#[derive(Debug)]
 pub struct InoUse {
     pub instance: Weak<TiFs>,
     pub ino: StorageIno,
     pub use_id: Uuid,
+    pub ino_size_lock: RwLock<()>,
 }
 
 impl Drop for InoUse {
@@ -94,7 +103,12 @@ pub fn parse_filename(name: ByteString) -> (ByteString, InoKind) {
 #[derive(Clone)] // Caches do only clone reference, not content
 pub struct TiFsCaches {
     pub block: TiFsBlockCache,
-    pub inode: TiFsInodeCache,
+    pub inode_desc: TxnDataCache<StorageIno, InoDescription>,
+    pub inode_size: TxnDataCache<StorageIno, InoSize>,
+    pub inode_lock_state: TxnDataCache<StorageIno, InoLockState>,
+    pub inode_atime: TxnDataCache<StorageIno, AccessTime>,
+    pub inode_mtime: TxnDataCache<StorageIno, ModificationTime>,
+    pub inode_attr: TxnDataCache<StorageIno, StorageFileAttr>,
 }
 
 pub struct TiFsMutable {
@@ -108,6 +122,7 @@ pub struct TiFsMutable {
 impl TiFsMutable {
 
     fn new(fs_config: &TiFsConfig) -> Self {
+        let ino_cache_size = fs_config.inode_cache_size as u64 / (fs_config.block_size / 16);
         Self {
             freed_fhs: HashSet::new(),
             next_fh: 0,
@@ -115,7 +130,12 @@ impl TiFsMutable {
             file_handlers: HashMap::new(),
             caches: TiFsCaches{
                 block: Cache::new(fs_config.hashed_blocks_cache_size as u64 / fs_config.block_size),
-                inode: Cache::new(fs_config.inode_cache_size as u64 / (fs_config.block_size / 16)),
+                inode_desc: TxnDataCache::new(ino_cache_size, Duration::from_secs(100)),
+                inode_size: TxnDataCache::new(ino_cache_size, Duration::from_secs(5)),
+                inode_atime: TxnDataCache::new(ino_cache_size, Duration::from_secs(5)),
+                inode_mtime: TxnDataCache::new(ino_cache_size, Duration::from_secs(5)),
+                inode_attr: TxnDataCache::new(ino_cache_size, Duration::from_secs(30)),
+                inode_lock_state: TxnDataCache::new(ino_cache_size, Duration::from_secs(2)),
             }
         }
     }
@@ -179,7 +199,10 @@ impl TiFs {
             .map_err(|err| anyhow!("{}", err))?;
         info!("connected to pd endpoints: {:?}", pd_endpoints);
 
-        let fs_config = TiFsConfig::from_options(&options);
+        let fs_config = TiFsConfig::from_options(&options).map_err(|err| {
+            tracing::error!("failed creating config. Err: {:?}", err);
+            err
+        })?;
 
         let fs = Arc::new_cyclic(|me| {
             TiFs {
@@ -390,37 +413,65 @@ impl TiFs {
         self.spin(msg, None, f).await
     }
 
-    fn map_storage_dir_item_kind_to_file_type(kind: StorageDirItemKind) -> FileType {
-        FILE_TYPE_MAP.get_by_left(&kind).unwrap().clone()
-    }
-
-    pub fn map_file_type_to_storage_dir_item_kind(typ: FileType) -> Result<StorageDirItemKind> {
-        FILE_TYPE_MAP.get_by_right(&typ).cloned().ok_or(FsError::WrongFileType)
-    }
-
-    pub fn map_storage_attr_to_fuser(&self, ino_kind: InoKind, ino_data: &Inode) -> FileAttr {
+    pub fn map_storage_attr_to_fuser(&self,
+        kind: InoKind,
+        desc: &InoDescription,
+        size: &InoSize,
+        attr: &StorageFileAttr,
+        atime: Option<SystemTime>,
+    ) -> FileAttr {
         let mut stat = FileAttr {
             ino: LogicalIno {
-                kind: ino_kind,
-                storage_ino: ino_data.storage_ino(),
+                kind,
+                storage_ino: desc.storage_ino(),
             }.to_raw(),
-            size: ino_data.size(),
-            blocks: ino_data.blocks(),
-            atime: ino_data.attr.atime,
-            mtime: ino_data.attr.mtime,
-            ctime: ino_data.attr.ctime,
-            crtime: ino_data.attr.crtime,
-            kind: Self::map_storage_dir_item_kind_to_file_type(ino_data.typ),
-            perm: ino_data.attr.perm.0,
+            size: size.size(),
+            blocks: size.blocks(),
+            atime: atime.unwrap_or(size.last_change),
+            mtime: size.last_change.max(attr.last_change),
+            ctime: attr.last_change,
+            crtime: desc.creation_time,
+            kind: map_storage_dir_item_kind_to_file_type(desc.typ),
+            perm: attr.perm.0,
             nlink: 1,
-            uid: ino_data.attr.uid,
-            gid: ino_data.attr.gid,
-            rdev: ino_data.attr.rdev,
+            uid: attr.uid,
+            gid: attr.gid,
+            rdev: attr.rdev,
             blksize: self.fs_config.block_size as u32,
-            flags: ino_data.attr.flags
+            flags: attr.flags
         };
         self.adapt_inode(&mut stat);
         stat
+    }
+
+    pub async fn lookup_all_info(&self, parent: StorageIno, name: ByteString
+    ) -> TiFsResult<FileAttr> {
+        let (desc, attr, size, atime) =
+            self.spin_no_delay(format!("lookup parent({}), name({})", parent, name),
+            move |_, txn| {
+                let name = name.clone();
+                Box::pin(async move {
+                    let ino = txn.clone().lookup_ino(parent, name.clone()).await?;
+                    txn.clone().get_all_ino_data(ino).await
+                })
+            }).await?;
+        let stat = self.map_storage_attr_to_fuser(
+            InoKind::Regular, &desc, &size, &attr, Some(atime.0));
+        Ok(stat)
+    }
+
+    pub async fn get_all_file_attributes(&self, ino: StorageIno
+    ) -> TiFsResult<FileAttr> {
+        let (desc, attr, size, atime) =
+            self.spin_no_delay(format!("get attrs ino({})", ino),
+            move |_, txn| {
+                Box::pin(async move {
+                    txn.clone().get_all_ino_data(ino).await
+                })
+            }).await?;
+        let stat = self.map_storage_attr_to_fuser(
+            InoKind::Regular, &desc, &size, &attr, Some(atime.0));
+        Ok(stat)
     }
 
     #[tracing::instrument]
@@ -457,7 +508,7 @@ impl TiFs {
                     kind: InoKind::Regular,
                 },
                 name,
-                typ: Self::map_storage_dir_item_kind_to_file_type(typ),
+                typ: map_storage_dir_item_kind_to_file_type(typ),
             };
             dir_complete.push(regular_entry);
         }
@@ -465,7 +516,7 @@ impl TiFs {
         Ok(dir_complete)
     }
 
-    pub async fn read_inode(&self, ino: StorageIno) -> Result<Arc<Inode>> {
+    pub async fn read_inode(&self, ino: StorageIno) -> Result<Arc<InoDescription>> {
         let arc = self.weak.upgrade().unwrap();
         let ino = arc
             .spin_no_delay(format!("read_inode"), move |_, txn| Box::pin(txn.read_inode_arc(ino)))
@@ -484,38 +535,7 @@ impl TiFs {
         while !arc.clone()
             .spin_no_delay(format!("setlkw"), move |_, txn| {
                 Box::pin(async move {
-                    let mut inode = txn.clone().read_inode(ino).await?.deref().clone();
-                    match typ {
-                        F_WRLCK => {
-                            if inode.lock_state.owner_set.len() > 1 {
-                                Ok(false)
-                            } else if inode.lock_state.owner_set.is_empty() {
-                                inode.lock_state.lk_type = F_WRLCK;
-                                inode.lock_state.owner_set.insert(lock_owner);
-                                txn.clone().save_inode(&Arc::new(inode)).await?;
-                                Ok(true)
-                            } else if inode.lock_state.owner_set.get(&lock_owner)
-                                == Some(&lock_owner)
-                            {
-                                inode.lock_state.lk_type = F_WRLCK;
-                                txn.clone().save_inode(&Arc::new(inode)).await?;
-                                Ok(true)
-                            } else {
-                                Err(FsError::InvalidLock)
-                            }
-                        }
-                        F_RDLCK => {
-                            if inode.lock_state.lk_type == F_WRLCK {
-                                Ok(false)
-                            } else {
-                                inode.lock_state.lk_type = F_RDLCK;
-                                inode.lock_state.owner_set.insert(lock_owner);
-                                txn.save_inode(&Arc::new(inode)).await?;
-                                Ok(true)
-                            }
-                        }
-                        _ => Err(FsError::InvalidLock),
-                    }
+                    txn.setlkw(ino, lock_owner, typ).await
                 })
             })
             .await?

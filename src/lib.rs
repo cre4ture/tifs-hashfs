@@ -4,6 +4,8 @@
 #![feature(type_alias_impl_trait)]
 #![feature(async_fn_traits)]
 #![feature(iter_array_chunks)]
+#![feature(int_roundings)]
+#![feature(iter_advance_by)]
 
 pub mod fs;
 pub mod utils;

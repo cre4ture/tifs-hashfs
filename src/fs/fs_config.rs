@@ -1,8 +1,16 @@
 
+use std::collections::HashMap;
+
+use bimap::BiHashMap;
 use fuser::MountOption as FuseMountOption;
+use lazy_static::lazy_static;
 use paste::paste;
-use tracing::{debug, error};
+use sha2::{Sha256, Sha512, Digest};
+use tracing::error;
 use parse_size::parse_size;
+
+use super::{error::{FsError, TiFsResult}, inode::TiFsHash};
+
 
 macro_rules! define_options {
     {
@@ -273,7 +281,32 @@ define_options! { MountOption (FuseMountOption) {
     define WriteInProgressLimit(String),
     define ReadAheadSize(String),
     define ReadAheadInProgressLimit(String),
+    define HashAlgorithm(String),
 }}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+pub enum HashAlgorithm {
+    Blake3,
+    Sha256,
+    Sha512,
+}
+
+lazy_static!{
+    static ref ALGO_NAME_MAP: BiHashMap<&'static str, HashAlgorithm> = {
+        let mut m = BiHashMap::new();
+        m.insert("BLAKE3", HashAlgorithm::Blake3);
+        m.insert("SHA-256", HashAlgorithm::Sha256);
+        m.insert("SHA-512", HashAlgorithm::Sha512);
+        m
+    };
+    static ref ALGO_HASH_LEN_MAP: HashMap<HashAlgorithm, usize> = {
+        let mut m = HashMap::new();
+        m.insert(HashAlgorithm::Blake3, 32);
+        m.insert(HashAlgorithm::Sha256, 32);
+        m.insert(HashAlgorithm::Sha512, 64);
+        m
+    };
+}
 
 #[derive(Clone)]
 pub struct TiFsConfig {
@@ -284,6 +317,8 @@ pub struct TiFsConfig {
     pub direct_io: bool,
     pub inode_cache_size: u64,
     pub hashed_blocks: bool,
+    pub hash_algorithm: HashAlgorithm,
+    pub hash_len: usize,
     pub hashed_blocks_cache_size: u64,
     pub max_size: Option<u64>,
     pub validate_writes: bool,
@@ -302,50 +337,51 @@ pub struct TiFsConfig {
 impl TiFsConfig {
     pub const DEFAULT_BLOCK_SIZE: u64 = 1 << 16;
 
-    pub fn from_options(options: &Vec<MountOption>) -> Self {
+    pub fn from_options(options: &Vec<MountOption>) -> TiFsResult<Self> {
 
-        let name_str = options.iter().find_map(|opt|{
-            if let MountOption::Name(name) = opt {
-                Some(name.clone())
-            } else {
-                None
+        // first declare params and set default value
+        let mut name = String::from("");
+        let mut max_size = None;
+        let mut block_size = Self::DEFAULT_BLOCK_SIZE;
+        let mut hash_algo = HashAlgorithm::Blake3;
+
+        // iterate over options and overwrite defaults
+        for option in options {
+            match option {
+                MountOption::Name(n) => name = n.clone(),
+                MountOption::BlkSize(size) => {
+                    block_size = parse_size(size)
+                        .map_err(|err| {
+                            FsError::ConfigParsingFailed {
+                                msg: format!("fail to parse blksize({}): {}", size, err) }
+                        })?;
+                }
+                MountOption::MaxSize(size) => {
+                    max_size = Some(parse_size(size)
+                        .map_err(|err| {
+                            FsError::ConfigParsingFailed {
+                                msg: format!("fail to parse maxsize({}): {}", size, err) }
+                        })?);
+                }
+                MountOption::HashAlgorithm(value) => {
+                    hash_algo = *ALGO_NAME_MAP.get_by_left(value.as_str()).ok_or(
+                        FsError::ConfigParsingFailed {
+                            msg: format!("hash algo name unsupported: {}", value)
+                        }
+                    )?;
+                }
+                _ => {}
             }
-        }).unwrap_or("".into());
+        }
 
-        let block_size = options
-        .iter()
-        .find_map(|option| match option {
-            MountOption::BlkSize(size) => parse_size(size)
-                .map_err(|err| {
-                    error!("fail to parse blksize({}): {}", size, err);
-                    err
-                })
-                .map(|size| {
-                    debug!("block size: {}", size);
-                    size
-                })
-                .ok(),
-            _ => None,
-        })
-        .unwrap_or(Self::DEFAULT_BLOCK_SIZE);
+        // calculate derived parameters
+        let hash_len = *ALGO_HASH_LEN_MAP.get(&hash_algo).unwrap();
 
-        TiFsConfig {
-            key_prefix: name_str.into_bytes(),
+        let cfg = TiFsConfig {
+            key_prefix: name.into_bytes(),
             block_size,
             direct_io: options.iter().any(|option| matches!(option, MountOption::DirectIO)),
-            max_size: options.iter().find_map(|option| match option {
-                MountOption::MaxSize(size) => parse_size(size)
-                    .map_err(|err| {
-                        error!("fail to parse maxsize({}): {}", size, err);
-                        err
-                    })
-                    .map(|size| {
-                        debug!("max size: {}", size);
-                        size
-                    })
-                    .ok(),
-                _ => None,
-            }),
+            max_size,
             enable_atime: options.iter().find_map(|option| match option {
                 MountOption::NoAtime => Some(false),
                 MountOption::Atime => Some(true),
@@ -365,6 +401,8 @@ impl TiFsConfig {
             hashed_blocks: options.iter().find_map(|opt|{
                 (MountOption::HashedBlocks == *opt).then_some(true)
             }).unwrap_or(false),
+            hash_algorithm: hash_algo,
+            hash_len: hash_len,
             hashed_blocks_cache_size: options.iter().find_map(|opt|{
                 if let MountOption::HashedBlocksCacheSize(value) = &opt {
                     parse_size(value).map_err(|err|{
@@ -425,6 +463,23 @@ impl TiFsConfig {
                     }).ok()
                 } else { None }
             }).unwrap_or(10),
+        };
+        Ok(cfg)
+    }
+
+    pub fn calculate_hash(&self, input: &[u8]) -> TiFsHash {
+        match self.hash_algorithm {
+            HashAlgorithm::Blake3 => blake3::hash(input).as_bytes().to_vec(),
+            HashAlgorithm::Sha256 => {
+                let mut hash_er = Sha256::new();
+                hash_er.update(input);
+                hash_er.finalize().to_vec()
+            }
+            HashAlgorithm::Sha512 => {
+                let mut hash_er = Sha512::new();
+                hash_er.update(input);
+                hash_er.finalize().to_vec()
+            }
         }
     }
 }

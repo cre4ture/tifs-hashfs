@@ -1,12 +1,12 @@
 use std::{borrow::Cow, mem};
 
-use super::inode::{self, TiFsHash};
+use super::inode::TiFsHash;
 
 pub type HashBlockData<'ol> = Cow<'ol, [u8]>;
 
 #[derive(Clone)]
 pub struct HashedBlock<'ol> {
-    pub hash: Option<inode::Hash>,
+    pub hash: Option<TiFsHash>,
     pub data: HashBlockData<'ol>,
 }
 
@@ -16,22 +16,6 @@ impl<'ol> HashedBlock<'ol> {
             hash: None,
             data: Cow::Borrowed(&[]),
         }
-    }
-
-    pub fn get_hash(&mut self) -> &inode::Hash {
-        if self.hash.is_none() {
-            return self.update_hash();
-        }
-        self.hash.as_ref().unwrap()
-    }
-
-    pub fn calculate_hash(data: &[u8]) -> TiFsHash {
-        blake3::hash(data)
-    }
-
-    pub fn update_hash(&mut self) -> &inode::Hash {
-        self.hash = Some(Self::calculate_hash(&self.data));
-        self.hash.as_ref().unwrap()
     }
 
     pub fn update_data_range(&mut self, start_write_pos: usize, block_write_data: &[u8]) {
