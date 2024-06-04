@@ -279,6 +279,7 @@ define_options! { MountOption (FuseMountOption) {
     define ReadAheadInProgressLimit(String),
     define HashAlgorithm(String),
     define InlineDataLimit(String),
+    define SmallTxns,
 }}
 
 #[derive(Clone)]
@@ -306,6 +307,7 @@ pub struct TiFsConfig {
     pub write_in_progress_limit: usize,
     pub read_ahead_size: u64,
     pub read_ahead_in_progress_limit: usize,
+    pub small_transactions: bool,
 }
 
 impl TiFsConfig {
@@ -320,6 +322,7 @@ impl TiFsConfig {
         let mut hash_algo = HashAlgorithm::Blake3;
         const INLINE_DATA_THRESHOLD_BASE: u64 = 1 << 4;
         let mut inline_data_limit = block_size / INLINE_DATA_THRESHOLD_BASE;
+        let mut small_transactions = false;
 
         // iterate over options and overwrite defaults
         for option in options {
@@ -353,6 +356,7 @@ impl TiFsConfig {
                                 msg: format!("failed to parse InlineDataLimit({}): {}", value, err) }
                         })?;
                 }
+                MountOption::SmallTxns => small_transactions = true,
                 _ => {}
             }
         }
@@ -447,6 +451,7 @@ impl TiFsConfig {
                     }).ok()
                 } else { None }
             }).unwrap_or(10),
+            small_transactions,
         };
         Ok(cfg)
     }

@@ -6,6 +6,7 @@
 #![feature(iter_array_chunks)]
 #![feature(int_roundings)]
 #![feature(iter_advance_by)]
+#![feature(try_trait_v2)]
 
 pub mod fs;
 pub mod utils;
@@ -65,7 +66,7 @@ where
     };
 
     let mut client_cfg = client_cfg.with_default_keyspace();
-    client_cfg.timeout = Duration::from_secs(60);
+    client_cfg.timeout = Duration::from_secs(1);
     debug!("use tikv client config: {:?}", client_cfg);
 
     let fs_impl = TiFs::construct(endpoints, client_cfg, options).await?;

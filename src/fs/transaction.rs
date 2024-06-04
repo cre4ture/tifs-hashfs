@@ -159,6 +159,7 @@ where
 pub struct Txn {
     weak: Weak<Self>,
     _instance_id: Uuid,
+    txn_client_mux: Arc<TransactionClientMux>,
     txn: Option<RwLock<Transaction>>,
     raw: Arc<tikv_client::RawClient>,
     raw_txn: Option<TxnArc>,
@@ -188,9 +189,21 @@ impl Txn {
         }
     }
 
+    pub async fn begin_optimistic_small(
+        client: Arc<TransactionClientMux>,
+    ) -> Result<Transaction> {
+        let options = TransactionOptions::new_optimistic().use_async_commit();
+        let options = options.retry_options(RetryOptions {
+            region_backoff: DEFAULT_REGION_BACKOFF,
+            lock_backoff: OPTIMISTIC_BACKOFF,
+        });
+        let txn = client.give_one().begin_with_options(options).await?;
+        Ok(txn)
+    }
+
     pub async fn begin_optimistic(
         instance_id: Uuid,
-        client: &TransactionClientMux,
+        client: Arc<TransactionClientMux>,
         raw: Arc<tikv_client::RawClient>,
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
@@ -207,9 +220,10 @@ impl Txn {
         Ok(TxnArc::new_cyclic(|weak| { Self {
                 weak: weak.clone(),
                 _instance_id: instance_id,
+                txn_client_mux: client.clone(),
                 txn,
                 raw: raw.clone(),
-                raw_txn: Some(Txn::pure_raw(instance_id, raw, fs_config, caches.clone(), max_name_len)),
+                raw_txn: Some(Txn::pure_raw(instance_id, client.clone(), raw, fs_config, caches.clone(), max_name_len)),
                 fs_config: fs_config.clone(),
                 block_size: fs_config.block_size,
                 max_name_len,
@@ -220,6 +234,7 @@ impl Txn {
 
     pub fn pure_raw(
         instance_id: Uuid,
+        client: Arc<TransactionClientMux>,
         raw: Arc<tikv_client::RawClient>,
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
@@ -228,6 +243,7 @@ impl Txn {
         Arc::new_cyclic(|weak| Txn {
             weak: weak.clone(),
             _instance_id: instance_id,
+            txn_client_mux: client.clone(),
             txn: None,
             raw,
             raw_txn: None,
@@ -238,73 +254,134 @@ impl Txn {
         })
     }
 
-    pub async fn get(self: TxnArc, key: impl Into<Key>) -> TiKvResult<Option<Value>> {
+    pub async fn mini_txn(&self) -> TiFsResult<Transaction> {
+        let transaction = Txn::begin_optimistic_small(
+            self.txn_client_mux.clone()).await?;
+        Ok(transaction)
+    }
+
+    pub async fn get(self: TxnArc, key: impl Into<Key>) -> TiFsResult<Option<Value>> {
         if let Some(txn) = &self.txn {
-            txn.write().await.get(key).await
+            Ok(txn.write().await.get(key).await?)
         } else {
-            self.raw.get(key).await
+            if self.fs_config.small_transactions {
+                let mut mini = self.mini_txn().await?;
+                let result = Ok(mini.get(key).await?);
+                if result.is_ok() {
+                    mini.commit().await?;
+                }
+                result
+            } else {
+                Ok(self.raw.get(key).await?)
+            }
         }
     }
 
     pub async fn batch_get(
         &self,
         keys: impl IntoIterator<Item = impl Into<Key>>,
-    ) -> TiKvResult<Vec<KvPair>> {
+    ) -> TiFsResult<Vec<KvPair>> {
         if let Some(txn) = &self.txn {
-            txn.write().await.batch_get(keys).await.map(|iter|iter.collect::<Vec<_>>())
+            Ok(txn.write().await.batch_get(keys).await
+                .map(|iter|iter.collect::<Vec<_>>())?)
         } else {
-            self.raw.batch_get(keys).await
-        }
-    }
-
-    pub async fn put(self: TxnArc, key: impl Into<Key>, value: impl Into<Value>) -> TiKvResult<()> {
-        if let Some(txn) = &self.txn {
-            txn.write().await.put(key, value).await
-        } else {
-            self.raw.put(key, value).await
-        }
-    }
-
-    pub async fn batch_put(me: Arc<Self>, pairs: Vec<KvPair>) -> TiKvResult<()> {
-        if let Some(txn) = &me.txn {
-            let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
-            txn.write().await.batch_mutate(mutations).await
-        } else {
-            me.raw.batch_put(pairs).await
-        }
-    }
-
-    pub async fn delete(self: TxnArc, key: impl Into<Key>) -> TiKvResult<()> {
-        if let Some(txn) = &self.txn {
-            txn.write().await.delete(key).await
-        } else {
-            self.raw.delete(key).await
-        }
-    }
-
-    pub async fn batch_mutate(self: TxnArc, mutations: impl IntoIterator<Item = Mutation>) -> TiKvResult<()> {
-        if let Some(txn) = &self.txn {
-            txn.write().await.batch_mutate(mutations).await
-        } else {
-            let mut deletes = Vec::new();
-            for entry in mutations.into_iter() {
-                match entry {
-                    Mutation::Delete(key) => deletes.push(key),
-                    Mutation::Put(key, value) => {
-                        let clone = self.raw.clone();
-                        tokio::spawn((async move || {
-                            let clone2 = clone;
-                            let key2 = key;
-                            let value2 = value;
-                            clone2.put(key2, value2).await
-                        })());
-                    }
+            if self.fs_config.small_transactions {
+                let mut mini = self.mini_txn().await?;
+                let result = Ok(mini.batch_get(keys).await
+                    .map(|iter|iter.collect::<Vec<_>>())?);
+                if result.is_ok() {
+                    mini.commit().await?;
                 }
-            };
-            if deletes.len() > 0 {
-                self.raw.batch_delete(deletes).await?;
+                result
+            } else {
+                Ok(self.raw.batch_get(keys).await?)
             }
-            Ok(())
+        }
+    }
+
+    pub async fn put(self: TxnArc, key: impl Into<Key>, value: impl Into<Value>) -> TiFsResult<()> {
+        if let Some(txn) = &self.txn {
+            Ok(txn.write().await.put(key, value).await?)
+        } else {
+            if self.fs_config.small_transactions {
+                let mut mini = self.mini_txn().await?;
+                let result = Ok(mini.put(key, value).await?);
+                if result.is_ok() {
+                    mini.commit().await?;
+                }
+                result
+            } else {
+                Ok(self.raw.put(key, value).await?)
+            }
+        }
+    }
+
+    pub async fn batch_put(self: TxnArc, pairs: Vec<KvPair>) -> TiFsResult<()> {
+        if let Some(txn) = &self.txn {
+            let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
+            Ok(txn.write().await.batch_mutate(mutations).await?)
+        } else {
+            if self.fs_config.small_transactions {
+                let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
+                let mut mini = self.mini_txn().await?;
+                let result = Ok(mini.batch_mutate(mutations).await?);
+                if result.is_ok() {
+                    mini.commit().await?;
+                }
+                result
+            } else {
+                Ok(self.raw.batch_put(pairs).await?)
+            }
+        }
+    }
+
+    pub async fn delete(self: TxnArc, key: impl Into<Key>) -> TiFsResult<()> {
+        if let Some(txn) = &self.txn {
+            Ok(txn.write().await.delete(key).await?)
+        } else {
+            if self.fs_config.small_transactions {
+                let mut mini = self.mini_txn().await?;
+                let result = Ok(mini.delete(key).await?);
+                if result.is_ok() {
+                    mini.commit().await?;
+                }
+                result
+            } else {
+                Ok(self.raw.delete(key).await?)
+            }
+        }
+    }
+
+    pub async fn batch_mutate(self: TxnArc, mutations: impl IntoIterator<Item = Mutation>) -> TiFsResult<()> {
+        if let Some(txn) = &self.txn {
+            Ok(txn.write().await.batch_mutate(mutations).await?)
+        } else {
+            if self.fs_config.small_transactions {
+                let mut mini = self.mini_txn().await?;
+                let result = Ok(mini.batch_mutate(mutations).await?);
+                if result.is_ok() {
+                    mini.commit().await?;
+                }
+                result
+            } else {
+                let mut deletes = Vec::new();
+                let mut put_pairs = Vec::new();
+                for entry in mutations.into_iter() {
+                    match entry {
+                        Mutation::Delete(key) => deletes.push(key),
+                        Mutation::Put(key, value) => {
+                            put_pairs.push(KvPair(key, value));
+                        }
+                    }
+                };
+                if put_pairs.len() > 0 {
+                    self.raw.batch_put(put_pairs).await?;
+                }
+                if deletes.len() > 0 {
+                    self.raw.batch_delete(deletes).await?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -312,11 +389,22 @@ impl Txn {
         &self,
         range: impl Into<BoundRange>,
         limit: u32,
-    ) -> TiKvResult<Vec<KvPair>> {
+    ) -> TiFsResult<Vec<KvPair>> {
         if let Some(txn) = &self.txn {
-            txn.write().await.scan(range, limit).await.map(|iter|iter.collect::<Vec<_>>())
+            Ok(txn.write().await.scan(range, limit).await
+                .map(|iter|iter.collect::<Vec<KvPair>>())?)
         } else {
-            self.raw.scan(range, limit).await
+            if self.fs_config.small_transactions {
+                let mut mini = self.mini_txn().await?;
+                let result = Ok(mini.scan(range, limit).await?
+                    .collect::<Vec<KvPair>>());
+                if result.is_ok() {
+                    mini.commit().await?;
+                }
+                result
+            } else {
+                Ok(self.raw.scan(range, limit).await?)
+            }
         }
     }
 
@@ -324,11 +412,22 @@ impl Txn {
         &self,
         range: impl Into<BoundRange>,
         limit: u32,
-    ) -> TiKvResult<Vec<Key>> {
+    ) -> TiFsResult<Vec<Key>> {
         if let Some(txn) = &self.txn {
-            txn.write().await.scan_keys(range, limit).await.map(|iter|iter.collect::<Vec<_>>())
+            Ok(txn.write().await.scan_keys(range, limit).await
+                .map(|iter|iter.collect::<Vec<_>>())?)
         } else {
-            self.raw.scan_keys(range, limit).await
+            if self.fs_config.small_transactions {
+                let mut mini = self.mini_txn().await?;
+                let result = Ok(mini.scan_keys(range, limit).await?
+                    .collect::<Vec<Key>>());
+                if result.is_ok() {
+                    mini.commit().await?;
+                }
+                result
+            } else {
+                Ok(self.raw.scan_keys(range, limit).await?)
+            }
         }
     }
 

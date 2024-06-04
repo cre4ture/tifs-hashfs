@@ -183,7 +183,7 @@ pub struct TiFs {
     pub instance_id: Uuid,
     pub pd_endpoints: Vec<String>,
     pub client_config: Config,
-    pub client: TransactionClientMux,
+    pub client: Arc<TransactionClientMux>,
     pub raw: Arc<tikv_client::RawClient>,
     pub direct_io: bool,
     pub fs_config: TiFsConfig,
@@ -209,9 +209,11 @@ impl TiFs {
     {
         let raw_cfg = cfg.clone();
         let raw = Arc::new(tikv_client::RawClient::new_with_config(pd_endpoints.clone(), raw_cfg).await?);
-        let client = TransactionClientMux::new(pd_endpoints.clone().into_iter().map(|s|s.into()).collect::<Vec<_>>(), cfg.clone())
+        let client = Arc::new(TransactionClientMux::new(
+                pd_endpoints.clone().into_iter().map(|s|s.into()).collect::<Vec<_>>(), cfg.clone()
+            )
             .await
-            .map_err(|err| anyhow!("{}", err))?;
+            .map_err(|err| anyhow!("{}", err))?);
         info!("connected to pd endpoints: {:?}", pd_endpoints);
 
         let fs_config = TiFsConfig::from_options(&options).map_err(|err| {
@@ -340,7 +342,7 @@ impl TiFs {
             Ok(v) => {
                 let commit_start = SystemTime::now();
                 txn.clone().commit().await?;
-                eprintln!(
+                tracing::trace!(
                     "transaction committed in {} ms",
                     commit_start.elapsed().unwrap().as_millis()
                 );
@@ -367,7 +369,7 @@ impl TiFs {
 
         let txn = Txn::begin_optimistic(
             self.instance_id,
-            &self.client,
+            self.client.clone(),
             self.raw.clone(),
             &self.fs_config,
             block_cache,
