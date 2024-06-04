@@ -29,8 +29,9 @@ use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, Modificati
 use super::reply::{
     Data, Directory, LogicalIno
 };
-use super::transaction::{Txn, TxnArc, TxnDataCache};
+use super::transaction::{Txn, TxnArc};
 use super::transaction_client_mux::TransactionClientMux;
+use super::utils::txn_data_cache::TxnDataCache;
 
 pub const DIR_SELF: ByteString = ByteString::from_static(".");
 pub const DIR_PARENT: ByteString = ByteString::from_static("..");
