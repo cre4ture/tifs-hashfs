@@ -14,6 +14,7 @@ use super::reply::LogicalIno;
 use super::tikv_fs::InoUse;
 use super::{error::FsError, inode::TiFsHash};
 
+pub const PARENT_OF_ROOT_INODE: StorageIno = StorageIno(0);
 pub const ROOT_INODE: StorageIno = StorageIno(fuser::FUSE_ROOT_ID);
 pub const ROOT_LOGICAL_INODE: LogicalIno = LogicalIno::from_raw(fuser::FUSE_ROOT_ID);
 
@@ -99,6 +100,7 @@ impl<'ol> KeyParser<'ol> {
         if act_prefix != prefix {
             return Err(FsError::UnknownError(format!("key prefix mismatch: {:?}", act_prefix)));
         }
+        i.advance_by(prefix.len()).unwrap();
         let kind_id = *i.next().unwrap_or(&0xFF);
         let kind = *KEY_KIND_IDS.get_by_left(&kind_id).ok_or(
             FsError::UnknownError(format!("key with unknown kind_i: {}", kind_id)))?;
@@ -319,146 +321,87 @@ impl KeyGenerator<StorageIno, StorageFileAttr> for ScopedKeyBuilder {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::fs::{inode::StorageIno, key::{BlockAddress, InoMetadata, KeyKind, KeyParser}, utils::hash_algorithm::HashAlgorithm};
 
-    /*
-    pub fn test() {
-        let invalid_key = || FsError::InvalidScopedKey(key.to_owned());
-        let (scope, data) = key.split_first().ok_or_else(invalid_key)?;
-        let kind = match *scope {
-            ScopedKey::META => KeyKind::Meta,
-            ScopedKey::INODE => {
-                let ino = u64::from_be_bytes(*data.array_chunks().next().ok_or_else(invalid_key)?);
-                KeyKind::Inode(ino)
-            }
-            ScopedKey::BLOCK => {
-                let mut arrays = data.array_chunks();
-                let ino = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                let block = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                KeyKind::Block { ino, block }
-            }
-            ScopedKey::HANDLER => {
-                let mut arrays = data.array_chunks();
-                let ino = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                let handler = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                KeyKind::FileHandler { ino, handler }
-            }
-            ScopedKey::INDEX => {
-                let parent =
-                    u64::from_be_bytes(*data.array_chunks().next().ok_or_else(invalid_key)?);
-                let name = std::str::from_utf8(&data[size_of::<u64>()..]).map_err(|_| invalid_key())?;
-                KeyKind::FileIndex { parent, name }
-            }
-            ScopedKey::HASHED_BLOCK => {
-                KeyKind::HashedBlock { hash: data }
-            }
-            ScopedKey::HASH_OF_BLOCK => {
-                let mut arrays = data.array_chunks();
-                let ino = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                let block = u64::from_be_bytes(*arrays.next().ok_or_else(invalid_key)?);
-                KeyKind::HashOfBlock { ino, block }
-            }
-            ScopedKey::HASHED_BLOCK_EXISTS => {
-                KeyKind::HashedBlockExists { hash: data }
-            }
-            ScopedKey::OPENED_INODE => {
-                let ino = u64::from_be_bytes(*data.array_chunks().next().ok_or_else(invalid_key)?);
-                let uuid = data[size_of::<u64>()..].array_chunks().next().ok_or_else(invalid_key)?;
-                KeyKind::OpenedInode { ino, uuid: uuid.clone() }
-            }
-            _ => return Err(invalid_key()),
-        };
+    use super::ScopedKeyBuilder;
 
-        Ok(ScopedKey{key_type: kind, prefix})
-    }*/
-//}
+    const TEST_PREFIX: &[u8] = b"HelloWorld";
 
-/*
-impl<'a> ScopedKey<'a> {
-    const META: u8 = 0;
-    const INODE: u8 = 1;
-    const BLOCK: u8 = 2;
-    const HANDLER: u8 = 3;
-    const INDEX: u8 = 4;
-    const HASHED_BLOCK: u8 = 5;
-    const HASH_OF_BLOCK: u8 = 6;
-    const HASHED_BLOCK_EXISTS: u8 = 7;
-    const OPENED_INODE: u8 = 8;
-
-    pub fn scope(&self) -> u8 {
-        use KeyKind::*;
-
-        match self.key_type {
-            Meta(_) => Self::META,
-            Inode(_) => Self::INODE,
-            Block { ino: _, block: _ } => Self::BLOCK,
-            FileHandler { ino: _, handler: _ } => Self::HANDLER,
-            FileIndex { parent: _, name: _ } => Self::INDEX,
-            HashedBlock { hash: _ } => Self::HASHED_BLOCK,
-            HashOfBlock { ino: _, block: _ } => Self::HASH_OF_BLOCK,
-            HashedBlockExists { hash: _ } => Self::HASHED_BLOCK_EXISTS,
-            OpenedInode { ino: _, uuid: _ } => Self::OPENED_INODE,
-        }
+    #[test]
+    fn serialize_deserialize_prefix_and_meta() {
+        let kb = ScopedKeyBuilder::new(TEST_PREFIX);
+        assert_eq!(kb.buf, TEST_PREFIX);
+        let buf = kb.meta();
+        let mut i = buf.iter();
+        let kp = KeyParser::start(&mut i, TEST_PREFIX, 16).unwrap();
+        assert_eq!(kp.kind, KeyKind::FsMetadata);
     }
 
-    pub fn len(&self) -> usize {
-        use KeyKind::*;
-
-        let kind_size = match self.key_type {
-            Meta(_) => 0,
-            Inode(_) => size_of::<u64>(),
-            Block { ino: _, block: _ } => size_of::<u64>() * 2,
-            FileHandler { ino: _, handler: _ } => size_of::<u64>() * 2,
-            FileIndex { parent: _, name } => size_of::<u64>() + name.len(),
-            HashedBlock { hash: _ } => size_of::<inode::Hash>(),
-            HashOfBlock { ino: _, block: _ } => size_of::<u64>() * 2,
-            HashedBlockExists { hash: _ } => size_of::<inode::Hash>(),
-            OpenedInode { ino: _, uuid: _ } => size_of::<UInode>() + 16,
-        };
-
-        return self.prefix.len() + 1 + kind_size;
+    #[test]
+    fn serialize_deserialize_ino_meta_access_time() {
+        let kb = ScopedKeyBuilder::new(TEST_PREFIX).inode_atime(StorageIno(5));
+        let mut i = kb.iter();
+        let kp = KeyParser::start(&mut i, TEST_PREFIX, 16).unwrap();
+        assert_eq!(kp.kind, KeyKind::InoMetadata);
+        let kp_ino = kp.parse_ino().unwrap();
+        assert_eq!(kp_ino.ino, StorageIno(5));
+        assert_eq!(kp_ino.meta, InoMetadata::AccessTime);
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
-        use KeyKind::*;
-        let (prefix, key) = key.split_at(self.prefix.len());
-        if prefix != self.prefix {
-            return Err(FsError::UnknownError(format!("key with invalid prefix: {}", prefix)));
-        }
-        let mut data = Vec::with_capacity(self.len());
-        data.extend(self.prefix);
-        data.push(self.scope());
-        match self.key_type {
-            Meta(_) => (),
-            Inode(ino) => data.extend(ino.to_be_bytes().iter()),
-            Block { ino, block } => {
-                data.extend(ino.to_be_bytes().iter());
-                data.extend(block.to_be_bytes().iter())
-            }
-            FileHandler { ino, handler } => {
-                data.extend(ino.to_be_bytes().iter());
-                data.extend(handler.to_be_bytes().iter())
-            }
-            FileIndex { parent, name } => {
-                data.extend(parent.to_be_bytes().iter());
-                data.extend(name.as_bytes().iter());
-            }
-            HashedBlock { hash } => {
-                data.extend(hash)
-            }
-            HashOfBlock { ino, block } => {
-                data.extend(ino.to_be_bytes().iter());
-                data.extend(block.to_be_bytes().iter())
-            }
-            HashedBlockExists { hash } => {
-                data.extend(hash)
-            }
-            OpenedInode { ino, uuid } => {
-                data.extend(ino.to_be_bytes().iter());
-                data.extend(uuid.iter());
-            }
-        }
-        data
+    #[test]
+    fn serialize_deserialize_hashed_block() {
+        let hash = HashAlgorithm::Blake3.calculate_hash(&[1,2,3]);
+        let kb = ScopedKeyBuilder::new(TEST_PREFIX).hashed_block(&hash);
+        let mut i = kb.iter();
+        let kp = KeyParser::start(&mut i, TEST_PREFIX, 32).unwrap();
+        assert_eq!(kp.kind, KeyKind::HashedBlock);
+        let read_hash = kp.parse_key_hashed_block().unwrap();
+        assert_eq!(hash, read_hash);
+    }
+
+    #[test]
+    fn serialize_deserialize_hashed_block_exists() {
+        let hash = HashAlgorithm::Blake3.calculate_hash(&[1,2,3]);
+        let kb = ScopedKeyBuilder::new(TEST_PREFIX).hashed_block_exists(&hash);
+        let mut i = kb.iter();
+        let kp = KeyParser::start(&mut i, TEST_PREFIX, 32).unwrap();
+        assert_eq!(kp.kind, KeyKind::HashedBlockExists);
+        let read_hash = kp.parse_key_hashed_block().unwrap();
+        assert_eq!(hash, read_hash);
+    }
+
+    #[test]
+    fn serialize_deserialize_hashed_block_len_64() {
+        let hash = HashAlgorithm::Sha512.calculate_hash(&[1,2,3]);
+        let kb = ScopedKeyBuilder::new(TEST_PREFIX).hashed_block(&hash);
+        let mut i = kb.iter();
+        let kp = KeyParser::start(&mut i, TEST_PREFIX, 64).unwrap();
+        assert_eq!(kp.kind, KeyKind::HashedBlock);
+        let read_hash = kp.parse_key_hashed_block().unwrap();
+        assert_eq!(hash, read_hash);
+    }
+
+    #[test]
+    fn serialize_deserialize_regular_block() {
+        let addr = BlockAddress{ino:StorageIno(7), index: 3};
+        let kb = ScopedKeyBuilder::new(TEST_PREFIX).block(addr.clone());
+        let mut i = kb.iter();
+        let kp = KeyParser::start(&mut i, TEST_PREFIX, 32).unwrap();
+        assert_eq!(kp.kind, KeyKind::Block);
+        let read_addr = kp.parse_key_block_address().unwrap();
+        assert_eq!(addr, read_addr);
+    }
+
+    #[test]
+    fn serialize_deserialize_block_hash() {
+        let addr = BlockAddress{ino:StorageIno(7), index: 3};
+        let kb = ScopedKeyBuilder::new(TEST_PREFIX).block_hash(addr.clone());
+        let mut i = kb.iter();
+        let kp = KeyParser::start(&mut i, TEST_PREFIX, 32).unwrap();
+        assert_eq!(kp.kind, KeyKind::BlockHash);
+        let read_addr = kp.parse_key_block_address().unwrap();
+        assert_eq!(addr, read_addr);
     }
 }
-
-*/

@@ -92,6 +92,7 @@ pub struct InoSize {
     inline_data: Option<Vec<u8>>,
     pub data_hash: Option<TiFsHash>,
     pub last_change: SystemTime,
+    pub change_iteration: u64,
 }
 
 impl InoSize {
@@ -102,6 +103,7 @@ impl InoSize {
             inline_data: None,
             data_hash: None,
             last_change: SystemTime::now(),
+            change_iteration: 0,
         }
     }
 

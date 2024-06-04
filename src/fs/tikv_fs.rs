@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
-use std::mem::{self, size_of};
+use std::mem;
 use std::ops::DerefMut;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -61,7 +61,6 @@ pub struct InoUse {
     pub instance: Weak<TiFs>,
     pub ino: StorageIno,
     pub use_id: Uuid,
-    pub ino_size_lock: RwLock<()>,
 }
 
 impl Drop for InoUse {
@@ -109,6 +108,21 @@ pub struct TiFsCaches {
     pub inode_atime: TxnDataCache<StorageIno, AccessTime>,
     pub inode_mtime: TxnDataCache<StorageIno, ModificationTime>,
     pub inode_attr: TxnDataCache<StorageIno, StorageFileAttr>,
+    pub ino_locks: Arc<RwLock<HashMap<StorageIno, Weak<RwLock<()>>>>>,
+}
+
+impl TiFsCaches {
+    pub async fn get_or_create_ino_lock(&self, ino: StorageIno) -> Arc<RwLock<()>> {
+        let mut locks = self.ino_locks.write().await;
+        let existing_lock = locks.get(&ino).and_then(|x|x.upgrade());
+        if let Some(lock) = existing_lock {
+            lock
+        } else {
+            let lock = Arc::new(RwLock::new(()));
+            locks.insert(ino, Arc::downgrade(&lock));
+            lock
+        }
+    }
 }
 
 pub struct TiFsMutable {
@@ -136,6 +150,7 @@ impl TiFsMutable {
                 inode_mtime: TxnDataCache::new(ino_cache_size, Duration::from_secs(5)),
                 inode_attr: TxnDataCache::new(ino_cache_size, Duration::from_secs(30)),
                 inode_lock_state: TxnDataCache::new(ino_cache_size, Duration::from_secs(2)),
+                ino_locks: Arc::new(RwLock::new(HashMap::new())),
             }
         }
     }
@@ -413,6 +428,7 @@ impl TiFs {
         self.spin(msg, None, f).await
     }
 
+    #[tracing::instrument]
     pub fn map_storage_attr_to_fuser(&self,
         kind: InoKind,
         desc: &InoDescription,
@@ -420,13 +436,22 @@ impl TiFs {
         attr: &StorageFileAttr,
         atime: Option<SystemTime>,
     ) -> FileAttr {
-        let mut stat = FileAttr {
+        let stat = FileAttr {
             ino: LogicalIno {
                 kind,
                 storage_ino: desc.storage_ino(),
             }.to_raw(),
-            size: size.size(),
-            blocks: size.blocks(),
+            size: match kind {
+                InoKind::Regular => size.size(),
+                InoKind::Hash => self.fs_config.hash_len as u64,
+                InoKind::Hashes => self.fs_config.hash_len as u64 * size.blocks(),
+            },
+            blocks: match kind {
+                InoKind::Regular => size.blocks(),
+                InoKind::Hash => 0,
+                InoKind::Hashes => (self.fs_config.hash_len as u64 * size.blocks())
+                                    .div_ceil(self.fs_config.block_size),
+            },
             atime: atime.unwrap_or(size.last_change),
             mtime: size.last_change.max(attr.last_change),
             ctime: attr.last_change,
@@ -440,7 +465,6 @@ impl TiFs {
             blksize: self.fs_config.block_size as u32,
             flags: attr.flags
         };
-        self.adapt_inode(&mut stat);
         stat
     }
 
@@ -460,17 +484,37 @@ impl TiFs {
         Ok(stat)
     }
 
-    pub async fn get_all_file_attributes(&self, ino: StorageIno
+    pub async fn lookup_all_info_logical(
+        &self,
+        parent: StorageIno,
+        name: ByteString,
+        kind: InoKind,
     ) -> TiFsResult<FileAttr> {
         let (desc, attr, size, atime) =
-            self.spin_no_delay(format!("get attrs ino({})", ino),
+            self.spin_no_delay(format!("lookup parent({}), name({})", parent, name),
             move |_, txn| {
+                let name = name.clone();
                 Box::pin(async move {
+                    let ino = txn.clone().lookup_ino(parent, name.clone()).await?;
                     txn.clone().get_all_ino_data(ino).await
                 })
             }).await?;
         let stat = self.map_storage_attr_to_fuser(
-            InoKind::Regular, &desc, &size, &attr, Some(atime.0));
+            kind, &desc, &size, &attr, Some(atime.0));
+        Ok(stat)
+    }
+
+    pub async fn get_all_file_attributes(&self, l_ino: LogicalIno
+    ) -> TiFsResult<FileAttr> {
+        let (desc, attr, size, atime) =
+            self.spin_no_delay(format!("get attrs ino({:?})", l_ino),
+            move |_, txn| {
+                Box::pin(async move {
+                    txn.clone().get_all_ino_data(l_ino.storage_ino()).await
+                })
+            }).await?;
+        let stat = self.map_storage_attr_to_fuser(
+            l_ino.kind, &desc, &size, &attr, Some(atime.0));
         Ok(stat)
     }
 
@@ -513,6 +557,7 @@ impl TiFs {
             dir_complete.push(regular_entry);
         }
 
+        trace!("read_dir1 - out: {dir_complete:?}");
         Ok(dir_complete)
     }
 
@@ -611,20 +656,6 @@ impl TiFs {
         }
 
         Ok(())
-    }
-
-    pub fn adapt_inode(&self, stat: &mut FileAttr) {
-        match LogicalIno::from_raw(stat.ino).kind {
-            InoKind::Regular => {},
-            InoKind::Hash => {
-                stat.size = size_of::<TiFsHash>() as u64;
-                stat.blocks = 0;
-            }
-            InoKind::Hashes => {
-                stat.size = size_of::<TiFsHash>() as u64 * stat.blocks;
-                stat.blocks = 0;
-            }
-        }
     }
 
     pub async fn flush_write_cache(&self, fh: u64) -> TiFsResult<()> {

@@ -8,6 +8,7 @@ use tracing::{debug, error, trace};
 use super::error::Result;
 use super::inode::StorageIno;
 use super::key::ROOT_INODE;
+use super::utils::common_prints::debug_print_start_and_end_bytes_of_buffer;
 
 pub fn get_time() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
@@ -55,13 +56,17 @@ impl Attr {
     }
 }
 
-#[derive(Debug)]
 pub struct Data {
     pub data: Vec<u8>,
 }
 impl Data {
     pub fn new(data: Vec<u8>) -> Self {
         Self { data }
+    }
+}
+impl Debug for Data {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", debug_print_start_and_end_bytes_of_buffer(16, &self.data))
     }
 }
 
@@ -307,7 +312,7 @@ pub trait FsReply<T: Debug>: Sized {
     fn reply(self, id: u64, result: Result<T>) {
         match result {
             Ok(item) => {
-                trace!("ok. reply for request({})", id);
+                trace!("ok. reply for request({}): {item:?}", id);
                 //eprintln!("ok. reply for request({}) - type: {}", id, type_name::<T>());
                 self.reply_ok(item)
             }

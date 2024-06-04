@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
-use std::mem;
 use std::ops::{Deref, Range, RangeInclusive};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -172,10 +171,8 @@ pub struct Txn {
 pub type TxnArc = Arc<Txn>;
 
 impl Txn {
-    const INLINE_DATA_THRESHOLD_BASE: u64 = 1 << 4;
-
     fn inline_data_threshold(&self) -> u64 {
-        self.block_size / Self::INLINE_DATA_THRESHOLD_BASE
+        self.fs_config.inline_data_limit
     }
 
     pub fn block_size(&self) -> u64 {
@@ -374,25 +371,34 @@ impl Txn {
     #[instrument(skip(self))]
     pub async fn read_hash_of_file(self: TxnArc, ino: StorageIno, offset: u64, size: u64) -> Result<Vec<u8>> {
 
-        let hash_size = mem::size_of::<TiFsHash>() as u64;
+        let hash_size = self.fs_config.hash_len as u64;
         let offset = offset.clamp(0, hash_size);
         let remaining = hash_size - offset;
         let size = size.clamp(0, remaining);
 
         let mut result = Vec::with_capacity(hash_size as usize);
-        let mut ino_size_data = self.caches.inode_size.read_cached(&ino, self.deref()).await?;
-        if ino_size_data.data_hash.is_none() {
-            let size_in_blocks = ino_size_data.size().div_ceil(self.fs_config.block_size);
+        let mut ino_size_arc = self.caches.inode_size.read_cached(&ino, self.deref()).await?;
+        while ino_size_arc.data_hash.is_none() {
+            let change_iteration = ino_size_arc.change_iteration;
+            let size_in_blocks = ino_size_arc.size().div_ceil(self.fs_config.block_size);
             let hash_data = self.clone().read_hashes_of_file(ino, 0, (size_in_blocks * hash_size) as u32).await?;
             let full_data_hash = self.fs_config.calculate_hash(&hash_data);
-            ino_size_data = self.caches.inode_size.read_cached(&ino, self.deref()).await?;
-            let mut ino_data_mut = ino_size_data.deref().clone();
-            ino_data_mut.data_hash = Some(full_data_hash);
-            ino_size_data = Arc::new(ino_data_mut);
-            self.caches.inode_size.write_cached(ino, ino_size_data.clone(), self.deref()).await?;
+            trace!("freshly_calculated_hash: {full_data_hash:x?}");
+
+            let lock = self.caches.get_or_create_ino_lock(ino).await;
+            ino_size_arc = self.caches.inode_size.read_cached(&ino, self.deref()).await?;
+            // was data changed in the meantime?
+            if ino_size_arc.change_iteration == change_iteration {
+                let mut ino_data_mut = ino_size_arc.deref().clone();
+                ino_data_mut.data_hash = Some(full_data_hash);
+                ino_size_arc = Arc::new(ino_data_mut);
+                self.caches.inode_size.write_cached(ino, ino_size_arc.clone(), self.deref()).await?;
+            }
+            drop(lock);
         }
 
-        if let Some(precalculated_hash) = &ino_size_data.data_hash {
+        if let Some(precalculated_hash) = &ino_size_arc.data_hash {
+            trace!("precalculated_hash: {precalculated_hash:x?}");
             result.extend_from_slice(&precalculated_hash[offset as usize..(offset+size) as usize]);
             return Ok(result);
         }
@@ -402,7 +408,7 @@ impl Txn {
 
     #[instrument(skip(self))]
     pub async fn read_hashes_of_file(self: TxnArc, ino: StorageIno, offset: u64, size: u32) -> Result<Vec<u8>> {
-        let hash_size = mem::size_of::<TiFsHash>() as u64;
+        let hash_size = self.fs_config.hash_len as u64;
         let first_block = offset / hash_size;
         let first_block_offset = offset % hash_size;
         let block_cnt = (first_block_offset + size as u64) / hash_size;
@@ -608,16 +614,6 @@ impl Txn {
         start: u64,
         data: &[u8],
     ) -> Result<usize> {
-        debug_assert!(ino_size.size() <= self.inline_data_threshold());
-        let size = data.len() as u64;
-        debug_assert!(
-            start + size <= self.inline_data_threshold(),
-            "{} + {} > {}",
-            start,
-            size,
-            self.inline_data_threshold()
-        );
-
         let size = data.len();
         let start = start as usize;
 
@@ -1105,8 +1101,9 @@ impl Txn {
         let size = data.len();
         let target = start + size as u64;
         let size_changed;
+        let lock = self.caches.get_or_create_ino_lock(fh.ino_use.ino).await;
         {
-            let write_size_lock = fh.ino_use.ino_size_lock.write().await;
+            let write_size_lock = lock.write().await;
             let mut ino_size = self.caches.inode_size.read_cached(
                 &ino, self.deref()).await?.deref().clone();
             size_changed = target > ino_size.size();
@@ -1144,7 +1141,7 @@ impl Txn {
         watch.sync("write impl");
 
         if size_changed || content_was_modified {
-            let wr_lock = fh.ino_use.ino_size_lock.write().await;
+            let wr_lock = lock.write().await;
             let mut ino_size_now = self.caches.inode_size.read_cached(
                 &ino, self.deref()).await?.deref().clone();
             // parallel writes might have done the size increment already
@@ -1155,6 +1152,7 @@ impl Txn {
             // if no hash was available before, no need to store a change
             let hash_removed = ino_size_now.data_hash.take().is_some();
             if size_still_changed || hash_removed {
+                ino_size_now.change_iteration += 1;
                 ino_size_now.last_change = SystemTime::now();
                 self.caches.inode_size.write_cached(
                     ino, Arc::new(ino_size_now), self.deref()).await?;
@@ -1268,8 +1266,11 @@ impl Txn {
         let desc = self.caches.inode_desc.read_cached(&ino, self.as_ref()).await?;
         let attr = self.caches.inode_attr.read_cached(&ino, self.as_ref()).await?;
         let size = self.caches.inode_size.read_cached(&ino, self.as_ref()).await?;
-        let atime = self.caches.inode_atime.read_cached(&ino, self.as_ref()).await?;
-        Ok((desc, attr, size, atime.deref().clone()))
+        let atime = self.caches.inode_atime.read_cached(
+            &ino, self.as_ref()).await.ok().as_deref().cloned().unwrap_or_else(||{
+                AccessTime(size.last_change.max(attr.last_change))
+            });
+        Ok((desc, attr, size, atime))
     }
 
     pub async fn set_attributes(
@@ -1329,7 +1330,8 @@ impl Txn {
         offset: i64,
         length: i64
     ) -> Result<()> {
-        let wr_lock = fh.ino_use.ino_size_lock.write();
+        let lock = self.caches.get_or_create_ino_lock(fh.ino_use.ino).await;
+        let wr_lock = lock.write().await;
         let mut ino_size = self.caches.inode_size.read_cached(
             &ino, self.as_ref()).await?.deref().clone();
         let target_size = (offset + length) as u64;
@@ -1385,7 +1387,7 @@ impl Txn {
                 inode: ino,
                 block: 0,
             })?;
-        trace!("read data: {}", String::from_utf8_lossy(&data));
+        trace!("read dir data: {}", String::from_utf8_lossy(&data));
         super::dir::decode(&data)
     }
 

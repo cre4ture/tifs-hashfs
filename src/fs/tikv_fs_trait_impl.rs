@@ -6,11 +6,10 @@ use bytestring::ByteString;
 use fuser::{consts::FOPEN_DIRECT_IO, KernelConfig, TimeOrNow};
 use futures::FutureExt;
 use libc::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET};
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-use crate::fs::{error::{FsError, Result}, inode::{StorageFilePermission, StorageIno}, key::ROOT_INODE, reply::InoKind};
+use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, key::{PARENT_OF_ROOT_INODE, ROOT_INODE}, reply::InoKind};
 
 use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::StorageDirItemKind, mode::{as_file_kind, as_file_perm}, reply::{get_time, Attr, Create, Data, Dir, Entry, Lock, LogicalIno, Lseek, Open, StatFs, Write, Xattr}, tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable, DIR_PARENT}};
 
@@ -28,6 +27,12 @@ impl AsyncFileSystem for TiFs {
         config
             .add_capabilities(fuser::consts::FUSE_FLOCK_LOCKS)
             .expect("kernel config failed to add cap_fuse FUSE_CAP_FLOCK_LOCKS");
+        if let Err(next_working) = config.set_max_readahead(self.fs_config.block_size as u32 * 6) {
+            tracing::info!("max_readahead value adaped to nearest: {next_working}");
+            config.set_max_readahead(next_working).map_err(|err|{
+                tracing::warn!("setting of max_readahead failed with error: {err:?}");
+            }).unwrap();
+        }
 
         arc.spin_no_delay(format!("init"), move |fs, txn| {
             Box::pin(async move {
@@ -41,10 +46,10 @@ impl AsyncFileSystem for TiFs {
                 }
 
                 let root_inode = txn.clone().read_inode(ROOT_INODE).await;
-                if let Err(FsError::InodeNotFound { inode: _ }) = root_inode {
+                if let Err(FsError::KeyNotFound) = root_inode {
                     let attr = txn
                         .mkdir(
-                            StorageIno(0),
+                            PARENT_OF_ROOT_INODE,
                             Default::default(),
                             StorageFilePermission(0o777),
                             gid,
@@ -65,10 +70,10 @@ impl AsyncFileSystem for TiFs {
     async fn lookup(&self, parent: u64, name: ByteString) -> Result<Entry> {
         let p_ino = LogicalIno::from_raw(parent);
 
-        let (filename, _kind) = parse_filename(name);
+        let (filename, kind) = parse_filename(name);
 
         Self::check_file_name(&filename)?;
-        let stat = self.lookup_all_info(p_ino.storage_ino(), filename).await?;
+        let stat = self.lookup_all_info_logical(p_ino.storage_ino(), filename, kind).await?;
 
         let entry = Entry {
             generation: 0,
@@ -82,7 +87,7 @@ impl AsyncFileSystem for TiFs {
     #[tracing::instrument]
     async fn getattr(&self, ino: u64) -> Result<Attr> {
         let l_ino = LogicalIno::from_raw(ino);
-        let stat = self.get_all_file_attributes(l_ino.storage_ino()).await?;
+        let stat = self.get_all_file_attributes(l_ino).await?;
         Ok(Attr::new(stat))
     }
 
@@ -129,7 +134,7 @@ impl AsyncFileSystem for TiFs {
         })
         .await?;
 
-        let attr = self.get_all_file_attributes(l_ino.storage_ino()).await?;
+        let attr = self.get_all_file_attributes(l_ino).await?;
 
         Ok(Attr {
             time: get_time(),
@@ -166,7 +171,6 @@ impl AsyncFileSystem for TiFs {
                 instance: self.weak.to_owned(),
                 ino: l_ino.storage_ino(),
                 use_id: new_use_id,
-                ino_size_lock: RwLock::new(()),
             });
             self.with_mut_data(|d: &mut TiFsMutable| d.opened_ino.insert(ino, Arc::downgrade(&new_ino_use))).await?;
             ino_use = Some(new_ino_use);

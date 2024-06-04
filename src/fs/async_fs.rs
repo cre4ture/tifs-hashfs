@@ -23,7 +23,7 @@ where
     V: Debug,
 {
     spawn(async move {
-        trace!("reply to request({})", id);
+        trace!("start request({}) - result type: {}", id, std::any::type_name::<V>());
         let result = f.await;
         // TODO eprintln!("reply to request({}): {:?}", id, result);
         reply.reply(id, result);
