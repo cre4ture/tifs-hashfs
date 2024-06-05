@@ -55,4 +55,8 @@ impl HashAlgorithm {
         );
         hash
     }
+
+    pub fn to_string(&self) -> String {
+        ALGO_NAME_MAP.get_by_right(self).unwrap().to_string()
+    }
 }

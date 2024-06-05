@@ -244,12 +244,20 @@ impl TiFs {
     async fn check_metadata(self: TiFsArc) -> Result<()> {
         let metadata = self
             .clone().spin_no_delay(format!("check_metadata"),
-            move |_, txn| Box::pin(txn.read_meta()))
+            move |_, txn| Box::pin(txn.read_static_meta()))
             .await?;
-        if let Some(meta) = metadata {
-            let cfg_flags = meta.config_flags.unwrap_or_default();
+        if let Some(cfg_flags) = metadata {
+            if cfg_flags.block_size != self.fs_config.block_size {
+                panic!("stored config information mismatch: block_size desired: {}, actual: {}",
+                    self.fs_config.block_size, cfg_flags.block_size);
+            }
             if cfg_flags.hashed_blocks != self.fs_config.hashed_blocks {
-                panic!("stored config information mismatch: hashed_blocks desired: {}, actual: {}", self.fs_config.hashed_blocks, cfg_flags.hashed_blocks);
+                panic!("stored config information mismatch: hashed_blocks desired: {}, actual: {}",
+                    self.fs_config.hashed_blocks, cfg_flags.hashed_blocks);
+            }
+            if cfg_flags.hash_algorithm != self.fs_config.hash_algorithm.to_string() {
+                panic!("stored config information mismatch: hash_algorithm desired: {}, actual: {}",
+                    self.fs_config.hash_algorithm.to_string(), cfg_flags.hash_algorithm);
             }
         }
 

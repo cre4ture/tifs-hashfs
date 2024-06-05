@@ -6,7 +6,7 @@ use bytestring::ByteString;
 use fuser::{consts::FOPEN_DIRECT_IO, KernelConfig, TimeOrNow};
 use futures::FutureExt;
 use libc::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, key::{PARENT_OF_ROOT_INODE, ROOT_INODE}, reply::InoKind};
@@ -37,14 +37,6 @@ impl AsyncFileSystem for TiFs {
         arc.spin_no_delay(format!("init"), move |fs, txn| {
             Box::pin(async move {
                 info!("initializing tifs on {:?} ...", &fs.pd_endpoints);
-                if let Some(meta) = txn.clone().read_meta().await? {
-                    if meta.block_size != txn.block_size() {
-                        let err = FsError::block_size_conflict(meta.block_size, txn.block_size());
-                        error!("{}", err);
-                        return Err(err);
-                    }
-                }
-
                 let root_inode = txn.clone().read_inode(ROOT_INODE).await;
                 if let Err(FsError::KeyNotFound) = root_inode {
                     let attr = txn

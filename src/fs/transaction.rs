@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::fs::inode::{StorageDirItem, StorageDirItemKind, StorageIno};
 use crate::fs::key::BlockAddress;
-use crate::fs::meta::StaticFsParameters;
+use crate::fs::meta::MetaStatic;
 use crate::fs::utils::stop_watch::AutoStopWatch;
 use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
@@ -468,20 +468,34 @@ impl Txn {
     }
 
     pub async fn reserve_new_ino(self: TxnArc) -> Result<StorageIno> {
-        let mut meta = self
+        let read_meta = self
             .clone().read_meta()
-            .await?
-            .unwrap_or_else(|| Meta::new(self.block_size as u64, StaticFsParameters{
-                hashed_blocks: self.fs_config.hashed_blocks
-            }));
+            .await?;
 
-        self.clone().check_space_left(&meta)?;
+        let mut dyn_meta = if let Some(meta) = read_meta {
+            meta
+        } else {
+            let meta_static = MetaStatic {
+                block_size: self.fs_config.block_size as u64,
+                hashed_blocks: self.fs_config.hashed_blocks,
+                hash_algorithm: self.fs_config.hash_algorithm.to_string(),
+            };
+            let static_key = Key::from(self.key_builder().meta_static());
+            self.clone().put(static_key, meta_static.serialize()?).await?;
 
-        let ino = meta.inode_next;
-        meta.inode_next += 1;
+            Meta {
+                inode_next: ROOT_INODE.0,
+                last_stat: None,
+            }
+        };
+
+        self.clone().check_space_left(&dyn_meta)?;
+
+        let ino = dyn_meta.inode_next;
+        dyn_meta.inode_next += 1;
 
         debug!("get ino({})", ino);
-        self.save_meta(&meta).await?;
+        self.save_meta(&dyn_meta).await?;
         Ok(StorageIno(ino))
     }
 
@@ -618,6 +632,12 @@ impl Txn {
 
     pub fn key_parser<'fl>(&'fl self, i: &'fl mut std::slice::Iter<'fl, u8>) -> TiFsResult<KeyParser<'fl>> {
         KeyParser::start(i, &self.fs_config.key_prefix, self.fs_config.hash_len)
+    }
+
+    pub async fn read_static_meta(self: TxnArc) -> Result<Option<MetaStatic>> {
+        let key = Key::from(self.key_builder().meta_static());
+        let opt_data = self.clone().get(key).await?;
+        opt_data.map(|data| MetaStatic::deserialize(&data)).transpose()
     }
 
     pub async fn read_meta(self: TxnArc) -> Result<Option<Meta>> {

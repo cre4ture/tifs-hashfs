@@ -6,41 +6,23 @@ use super::reply::StatFs;
 use super::serialize::{deserialize, serialize, ENCODING};
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub struct StaticFsParameters{
+pub struct MetaStatic{
+    pub block_size: u64,
     pub hashed_blocks: bool,
-}
-
-impl StaticFsParameters {
-    pub const fn new() -> Self {
-        Self {
-            hashed_blocks: false,
-        }
-    }
-}
-
-impl Default for StaticFsParameters {
-    fn default() -> Self {
-        Self {
-            hashed_blocks: false,
-        }
-    }
+    pub hash_algorithm: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Meta {
     pub inode_next: u64, // TODO: get rid of global counter
-    pub block_size: u64,
     pub last_stat: Option<StatFs>,
-    pub config_flags: Option<StaticFsParameters>,
 }
 
 impl Meta {
-    pub const fn new(block_size: u64, config: StaticFsParameters) -> Self {
+    pub const fn new() -> Self {
         Self {
             inode_next: ROOT_INODE.0,
-            block_size,
             last_stat: None,
-            config_flags: Some(config),
         }
     }
 
@@ -55,6 +37,25 @@ impl Meta {
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
         deserialize(bytes).map_err(|err| FsError::Serialize {
             target: "meta",
+            typ: ENCODING,
+            msg: err.to_string(),
+        })
+    }
+}
+
+
+impl MetaStatic {
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        serialize(self).map_err(|err| FsError::Serialize {
+            target: "meta_static",
+            typ: ENCODING,
+            msg: err.to_string(),
+        })
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+        deserialize(bytes).map_err(|err| FsError::Serialize {
+            target: "meta_static",
             typ: ENCODING,
             msg: err.to_string(),
         })

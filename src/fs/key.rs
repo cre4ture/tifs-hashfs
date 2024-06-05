@@ -21,6 +21,7 @@ pub const ROOT_LOGICAL_INODE: LogicalIno = LogicalIno::from_raw(fuser::FUSE_ROOT
 /// ATTENTION: Order of enums in this struct matters for serialization!
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
 pub enum KeyKind {
+    FsMetadataStatic,
     FsMetadata,
     InoMetadata,
     Block, // { ino: u64, block: u64 },
@@ -181,6 +182,11 @@ impl ScopedKeyBuilder {
     fn write_key_kind(mut self, kk: KeyKind) -> Self {
         self.buf.push(*KEY_KIND_IDS.get_by_right(&kk).unwrap());
         self
+    }
+
+    // final
+    pub fn meta_static(self) -> KeyBuffer {
+        self.write_key_kind(KeyKind::FsMetadataStatic).buf
     }
 
     // final
