@@ -35,6 +35,7 @@ use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, Modificati
 use super::key::{KeyGenerator, KeyParser, ScopedKeyBuilder, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::as_file_perm;
+use super::szymanskis_critical_section::CriticalSectionKeyLock;
 use super::utils::txn_data_cache::{TxnDelete, TxnFetch, TxnPut};
 use super::{parsers, serialize};
 use super::reply::StatFs;
@@ -91,7 +92,7 @@ fn set_if_changed<T: std::cmp::PartialEq>(
 }
 
 pub struct Txn {
-    weak: Weak<Self>,
+    pub weak: Weak<Self>,
     _instance_id: Uuid,
     txn_client_mux: Arc<TransactionClientMux>,
     txn: Option<RwLock<Transaction>>,
@@ -112,6 +113,10 @@ impl Txn {
 
     pub fn block_size(&self) -> u64 {
         self.block_size
+    }
+
+    pub fn fs_config(&self) -> TiFsConfig {
+        self.fs_config
     }
 
     fn check_space_left(self: TxnArc, meta: &Meta) -> Result<()> {
@@ -804,7 +809,12 @@ impl Txn {
     }
 
     pub async fn clear_data(self: TxnArc, ino: StorageIno) -> Result<u64> {
-        let mut ino_size = self.caches.inode_size.read_cached(
+
+        let ino_size_key = self.key_builder().inode_size(ino);
+        let key_lock = CriticalSectionKeyLock::new(
+            self.clone(), Key::from(ino_size_key)).await?;
+
+        let mut ino_size = self.caches.inode_size.read_uncached(
             &ino, self.deref()).await?.deref().clone();
         let block_cnt = ino_size.size().div_ceil(self.block_size);
 
@@ -824,6 +834,7 @@ impl Txn {
         ino_size.set_size(0, self.fs_config.block_size);
         ino_size.last_change = SystemTime::now();
         self.caches.inode_size.write_cached(ino, Arc::new(ino_size), self.deref()).await?;
+        drop(key_lock);
         Ok(clear_size)
     }
 
@@ -1265,21 +1276,18 @@ impl Txn {
     }
 
     pub async fn unlink(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {
-        match self.clone().get_index(parent, name.clone()).await? {
-            None => Err(FsError::FileNotFound {
-                file: name.to_string(),
-            }),
-            Some(_ino) => {
-                self.clone().remove_index(parent, name.clone()).await?;
-                let parent_dir = self.clone().read_dir(parent).await?;
-                let new_parent_dir: StorageDirectory = parent_dir
-                    .into_iter()
-                    .filter(|item| item.name != *name)
-                    .collect();
-                self.clone().save_dir(parent, &new_parent_dir).await?;
-                Ok(())
-            }
-        }
+        let Some(ino) = self.clone().get_index(parent, name.clone()).await? else {
+            return Err(FsError::FileNotFound { file: name.to_string() });
+        };
+
+        self.clone().remove_index(parent, name.clone()).await?;
+        let parent_dir = self.clone().read_dir(parent).await?;
+        let new_parent_dir: StorageDirectory = parent_dir
+            .into_iter()
+            .filter(|item| item.name != *name)
+            .collect();
+        self.clone().save_dir(parent, &new_parent_dir).await?;
+        Ok(())
     }
 
     pub async fn rmdir(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {

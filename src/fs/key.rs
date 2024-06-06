@@ -21,6 +21,7 @@ pub const ROOT_LOGICAL_INODE: LogicalIno = LogicalIno::from_raw(fuser::FUSE_ROOT
 /// ATTENTION: Order of enums in this struct matters for serialization!
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
 pub enum KeyKind {
+    KeyLockStates,
     FsMetadataStatic,
     FsMetadata,
     InoMetadata,
@@ -36,6 +37,7 @@ pub enum KeyKind {
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
 pub enum InoMetadata {
     Description,
+    LinkCount,
     Size,
     UnixAttributes,
     LockState,
@@ -156,6 +158,25 @@ impl<'ol> KeyParser<'ol> {
             }
         })
     }
+
+    pub fn parse_lock_key(mut self, key_to_lock: &Vec<u8>) -> TiFsResult<Uuid> {
+        if self.kind != KeyKind::KeyLockStates {
+            return Err(FsError::UnknownError(
+                format!("parse_lock_key(): unexpected key_type: {:?}", self.kind)));
+        }
+        let key_to_lock_act = self.i.as_slice().get(0..key_to_lock.len()).unwrap_or(self.i.as_slice());
+        if key_to_lock != key_to_lock_act {
+            return Err(FsError::UnknownError(
+                format!("parse_lock_key(): unexpected key_to_lock_act: {:?}", key_to_lock_act)));
+        }
+        self.i.advance_by(key_to_lock.len());
+        let chunk = self.i.as_slice().array_chunks::<16>().next();
+        let Some(chunk) = chunk else {
+            return Err(FsError::UnknownError(
+                format!("parse_lock_key(): key length too small")));
+        };
+        Ok(Uuid::from_bytes_ref(chunk).clone())
+    }
 }
 
 pub struct KeyParserIno<'ol> {
@@ -182,6 +203,17 @@ impl ScopedKeyBuilder {
     fn write_key_kind(mut self, kk: KeyKind) -> Self {
         self.buf.push(*KEY_KIND_IDS.get_by_right(&kk).unwrap());
         self
+    }
+
+    // final
+    pub fn key_lock_state(
+        self,
+        key: Key,
+        uuid: Uuid) -> KeyBuffer {
+        let mut buf = self.write_key_kind(KeyKind::KeyLockStates).buf;
+        buf.append(&mut Vec::from(key));
+        buf.extend_from_slice(uuid.as_bytes());
+        buf
     }
 
     // final
@@ -220,6 +252,10 @@ impl ScopedKeyBuilder {
     // final
     pub fn inode_atime(self, ino: StorageIno) -> KeyBuffer {
         self.inode_x(ino, InoMetadata::AccessTime).buf
+    }
+
+    pub fn inode_link_count(self, ino: StorageIno) -> KeyBuffer {
+        self.inode_x(ino, InoMetadata::LinkCount).buf
     }
 
     pub fn block(self, addr: BlockAddress) -> KeyBuffer {

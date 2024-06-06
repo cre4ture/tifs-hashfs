@@ -20,3 +20,4 @@ pub mod transaction_client_mux;
 pub mod parsers;
 pub mod fs_config;
 pub mod tikv_fs_trait_impl;
+pub mod szymanskis_critical_section;
