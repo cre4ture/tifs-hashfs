@@ -88,6 +88,9 @@ pub enum FsError {
 
     #[error("db-key not found")]
     KeyNotFound,
+
+    #[error("try lock failed")]
+    TryLockFailed,
 }
 
 pub type Result<T> = std::result::Result<T, FsError>;
@@ -156,5 +159,11 @@ impl From<FsError> for libc::c_int {
             ChecksumMismatch { hash: _, actual_hash: _ } => libc::ERANGE,
             _ => libc::EFAULT,
         }
+    }
+}
+
+impl From<tokio::sync::TryLockError> for FsError {
+    fn from(_value: tokio::sync::TryLockError) -> Self {
+        Self::TryLockFailed
     }
 }

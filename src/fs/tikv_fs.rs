@@ -17,7 +17,7 @@ use moka::future::Cache;
 use tikv_client::Config;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, error, info, instrument, trace};
+use tracing::{debug, error, info, instrument, trace, warn};
 use uuid::Uuid;
 use lazy_static::lazy_static;
 
@@ -236,7 +236,59 @@ impl TiFs {
 
         fs.clone().check_metadata().await?;
 
+        tokio::spawn(Self::heartbeat(fs.weak.clone()));
+
         Ok(fs)
+    }
+
+    async fn heartbeat_check_mut_data(&self) -> TiFsResult<()> {
+        let mut_data = self.mut_data.try_read()?;
+        let caches = mut_data.caches.clone();
+        let active_file_handlers = mut_data.file_handlers.len();
+        let opened_inos = mut_data.opened_ino.len();
+        drop(mut_data);
+        let ino_locks = caches.ino_locks.try_read()?;
+        trace!("ino locks({}): {:?}", ino_locks.len(), ino_locks);
+        trace!("active file handlers, inos: {}, {}", active_file_handlers, opened_inos);
+        Ok(())
+    }
+
+    async fn heartbeat_clean_weak_ptrs(&self) -> TiFsResult<()> {
+        let mut mut_data = self.mut_data.try_write()?;
+        let caches = mut_data.caches.clone();
+        mut_data.opened_ino.retain(|_k,w| {
+            w.upgrade().is_some()
+        });
+        drop(mut_data);
+        let mut ino_locks = caches.ino_locks.try_write()?;
+        ino_locks.retain(|_k,w|{
+            w.upgrade().is_some()
+        });
+        Ok(())
+    }
+
+    #[tracing::instrument]
+    async fn heartbeat(me: Weak<TiFs>) {
+        let mut timer = tokio::time::interval(Duration::from_millis(1000));
+        loop {
+            let Some(strong) = me.upgrade() else {
+                return;
+            };
+            trace!("heartbeat");
+
+            let clean_result = strong.heartbeat_clean_weak_ptrs().await;
+            if let Err(err) = clean_result {
+                trace!("failed cleanup: {err:?}");
+            }
+
+            let result = strong.heartbeat_check_mut_data().await;
+            if let Err(err) = result {
+                trace!("failed check: {err:?}");
+            }
+
+            drop(strong);
+            timer.tick().await;
+        }
     }
 
     async fn check_metadata(self: TiFsArc) -> Result<()> {
