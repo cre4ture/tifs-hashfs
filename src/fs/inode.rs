@@ -33,10 +33,16 @@ pub enum StorageDirItemKind {
     Symlink,
 }
 
+#[derive(Debug, Clone)]
+pub struct DirectoryItem {
+    pub ino: StorageIno,
+    pub name: String,
+    pub typ: StorageDirItemKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageDirItem {
     pub ino: StorageIno,
-    pub name: String,
     pub typ: StorageDirItemKind,
 }
 

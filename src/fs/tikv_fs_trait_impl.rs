@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, key::{PARENT_OF_ROOT_INODE, ROOT_INODE}, reply::InoKind};
 
-use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::StorageDirItemKind, mode::{as_file_kind, as_file_perm}, reply::{get_time, Attr, Create, Data, Dir, Entry, Lock, LogicalIno, Lseek, Open, StatFs, Write, Xattr}, tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable, DIR_PARENT}};
+use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::StorageDirItemKind, mode::{as_file_kind, as_file_perm}, reply::{get_time, Attr, Create, Data, Dir, Entry, Lock, LogicalIno, Lseek, Open, StatFs, Write, Xattr}, tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable}};
 
 
 
@@ -410,7 +410,7 @@ impl AsyncFileSystem for TiFs {
         let p_ino = LogicalIno::from_raw(new_parent);
         Self::check_file_name(&new_name)?;
         let _inode = self
-            .spin_no_delay(format!("link"), move |_, txn| Box::pin(txn.link(l_ino.storage_ino(), p_ino.storage_ino(), new_name.clone())))
+            .spin_no_delay(format!("link"), move |_, txn| Box::pin(txn.add_hard_link(l_ino.storage_ino(), p_ino.storage_ino(), new_name.clone())))
             .await?;
         let (i_desc, i_attr,
              i_size, atime) = self
@@ -443,14 +443,9 @@ impl AsyncFileSystem for TiFs {
             let name = raw_name.clone();
             let new_name = new_raw_name.clone();
             Box::pin(async move {
-                let ino = txn.clone().lookup_ino(p_ino.storage_ino(), name.clone()).await?;
-                txn.clone().link(ino, np_ino.storage_ino(), new_name).await?;
+                let dir_item = txn.clone().lookup_ino(p_ino.storage_ino(), name.clone()).await?;
+                txn.clone().add_hard_link(dir_item.ino, np_ino.storage_ino(), new_name).await?;
                 txn.clone().unlink(p_ino.storage_ino(), name).await?;
-                let inode = txn.clone().read_inode(ino).await?;
-                if inode.typ == StorageDirItemKind::Directory {
-                    txn.clone().unlink(ino, DIR_PARENT).await?;
-                    txn.link(np_ino.storage_ino(), ino, DIR_PARENT).await?;
-                }
                 Ok(())
             })
         })

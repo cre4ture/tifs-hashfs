@@ -1,12 +1,11 @@
 
 use std::sync::Arc;
 
-use anyhow::Ok;
 use strum::{EnumIter, IntoEnumIterator};
 use tikv_client::{BoundRange, Key, KvPair};
 use uuid::Uuid;
 
-use super::{error::TiFsResult, key::ScopedKeyBuilder, transaction::Txn, utils::txn_data_cache::{TxnDelete, TxnPut}};
+use super::{error::TiFsResult, key::ScopedKeyBuilder, transaction::{Txn, TxnArc, MAX_TIKV_SCAN_LIMIT}};
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
 pub enum SzymanskisState {
@@ -18,7 +17,7 @@ pub enum SzymanskisState {
 }
 
 impl SzymanskisState {
-    pub const fn as_u8(&self) -> u8 {
+    pub fn as_u8(&self) -> u8 {
         let iter = SzymanskisState::iter();
         let id_u8 = iter.enumerate().fold(
             0 as u8, |acc,(i,s)| {
@@ -31,7 +30,7 @@ impl SzymanskisState {
         id_u8
     }
 
-    pub const fn from_u8(id_u8: u8) -> SzymanskisState {
+    pub fn from_u8(id_u8: u8) -> SzymanskisState {
         let iter = SzymanskisState::iter();
         let state = iter.enumerate().fold(
             SzymanskisState::S0Noncritical, |acc,(i,s)| {
@@ -46,31 +45,29 @@ impl SzymanskisState {
 }
 
 pub struct SzymanowskiCriticalSection {
-    key_prefix: Vec<u8>,
     key_to_lock: Vec<u8>,
     my_id: Uuid,
     my_state: SzymanskisState,
-    key_for_state_report: Key,
+    key_for_state_report: Vec<u8>,
     key_range: BoundRange,
     entered: bool,
 }
 
 impl SzymanowskiCriticalSection {
-    pub fn new(key_prefix: Vec<u8>, key_to_lock: Key) -> Self {
+    pub fn new(key_prefix: Vec<u8>, key_to_lock: Vec<u8>) -> Self {
         let my_id = uuid::Uuid::new_v4();
         let key_for_state_report = ScopedKeyBuilder::new(&key_prefix)
-            .key_lock_state(key_to_lock.clone(), my_id);
+            .key_lock_state(&key_to_lock, my_id);
         let key_range_start = ScopedKeyBuilder::new(&key_prefix)
-            .key_lock_state(key_to_lock.clone(), Uuid::nil());
+            .key_lock_state(&key_to_lock, Uuid::nil());
         let key_range_end = ScopedKeyBuilder::new(&key_prefix)
-            .key_lock_state(key_to_lock.clone(), Uuid::max());
+            .key_lock_state(&key_to_lock, Uuid::max());
         Self {
-            key_prefix,
-            key_to_lock: Vec::from(key_to_lock),
+            key_to_lock,
             my_id,
             my_state: SzymanskisState::S0Noncritical,
             key_for_state_report,
-            key_range: key_range_start..=key_range_end,
+            key_range: (Key::from(key_range_start)..=Key::from(key_range_end)).into(),
             entered: false,
         }
     }
@@ -82,7 +79,7 @@ impl SzymanowskiCriticalSection {
     pub async fn enter(&mut self, txn: &Txn) -> TiFsResult<()> {
 
         if self.entered {
-            return Ok(())
+            return TiFsResult::Ok(())
         }
 
         use SzymanskisState::*;
@@ -117,6 +114,10 @@ impl SzymanowskiCriticalSection {
         }).await?;
         self.entered = true;
         Ok(())
+    }
+
+    pub async fn leave_arc(mut self, txn: TxnArc) -> TiFsResult<()> {
+        self.leave(&txn).await
     }
 
     pub async fn leave(&mut self, txn: &Txn) -> TiFsResult<()> {
@@ -164,7 +165,7 @@ impl SzymanowskiCriticalSection {
     }
 
     async fn get_current_states_excluding_mine(&mut self, txn: &Txn) -> TiFsResult<Vec<(Uuid, SzymanskisState)>> {
-        let all_states_kv = txn.scan(self.key_range.clone(), 10240).await?;
+        let all_states_kv = txn.scan(self.key_range.clone(), MAX_TIKV_SCAN_LIMIT).await?;
         let all_states = all_states_kv.into_iter().filter_map(
             |KvPair(k,v)| {
                 let key_buffer = Vec::from(k);
@@ -195,20 +196,32 @@ impl CriticalSectionKeyLock {
         let mut cs = SzymanowskiCriticalSection::new(
             txn.fs_config().key_prefix, key_to_lock);
         cs.enter(&txn).await?;
-        Self {
+        TiFsResult::Ok(Self {
             critical_section: Some(cs),
             txn,
+        })
+    }
+
+    /// Call to this function is optional as the Drop trait is implemented.
+    /// Still it makes sense to call it explicitly, as error reporting and
+    /// wait for completion can not be done with Drop trait.
+    pub async fn unlock(mut self) -> TiFsResult<()> {
+        if let Some(mut cs) = self.critical_section.take() {
+            cs.leave(&self.txn).await
+        } else {
+            Ok(())
         }
     }
 }
 
 impl Drop for CriticalSectionKeyLock {
     fn drop(&mut self) {
-        if let Some(cs) = self.critical_section.take() {
-            let txn = self.txn.clone();
-            tokio::spawn((move || {
-                cs.leave(&txn)
-            })());
-        }
+        let moved_self = Self {
+            critical_section: self.critical_section.take(),
+            txn: self.txn.clone(),
+        };
+        tokio::spawn((move || {
+            moved_self.unlock()
+        })());
     }
 }

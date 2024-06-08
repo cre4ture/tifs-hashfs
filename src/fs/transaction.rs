@@ -13,11 +13,12 @@ use num_format::{Buffer, Locale, ToFormattedString};
 use serde::{Deserialize, Serialize};
 use tikv_client::{Backoff, BoundRange, Key, KvPair, RetryOptions, Timestamp, Transaction, TransactionOptions, Value};
 use tokio::sync::RwLock;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, info, instrument, trace};
 use tikv_client::transaction::Mutation;
 use uuid::Uuid;
 
-use crate::fs::inode::{StorageDirItem, StorageDirItemKind, StorageIno};
+use crate::fs::index::deserialize_json;
+use crate::fs::inode::{DirectoryItem, StorageDirItem, StorageDirItemKind, StorageIno};
 use crate::fs::key::BlockAddress;
 use crate::fs::meta::MetaStatic;
 use crate::fs::utils::stop_watch::AutoStopWatch;
@@ -30,16 +31,16 @@ use super::file_handler::FileHandler;
 use super::fs_config::TiFsConfig;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
-use super::index::Index;
+use super::index::serialize_json;
 use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageFileAttr, StorageFilePermission, TiFsHash};
-use super::key::{KeyGenerator, KeyParser, ScopedKeyBuilder, ROOT_INODE};
+use super::key::{read_big_endian, KeyGenerator, KeyParser, ScopedKeyBuilder, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::as_file_perm;
 use super::szymanskis_critical_section::CriticalSectionKeyLock;
 use super::utils::txn_data_cache::{TxnDelete, TxnFetch, TxnPut};
 use super::{parsers, serialize};
 use super::reply::StatFs;
-use super::tikv_fs::{TiFsCaches, DIR_PARENT, DIR_SELF};
+use super::tikv_fs::TiFsCaches;
 use super::transaction_client_mux::TransactionClientMux;
 
 use tikv_client::Result as TiKvResult;
@@ -48,6 +49,7 @@ use tikv_client::Result as TiKvResult;
 pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000, 100);
 pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000);
 pub const PESSIMISTIC_BACKOFF: Backoff = Backoff::no_backoff();
+pub const MAX_TIKV_SCAN_LIMIT: u32 = 10240;
 
 pub fn make_chunks_hash_map<K,V>(input: HashMap<K,V>, max_chunk_size: usize) -> VecDeque<HashMap<K,V>>
 where
@@ -116,7 +118,7 @@ impl Txn {
     }
 
     pub fn fs_config(&self) -> TiFsConfig {
-        self.fs_config
+        self.fs_config.clone()
     }
 
     fn check_space_left(self: TxnArc, meta: &Meta) -> Result<()> {
@@ -499,35 +501,32 @@ impl Txn {
         let ino = dyn_meta.inode_next;
         dyn_meta.inode_next += 1;
 
-        debug!("get ino({})", ino);
         self.save_meta(&dyn_meta).await?;
+        debug!("reserved new ino: {}", ino);
         Ok(StorageIno(ino))
     }
 
     pub async fn check_if_dir_entry_exists(self: Arc<Self>, parent: StorageIno, name: &ByteString) -> Result<bool> {
-        Ok(self.get_index(parent, name.clone()).await?.is_some())
+        Ok(self.get_directory_item(parent, name.clone()).await?.is_some())
     }
 
-    pub async fn connect_inode_to_directory(self: Arc<Self>, parent: StorageIno, name: &ByteString, inode: &InoDescription) -> Result<()> {
+    pub async fn connect_inode_to_directory(
+        self: Arc<Self>,
+        parent: StorageIno,
+        name: &ByteString,
+        inode: &InoDescription
+    ) -> Result<()> {
         if parent >= ROOT_INODE {
             if self.clone().check_if_dir_entry_exists(parent, name).await? {
                 return Err(FsError::FileExist {
                     file: name.to_string(),
                 });
             }
-            self.clone().set_index(parent, name.clone(), inode.storage_ino()).await?;
-
-            let mut dir = self.clone().read_dir(parent).await?;
-            debug!("read dir({:?})", &dir);
-
-            dir.push(StorageDirItem {
-                ino: inode.storage_ino(),
-                name: name.to_string(),
-                typ: inode.typ,
-            });
-
-            self.save_dir(parent, &dir).await?;
-            // TODO: update attributes of directory
+            self.clone().set_directory_child(
+                parent,
+                name.clone(),
+                &StorageDirItem { ino: inode.ino, typ: inode.typ },
+            ).await?;
         }
         Ok(())
     }
@@ -570,26 +569,28 @@ impl Txn {
         Ok((ino_desc, ino_size, ino_attr))
     }
 
-    pub async fn get_index(self: Arc<Self>, parent: StorageIno, name: ByteString) -> Result<Option<StorageIno>> {
-        let key = Key::from(self.key_builder().index(parent, &name));
+    pub async fn get_directory_item(self: Arc<Self>, parent: StorageIno, name: ByteString) -> Result<Option<StorageDirItem>> {
+        let key = Key::from(self.key_builder().directory_child(parent, &name));
+        trace!("get dir item by key: {:?}", key);
         self.clone().get(key)
             .await
             .map_err(FsError::from)
             .and_then(|value| {
                 value
-                    .map(|data| Ok(Index::deserialize(&data)?.storage_ino()))
+                    .map(|data| Ok(deserialize_json::<StorageDirItem>(&data)?))
                     .transpose()
             })
     }
 
-    pub async fn set_index(self: TxnArc, parent: StorageIno, name: ByteString, ino: StorageIno) -> Result<()> {
-        let key = Key::from(self.key_builder().index(parent, &name));
-        let value = Index::new(ino).serialize()?;
+    pub async fn set_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, item: &StorageDirItem) -> Result<()> {
+        let key = Key::from(self.key_builder().directory_child(parent, &name));
+        trace!("set dir item by key: {:?}, name: {:?}, item: {:?}", key, name, item);
+        let value = serialize_json(&item)?;
         Ok(self.clone().put(key, value).await?)
     }
 
-    pub async fn remove_index(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {
-        let key = Key::from(self.key_builder().index(parent, &name));
+    pub async fn remove_directory_child(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {
+        let key = Key::from(self.key_builder().directory_child(parent, &name));
         Ok(self.clone().delete(key).await?)
     }
 
@@ -812,7 +813,7 @@ impl Txn {
 
         let ino_size_key = self.key_builder().inode_size(ino);
         let key_lock = CriticalSectionKeyLock::new(
-            self.clone(), Key::from(ino_size_key)).await?;
+            self.clone(), ino_size_key).await?;
 
         let mut ino_size = self.caches.inode_size.read_uncached(
             &ino, self.deref()).await?.deref().clone();
@@ -834,7 +835,7 @@ impl Txn {
         ino_size.set_size(0, self.fs_config.block_size);
         ino_size.last_change = SystemTime::now();
         self.caches.inode_size.write_cached(ino, Arc::new(ino_size), self.deref()).await?;
-        drop(key_lock);
+        key_lock.unlock().await?;
         Ok(clear_size)
     }
 
@@ -906,11 +907,10 @@ impl Txn {
     pub async fn hb_get_block_hash_list_by_block_range_chunked(self: TxnArc, ino: StorageIno, block_range: Range<u64>
     ) -> Result<HashMap<BlockAddress, TiFsHash>> {
         let mut i = block_range.start;
-        let max_chunk_size = 10240;
         let mut result = HashMap::with_capacity(block_range.clone().count());
         while i < block_range.end {
             let chunk_start = i;
-            let chunk_end = (chunk_start+max_chunk_size).min(block_range.end);
+            let chunk_end = (chunk_start+MAX_TIKV_SCAN_LIMIT as u64).min(block_range.end);
             i = chunk_end;
 
             let chunk = self.clone().hb_get_block_hash_list_by_block_range(ino, chunk_start..chunk_end).await?;
@@ -1248,74 +1248,80 @@ impl Txn {
         self.read_inline_data(&ino_size, 0, size).await
     }
 
-    pub async fn link(self: TxnArc, ino: StorageIno, new_parent: StorageIno, new_name: ByteString
+    pub async fn add_hard_link(self: TxnArc, ino: StorageIno, further_parent: StorageIno, new_name: ByteString
     ) -> Result<Arc<InoDescription>> {
         // check and remove any inode at destination:
-        if let Some(old_ino) = self.clone().get_index(new_parent, new_name.clone()).await? {
-            let ino_desc = self.clone().read_inode(old_ino).await?;
-            match ino_desc.typ {
-                StorageDirItemKind::Directory => self.clone().rmdir(new_parent, new_name.clone()).await?,
-                _ => self.clone().unlink(new_parent, new_name.clone()).await?,
+        if let Some(old_dir_item) = self.clone().get_directory_item(further_parent, new_name.clone()).await? {
+            match old_dir_item.typ {
+                StorageDirItemKind::Directory => self.clone().rmdir(further_parent, new_name.clone()).await?,
+                _ => self.clone().unlink(further_parent, new_name.clone()).await?,
             }
         }
 
-        // attach existing ino to a new directory with a new name:
-        self.clone().set_index(new_parent, new_name.clone(), ino).await?;
-
         let inode = self.clone().read_inode(ino).await?.deref().clone();
-        let mut dir = self.clone().read_dir(new_parent).await?;
+        // attach existing ino to a further directory with a new name:
+        self.clone().set_directory_child(
+            further_parent,
+            new_name.clone(),
+            &StorageDirItem { ino, typ: inode.typ }).await?;
 
-        dir.push(StorageDirItem {
-            ino,
-            name: new_name.to_string(),
-            typ: inode.typ,
-        });
-
-        self.clone().save_dir(new_parent, &dir).await?;
         Ok(Arc::new(inode))
     }
 
     pub async fn unlink(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {
-        let Some(ino) = self.clone().get_index(parent, name.clone()).await? else {
+        let Some(dir_entry) = self.clone().get_directory_item(parent, name.clone()).await? else {
             return Err(FsError::FileNotFound { file: name.to_string() });
         };
 
-        self.clone().remove_index(parent, name.clone()).await?;
-        let parent_dir = self.clone().read_dir(parent).await?;
-        let new_parent_dir: StorageDirectory = parent_dir
-            .into_iter()
-            .filter(|item| item.name != *name)
-            .collect();
-        self.clone().save_dir(parent, &new_parent_dir).await?;
+        self.clone().remove_directory_child(parent, name.clone()).await?;
+
+        {
+            let key = self.key_builder().inode_link_count(dir_entry.ino);
+            let key_lock = CriticalSectionKeyLock::new(
+                self.clone(), key.clone()).await?;
+
+            if let Some(v) = self.clone().get(key.clone()).await? {
+                let mut i = v.iter();
+                let mut current_count = read_big_endian::<8, u64>(&mut i)?;
+                if current_count > 0 {
+                    current_count -= 1;
+                } else {
+                    info!("unlink(): found existing, previously linked inode with zero link count");
+                }
+                self.put(key, current_count.to_be_bytes().to_vec()).await?;
+            }
+
+            key_lock.unlock().await?;
+        }
+
         Ok(())
     }
 
     pub async fn rmdir(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {
-        match self.clone().get_index(parent, name.clone()).await? {
+        match self.clone().get_directory_item(parent, name.clone()).await? {
             None => Err(FsError::FileNotFound {
                 file: name.to_string(),
             }),
-            Some(ino) => {
-                if self.clone()
-                    .read_dir(ino)
-                    .await?
-                    .iter()
-                    .any(|i| DIR_SELF != i.name && DIR_PARENT != i.name)
-                {
-                    let name_str = name.to_string();
-                    debug!("dir({}) not empty", &name_str);
-                    return Err(FsError::DirNotEmpty { dir: name_str });
-                }
+            Some(dir_item) => match dir_item.typ {
+                StorageDirItemKind::Directory => {
+                    if !self.clone()
+                        .read_dir(dir_item.ino)
+                        .await?.is_empty()
+                    {
+                        let name_str = name.to_string();
+                        debug!("dir({}) not empty", &name_str);
+                        return Err(FsError::DirNotEmpty { dir: name_str });
+                    }
 
-                self.clone().unlink(ino, DIR_SELF).await?;
-                self.clone().unlink(ino, DIR_PARENT).await?;
-                self.clone().unlink(parent, name).await
+                    self.clone().unlink(parent, name).await
+                }
+                _ => Err(FsError::WrongFileType),
             }
         }
     }
 
-    pub async fn lookup_ino(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<StorageIno> {
-        self.get_index(parent, name.clone())
+    pub async fn lookup_ino(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<StorageDirItem> {
+        self.get_directory_item(parent, name.clone())
             .await?
             .ok_or_else(|| FsError::FileNotFound {
                 file: name.to_string(),
@@ -1429,41 +1435,32 @@ impl Txn {
         let (ino_desc, ino_size, ino_attr)
             = self.clone().make_inode(parent, name, StorageDirItemKind::Directory,
                 perm, gid, uid, 0, None).await?;
-        self.clone().save_dir(ino_desc.ino, &StorageDirectory::new()).await?;
-        /*
-        self.clone().link(inode.storage_ino(), inode.storage_ino(), DIR_SELF).await?;
-        if parent >= ROOT_INODE {
-            self.clone().link(parent, inode.storage_ino(), DIR_PARENT).await?;
-        }
-        */
         Ok((ino_desc, ino_size, ino_attr))
     }
 
     pub async fn read_dir(self: Arc<Self>, ino: StorageIno) -> Result<StorageDirectory> {
-        let key = Key::from(self.key_builder().block(BlockAddress { ino, index: 0 }));
-        let data = self.clone()
-            .get(key)
-            .await?
-            .ok_or(FsError::BlockNotFound {
-                inode: ino,
-                block: 0,
-            })?;
-        trace!("read dir data: {}", String::from_utf8_lossy(&data));
-        super::dir::decode(&data)
-    }
-
-    pub async fn save_dir(self: TxnArc, ino: StorageIno, dir: &[StorageDirItem]
-    ) -> Result<()> {
-        let data = super::dir::encode(dir)?;
-        let mut inode = self.caches.inode_size.read_cached(
-            &ino, self.deref()).await?.deref().clone();
-        inode.set_size(data.len() as u64, self.block_size);
-        inode.last_change = SystemTime::now();
-        let ptr = Arc::new(inode);
-        self.caches.inode_size.write_cached(ino, ptr, self.deref()).await?;
-        let key = Key::from(self.key_builder().block(BlockAddress{ino, index: 0}));
-        self.clone().put(key, data).await?;
-        Ok(())
+        let range = self.key_builder().directory_child_range(ino);
+        trace!("start scan: {:?}", range);
+        let data = self.clone().scan(range, 10).await?;
+        trace!("scan result size: {:?}", data.len());
+        let mut result = StorageDirectory::with_capacity(data.len());
+        data.iter().enumerate().map(|(i, KvPair(k,v))|{
+            trace!("scan result key #{i}: {:?}, data-len: {}", k, v.len());
+        }).fold((), |_,_|{});
+        for (i, KvPair(k,v)) in data.into_iter().enumerate() {
+            let key_buf = Vec::from(k);
+            trace!("process scan result key #{i}: {:?}", key_buf);
+            let mut i = key_buf.iter();
+            let (_p_ino, name) = self.key_parser(&mut i)?.parse_directory_child()?;
+            let item = deserialize_json::<StorageDirItem>(&v)?;
+            result.push(DirectoryItem {
+                ino: item.ino,
+                name: String::from_utf8_lossy(&name).to_string(),
+                typ: item.typ,
+            });
+        }
+        trace!("read dir data: len: {}", result.len());
+        Ok(result)
     }
 
     pub async fn statfs(self: TxnArc) -> Result<StatFs> {

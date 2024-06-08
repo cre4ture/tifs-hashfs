@@ -4,7 +4,7 @@ use bimap::BiHashMap;
 use lazy_static::lazy_static;
 use num_traits::FromBytes;
 use std::slice::Iter;
-use tikv_client::Key;
+use tikv_client::{BoundRange, Key};
 use uuid::Uuid;
 use strum::{EnumIter, IntoEnumIterator};
 
@@ -25,12 +25,25 @@ pub enum KeyKind {
     FsMetadataStatic,
     FsMetadata,
     InoMetadata,
-    Block, // { ino: u64, block: u64 },
-    FileIndex, // { parent: u64, name: &'static str },
+    Block, // { ino: u64, block: u64 } => { data: Vec<u8> }
+    DirectoryChild, // { parent: u64, name: &'static str } => { ino: u64 }
+    ParentLink, // { ino: u64, parent_ino: u64 } => None
     HashedBlock, // { hash: &[u8] },
-    BlockHash, // { ino: u64, block: u64 },
-    HashedBlockExists, // { hash: &[u8] },
+    BlockHash, // { ino: u64, block: u64 } => { hash: &[u8] }
+    HashedBlockExists, // { hash: &[u8] } => None
     //HashedBlockUsedBy { hash: &'a[u8], ino: u64, block: u64 },
+}
+
+pub mod key_structs {
+    use struct_iterable::Iterable;
+
+    use crate::fs::inode::StorageIno;
+
+    #[derive(Iterable)]
+    pub struct ParentLink {
+        pub ino: StorageIno,
+        pub parent_ino: StorageIno,
+    }
 }
 
 /// ATTENTION: Order of enums in this struct matters for serialization!
@@ -77,13 +90,39 @@ pub fn write_big_endian<T>(value: u64, buf: &mut KeyBuffer) {
     buf.extend_from_slice(&value.to_be_bytes());
 }
 
-impl BlockAddress {
-    pub fn deserialize_from(i: &mut Iter<u8>) -> TiFsResult<Self> {
+pub trait KeyDeSer {
+    fn deserialize_from(i: &mut Iter<u8>) -> TiFsResult<Self> where Self: Sized;
+    fn deserialize_self_from(&mut self, i: &mut Iter<u8>) -> TiFsResult<()> where Self: Sized {
+        Self::deserialize_from(i).map(|x| { *self = x; })
+    }
+    fn serialize_to(self, buf: &mut KeyBuffer);
+}
+
+impl KeyDeSer for StorageIno {
+    fn deserialize_from(i: &mut Iter<u8>) -> TiFsResult<Self> {
+        read_big_endian(i).map(|x| StorageIno(x) )
+    }
+
+    fn deserialize_self_from(&mut self, i: &mut Iter<u8>) -> TiFsResult<()> {
+        read_big_endian(i).map(|x| { *self = StorageIno(x); } )
+    }
+
+    fn serialize_to(self, buf: &mut KeyBuffer) {
+        write_big_endian::<u64>(self.0, buf)
+    }
+}
+
+
+impl KeyDeSer for BlockAddress {
+    fn deserialize_from(i: &mut Iter<u8>) -> TiFsResult<Self> {
         let ino = StorageIno(read_big_endian::<8, u64>(i)?);
         let index = read_big_endian::<8, u64>(i)?;
         Ok(Self { ino, index })
     }
-    pub fn serialize_to(self, buf: &mut KeyBuffer) {
+    fn deserialize_self_from(&mut self, i: &mut Iter<u8>) -> TiFsResult<()> {
+        Self::deserialize_from(i).map(|x|{ *self = x; })
+    }
+    fn serialize_to(self, buf: &mut KeyBuffer) {
         buf.extend_from_slice(&self.ino.0.to_be_bytes());
         buf.extend_from_slice(&self.index.to_be_bytes());
     }
@@ -113,6 +152,17 @@ impl<'ol> KeyParser<'ol> {
             kind,
         })
     }
+/*
+    pub fn parse_t<T: struct_iterable::Iterable + Default>(mut self) -> TiFsResult<(T, Self)> {
+        let mut output = T::default();
+        for (field_name, field_value) in output.iter() {
+            if let Some(de_ser) = field_value.downcast_mut::<dyn KeyDeSer>() {
+                de_ser.deserialize_from(&mut self.i);
+            }
+        }
+        Ok((output, self))
+    }
+    */
 
     pub fn parse_ino<'fl>(mut self) -> TiFsResult<KeyParserIno<'ol>> {
         if self.kind != KeyKind::InoMetadata {
@@ -159,7 +209,7 @@ impl<'ol> KeyParser<'ol> {
         })
     }
 
-    pub fn parse_lock_key(mut self, key_to_lock: &Vec<u8>) -> TiFsResult<Uuid> {
+    pub fn parse_lock_key(self, key_to_lock: &Vec<u8>) -> TiFsResult<Uuid> {
         if self.kind != KeyKind::KeyLockStates {
             return Err(FsError::UnknownError(
                 format!("parse_lock_key(): unexpected key_type: {:?}", self.kind)));
@@ -169,13 +219,23 @@ impl<'ol> KeyParser<'ol> {
             return Err(FsError::UnknownError(
                 format!("parse_lock_key(): unexpected key_to_lock_act: {:?}", key_to_lock_act)));
         }
-        self.i.advance_by(key_to_lock.len());
+        self.i.advance_by(key_to_lock.len()).unwrap();
         let chunk = self.i.as_slice().array_chunks::<16>().next();
         let Some(chunk) = chunk else {
             return Err(FsError::UnknownError(
                 format!("parse_lock_key(): key length too small")));
         };
         Ok(Uuid::from_bytes_ref(chunk).clone())
+    }
+
+    pub fn parse_directory_child(mut self) -> TiFsResult<(StorageIno, Vec<u8>)> {
+        if self.kind != KeyKind::DirectoryChild {
+            return Err(FsError::UnknownError(
+                format!("parse_lock_key(): unexpected key_type: {:?}", self.kind)));
+        }
+        let dir_ino = StorageIno::deserialize_from(&mut self.i)?;
+        let child_name = self.i.as_slice().to_vec();
+        Ok((dir_ino, child_name))
     }
 }
 
@@ -208,13 +268,28 @@ impl ScopedKeyBuilder {
     // final
     pub fn key_lock_state(
         self,
-        key: Key,
+        key: &[u8],
         uuid: Uuid) -> KeyBuffer {
         let mut buf = self.write_key_kind(KeyKind::KeyLockStates).buf;
-        buf.append(&mut Vec::from(key));
+        buf.extend_from_slice(key);
         buf.extend_from_slice(uuid.as_bytes());
         buf
     }
+
+    fn write_key_de_ser<T: KeyDeSer>(mut self, input: T) -> Self {
+        input.serialize_to(&mut self.buf);
+        self
+    }
+/*
+    fn write_struct_t<T: struct_iterable::Iterable>(mut self, input: T) -> Self {
+        for (field_name, field_value) in input.iter() {
+            if let Some(de_ser) = field_value.downcast_ref::<dyn KeyDeSer>() {
+                de_ser.serialize_to(&mut self.buf);
+            }
+        }
+        self
+    }
+    */
 
     // final
     pub fn meta_static(self) -> KeyBuffer {
@@ -292,12 +367,25 @@ impl ScopedKeyBuilder {
         self.inode_description(ROOT_INODE)
     }
 
-    pub fn index(self, parent: StorageIno, name: &str) -> KeyBuffer {
-        let mut me = self.write_key_kind(KeyKind::FileIndex);
+    pub fn directory_child(self, parent: StorageIno, name: &str) -> KeyBuffer {
+        let mut me = self.write_key_kind(KeyKind::DirectoryChild);
         write_big_endian::<u64>(parent.0, &mut me.buf);
         me.buf.extend_from_slice(name.as_bytes());
         me.buf
     }
+
+    pub fn directory_child_range(self, dir_ino: StorageIno) -> BoundRange {
+        let start_key = self.clone().write_key_kind(KeyKind::DirectoryChild)
+            .write_key_de_ser(dir_ino).buf;
+        let end_key = self.write_key_kind(KeyKind::DirectoryChild)
+            .write_key_de_ser(StorageIno(dir_ino.0+1)).buf;
+        let range = BoundRange {
+            from: std::ops::Bound::Included(Key::from(start_key)),
+            to: std::ops::Bound::Excluded(Key::from(end_key)),
+        };
+        range
+    }
+
 
     pub fn block_range(self, ino: StorageIno, block_range: Range<u64>) -> Range<Key> {
         debug_assert_ne!(0, ino.0);

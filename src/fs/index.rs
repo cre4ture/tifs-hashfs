@@ -1,36 +1,20 @@
-use serde::{Deserialize, Serialize};
+use std::any::type_name;
 
-use super::error::{FsError, Result};
-use super::inode::StorageIno;
-use super::serialize::{deserialize, serialize, ENCODING};
 
-#[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, Deserialize, Serialize)]
-pub struct Index {
-    pub ino: u64,
+use super::error::{FsError, Result, TiFsResult};
+
+pub fn deserialize_json<T: for<'sl> serde::Deserialize<'sl>>(bytes: &[u8]) -> TiFsResult<T> {
+    serde_json::from_slice::<T>(bytes).map_err(|err| FsError::Serialize {
+        target: type_name::<T>(),
+        typ: "JSON",
+        msg: err.to_string(),
+    })
 }
 
-impl Index {
-    pub fn storage_ino(&self) -> StorageIno {
-        StorageIno(self.ino)
-    }
-
-    pub const fn new(ino: StorageIno) -> Self {
-        Self { ino: ino.0 }
-    }
-
-    pub fn serialize(&self) -> Result<Vec<u8>> {
-        serialize(self).map_err(|err| FsError::Serialize {
-            target: "index",
-            typ: ENCODING,
-            msg: err.to_string(),
-        })
-    }
-
-    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
-        deserialize(bytes).map_err(|err| FsError::Serialize {
-            target: "index",
-            typ: ENCODING,
-            msg: err.to_string(),
-        })
-    }
+pub fn serialize_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|err| FsError::Serialize {
+        target: type_name::<T>(),
+        typ: "JSON",
+        msg: err.to_string(),
+    })
 }

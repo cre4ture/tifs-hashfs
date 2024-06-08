@@ -21,20 +21,18 @@ use tracing::{debug, error, info, instrument, trace};
 use uuid::Uuid;
 use lazy_static::lazy_static;
 
+use crate::fs::inode::DirectoryItem;
 use crate::fs::reply::{DirItem, InoKind};
 use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
-use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageDirItem, StorageDirItemKind, StorageFileAttr, StorageIno, TiFsHash};
+use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageDirItemKind, StorageFileAttr, StorageIno, TiFsHash};
 use super::reply::{
     Data, Directory, LogicalIno
 };
 use super::transaction::{Txn, TxnArc};
 use super::transaction_client_mux::TransactionClientMux;
 use super::utils::txn_data_cache::TxnDataCache;
-
-pub const DIR_SELF: ByteString = ByteString::from_static(".");
-pub const DIR_PARENT: ByteString = ByteString::from_static("..");
 
 pub type TiFsBlockCache = Cache<TiFsHash, Arc<Vec<u8>>>;
 pub type TiFsInodeCache = Cache<StorageIno, (Instant, Arc<InoDescription>)>;
@@ -486,8 +484,8 @@ impl TiFs {
             move |_, txn| {
                 let name = name.clone();
                 Box::pin(async move {
-                    let ino = txn.clone().lookup_ino(parent, name.clone()).await?;
-                    txn.clone().get_all_ino_data(ino).await
+                    let dir_item = txn.clone().lookup_ino(parent, name.clone()).await?;
+                    txn.clone().get_all_ino_data(dir_item.ino).await
                 })
             }).await?;
         let stat = self.map_storage_attr_to_fuser(
@@ -506,8 +504,8 @@ impl TiFs {
             move |_, txn| {
                 let name = name.clone();
                 Box::pin(async move {
-                    let ino = txn.clone().lookup_ino(parent, name.clone()).await?;
-                    txn.clone().get_all_ino_data(ino).await
+                    let item = txn.clone().lookup_ino(parent, name.clone()).await?;
+                    txn.clone().get_all_ino_data(item.ino).await
                 })
             }).await?;
         let stat = self.map_storage_attr_to_fuser(
@@ -536,7 +534,7 @@ impl TiFs {
             .await?;
 
         let mut dir_complete = Vec::with_capacity(dir.len() * 3);
-        for StorageDirItem{ino, name, typ} in dir.into_iter() {
+        for DirectoryItem{ino, name, typ} in dir.into_iter() {
             if typ == StorageDirItemKind::File {
                 let full_hash_entry = DirItem {
                     ino: LogicalIno{
