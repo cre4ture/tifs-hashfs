@@ -27,7 +27,13 @@ impl AsyncFileSystem for TiFs {
         config
             .add_capabilities(fuser::consts::FUSE_FLOCK_LOCKS)
             .expect("kernel config failed to add cap_fuse FUSE_CAP_FLOCK_LOCKS");
-        if let Err(next_working) = config.set_max_readahead(self.fs_config.block_size as u32 * 6) {
+        config.add_capabilities(fuser::consts::FUSE_BIG_WRITES)
+            .expect("kernel config failed to add cap_fuse FUSE_BIG_WRITES");
+        config.add_capabilities(fuser::consts::FUSE_PARALLEL_DIROPS)
+            .expect("kernel config failed to add cap_fuse FUSE_PARALLEL_DIROPS");
+        let _ = config.set_max_write(self.fs_config.block_size as u32 * 128);
+
+        if let Err(next_working) = config.set_max_readahead(self.fs_config.block_size as u32 * 100) {
             tracing::info!("max_readahead value adaped to nearest: {next_working}");
             config.set_max_readahead(next_working).map_err(|err|{
                 tracing::warn!("setting of max_readahead failed with error: {err:?}");

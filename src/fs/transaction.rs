@@ -10,8 +10,7 @@ use fuser::TimeOrNow;
 use futures::TryFutureExt;
 use multimap::MultiMap;
 use num_format::{Buffer, Locale, ToFormattedString};
-use serde::{Deserialize, Serialize};
-use tikv_client::{Backoff, BoundRange, Key, KvPair, RetryOptions, Timestamp, Transaction, TransactionOptions, Value};
+use tikv_client::{Backoff, Key, KvPair, RetryOptions, TransactionOptions};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, trace};
 use tikv_client::transaction::Mutation;
@@ -28,22 +27,21 @@ use super::block::empty_block;
 use super::dir::StorageDirectory;
 use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
+use super::flexible_transaction::FlexibleTransaction;
 use super::fs_config::TiFsConfig;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::index::serialize_json;
 use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageFileAttr, StorageFilePermission, TiFsHash};
-use super::key::{read_big_endian, KeyGenerator, KeyParser, ScopedKeyBuilder, ROOT_INODE};
+use super::key::{read_big_endian, KeyParser, ScopedKeyBuilder, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::as_file_perm;
 use super::szymanskis_critical_section::CriticalSectionKeyLock;
-use super::utils::txn_data_cache::{TxnDelete, TxnFetch, TxnPut};
-use super::{parsers, serialize};
+use super::parsers;
 use super::reply::StatFs;
 use super::tikv_fs::TiFsCaches;
 use super::transaction_client_mux::TransactionClientMux;
 
-use tikv_client::Result as TiKvResult;
 
 
 pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000, 100);
@@ -96,10 +94,7 @@ fn set_if_changed<T: std::cmp::PartialEq>(
 pub struct Txn {
     pub weak: Weak<Self>,
     _instance_id: Uuid,
-    txn_client_mux: Arc<TransactionClientMux>,
-    txn: Option<RwLock<Transaction>>,
-    raw: Arc<tikv_client::RawClient>,
-    raw_txn: Option<TxnArc>,
+    pub f_txn: FlexibleTransaction,
     fs_config: TiFsConfig,
     block_size: u64,            // duplicate of fs_config.block_size. Keep it to avoid refactoring efforts.
     max_name_len: u32,
@@ -130,18 +125,6 @@ impl Txn {
         }
     }
 
-    pub async fn begin_optimistic_small(
-        client: Arc<TransactionClientMux>,
-    ) -> Result<Transaction> {
-        let options = TransactionOptions::new_optimistic().use_async_commit();
-        let options = options.retry_options(RetryOptions {
-            region_backoff: DEFAULT_REGION_BACKOFF,
-            lock_backoff: OPTIMISTIC_BACKOFF,
-        });
-        let txn = client.give_one().begin_with_options(options).await?;
-        Ok(txn)
-    }
-
     pub async fn begin_optimistic(
         instance_id: Uuid,
         client: Arc<TransactionClientMux>,
@@ -161,10 +144,7 @@ impl Txn {
         Ok(TxnArc::new_cyclic(|weak| { Self {
                 weak: weak.clone(),
                 _instance_id: instance_id,
-                txn_client_mux: client.clone(),
-                txn,
-                raw: raw.clone(),
-                raw_txn: Some(Txn::pure_raw(instance_id, client.clone(), raw, fs_config, caches.clone(), max_name_len)),
+                f_txn: FlexibleTransaction::new_txn(client, txn, raw, fs_config.clone()),
                 fs_config: fs_config.clone(),
                 block_size: fs_config.block_size,
                 max_name_len,
@@ -184,10 +164,8 @@ impl Txn {
         Arc::new_cyclic(|weak| Txn {
             weak: weak.clone(),
             _instance_id: instance_id,
-            txn_client_mux: client.clone(),
-            txn: None,
-            raw,
-            raw_txn: None,
+            f_txn: FlexibleTransaction::new_pure_raw(
+                client, raw, fs_config.clone()),
             fs_config: fs_config.clone(),
             block_size: fs_config.block_size,
             max_name_len,
@@ -195,205 +173,12 @@ impl Txn {
         })
     }
 
-    pub async fn mini_txn(&self) -> TiFsResult<Transaction> {
-        let transaction = Txn::begin_optimistic_small(
-            self.txn_client_mux.clone()).await?;
-        Ok(transaction)
-    }
-
-    pub async fn get(self: TxnArc, key: impl Into<Key>) -> TiFsResult<Option<Value>> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.get(key).await?)
-        } else {
-            if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.get(key).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
-            } else {
-                Ok(self.raw.get(key).await?)
-            }
-        }
-    }
-
-    pub async fn batch_get(
-        &self,
-        keys: impl IntoIterator<Item = impl Into<Key>>,
-    ) -> TiFsResult<Vec<KvPair>> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.batch_get(keys).await
-                .map(|iter|iter.collect::<Vec<_>>())?)
-        } else {
-            if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.batch_get(keys).await
-                    .map(|iter|iter.collect::<Vec<_>>())?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
-            } else {
-                Ok(self.raw.batch_get(keys).await?)
-            }
-        }
-    }
-
-    pub async fn put(self: TxnArc, key: impl Into<Key>, value: impl Into<Value>) -> TiFsResult<()> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.put(key, value).await?)
-        } else {
-            if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.put(key, value).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
-            } else {
-                Ok(self.raw.put(key, value).await?)
-            }
-        }
-    }
-
-    pub async fn batch_put(self: TxnArc, pairs: Vec<KvPair>) -> TiFsResult<()> {
-        if let Some(txn) = &self.txn {
-            let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
-            Ok(txn.write().await.batch_mutate(mutations).await?)
-        } else {
-            if self.fs_config.small_transactions {
-                let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
-                let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.batch_mutate(mutations).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
-            } else {
-                Ok(self.raw.batch_put(pairs).await?)
-            }
-        }
-    }
-
-    pub async fn delete(self: TxnArc, key: impl Into<Key>) -> TiFsResult<()> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.delete(key).await?)
-        } else {
-            if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.delete(key).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
-            } else {
-                Ok(self.raw.delete(key).await?)
-            }
-        }
-    }
-
-    pub async fn batch_mutate(self: TxnArc, mutations: impl IntoIterator<Item = Mutation>) -> TiFsResult<()> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.batch_mutate(mutations).await?)
-        } else {
-            if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.batch_mutate(mutations).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
-            } else {
-                let mut deletes = Vec::new();
-                let mut put_pairs = Vec::new();
-                for entry in mutations.into_iter() {
-                    match entry {
-                        Mutation::Delete(key) => deletes.push(key),
-                        Mutation::Put(key, value) => {
-                            put_pairs.push(KvPair(key, value));
-                        }
-                    }
-                };
-                if put_pairs.len() > 0 {
-                    self.raw.batch_put(put_pairs).await?;
-                }
-                if deletes.len() > 0 {
-                    self.raw.batch_delete(deletes).await?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    pub async fn scan(
-        &self,
-        range: impl Into<BoundRange>,
-        limit: u32,
-    ) -> TiFsResult<Vec<KvPair>> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.scan(range, limit).await
-                .map(|iter|iter.collect::<Vec<KvPair>>())?)
-        } else {
-            if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.scan(range, limit).await?
-                    .collect::<Vec<KvPair>>());
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
-            } else {
-                Ok(self.raw.scan(range, limit).await?)
-            }
-        }
-    }
-
-    pub async fn scan_keys(
-        &self,
-        range: impl Into<BoundRange>,
-        limit: u32,
-    ) -> TiFsResult<Vec<Key>> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.scan_keys(range, limit).await
-                .map(|iter|iter.collect::<Vec<_>>())?)
-        } else {
-            if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.scan_keys(range, limit).await?
-                    .collect::<Vec<Key>>());
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
-            } else {
-                Ok(self.raw.scan_keys(range, limit).await?)
-            }
-        }
-    }
-
-    pub async fn commit(&self) -> TiKvResult<Option<Timestamp>> {
-        if let Some(txn) = &self.txn {
-            txn.write().await.commit().await
-        } else {
-            Ok(Some(Timestamp::default()))
-        }
-    }
-
-    pub async fn rollback(&self) -> TiKvResult<()> {
-        if let Some(txn) = &self.txn {
-            txn.write().await.rollback().await
-        } else {
-            Ok(())
-        }
-    }
-
     pub async fn open(self: Arc<Self>, ino: StorageIno, use_id: Uuid) -> Result<()> {
         // check for existence
         let _inode = self.clone().read_inode(ino).await?;
         // publish opened state
         let key = Key::from(self.key_builder().opened_inode(ino, use_id));
-        self.clone().put(key, &[]).await?;
+        self.f_txn.put(key, &[]).await?;
         eprintln!("open-ino: {ino}, use_id: {use_id}");
         Ok(())
     }
@@ -403,7 +188,7 @@ impl Txn {
         let _inode = self.clone().read_inode(ino).await?;
         // de-publish opened state
         let key = Key::from(self.key_builder().opened_inode(ino, use_id));
-        self.clone().delete(key).await?;
+        self.f_txn.delete(key).await?;
         eprintln!("close-ino: {ino}, use_id: {use_id}");
         Ok(())
     }
@@ -417,7 +202,7 @@ impl Txn {
         let size = size.clamp(0, remaining);
 
         let mut result = Vec::with_capacity(hash_size as usize);
-        let mut ino_size_arc = self.caches.inode_size.read_cached(&ino, self.deref()).await?;
+        let mut ino_size_arc = self.caches.inode_size.read_cached(&ino, &self.f_txn).await?;
         while ino_size_arc.data_hash.is_none() {
             let change_iteration = ino_size_arc.change_iteration;
             let size_in_blocks = ino_size_arc.size().div_ceil(self.fs_config.block_size);
@@ -426,13 +211,13 @@ impl Txn {
             trace!("freshly_calculated_hash: {full_data_hash:x?}");
 
             let lock = self.caches.get_or_create_ino_lock(ino).await;
-            ino_size_arc = self.caches.inode_size.read_cached(&ino, self.deref()).await?;
+            ino_size_arc = self.caches.inode_size.read_cached(&ino, &self.f_txn).await?;
             // was data changed in the meantime?
             if ino_size_arc.change_iteration == change_iteration {
                 let mut ino_data_mut = ino_size_arc.deref().clone();
                 ino_data_mut.data_hash = Some(full_data_hash);
                 ino_size_arc = Arc::new(ino_data_mut);
-                self.caches.inode_size.write_cached(ino, ino_size_arc.clone(), self.deref()).await?;
+                self.caches.inode_size.write_cached(ino, ino_size_arc.clone(), &self.f_txn).await?;
             }
             drop(lock);
         }
@@ -488,7 +273,7 @@ impl Txn {
                 hash_algorithm: self.fs_config.hash_algorithm.to_string(),
             };
             let static_key = Key::from(self.key_builder().meta_static());
-            self.clone().put(static_key, meta_static.serialize()?).await?;
+            self.f_txn.put(static_key, meta_static.serialize()?).await?;
 
             Meta {
                 inode_next: ROOT_INODE.0,
@@ -561,9 +346,9 @@ impl Txn {
             last_change: SystemTime::now(),
         });
 
-        self.caches.inode_desc.write_cached(ino, ino_desc.clone(), self.deref()).await?;
-        self.caches.inode_size.write_cached(ino, ino_size.clone(), self.deref()).await?;
-        self.caches.inode_attr.write_cached(ino, ino_attr.clone(), self.deref()).await?;
+        self.caches.inode_desc.write_cached(ino, ino_desc.clone(), &self.f_txn).await?;
+        self.caches.inode_size.write_cached(ino, ino_size.clone(), &self.f_txn).await?;
+        self.caches.inode_attr.write_cached(ino, ino_attr.clone(), &self.f_txn).await?;
         self.clone().connect_inode_to_directory(parent, &name, &ino_desc).await?;
 
         Ok((ino_desc, ino_size, ino_attr))
@@ -572,7 +357,7 @@ impl Txn {
     pub async fn get_directory_item(self: Arc<Self>, parent: StorageIno, name: ByteString) -> Result<Option<StorageDirItem>> {
         let key = Key::from(self.key_builder().directory_child(parent, &name));
         trace!("get dir item by key: {:?}", key);
-        self.clone().get(key)
+        self.f_txn.get(key)
             .await
             .map_err(FsError::from)
             .and_then(|value| {
@@ -586,33 +371,33 @@ impl Txn {
         let key = Key::from(self.key_builder().directory_child(parent, &name));
         trace!("set dir item by key: {:?}, name: {:?}, item: {:?}", key, name, item);
         let value = serialize_json(&item)?;
-        Ok(self.clone().put(key, value).await?)
+        Ok(self.f_txn.put(key, value).await?)
     }
 
     pub async fn remove_directory_child(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {
         let key = Key::from(self.key_builder().directory_child(parent, &name));
-        Ok(self.clone().delete(key).await?)
+        Ok(self.f_txn.delete(key).await?)
     }
 
     pub async fn read_inode_uncached(self: TxnArc, ino: StorageIno) -> Result<Arc<InoDescription>> {
-        self.caches.inode_desc.read_uncached(&ino, self.deref()).await
+        self.caches.inode_desc.read_uncached(&ino, &self.f_txn).await
     }
 
     pub async fn read_inode(self: TxnArc, ino: StorageIno) -> Result<Arc<InoDescription>> {
-        self.caches.inode_desc.read_cached(&ino, self.deref()).await
+        self.caches.inode_desc.read_cached(&ino, &self.f_txn).await
     }
 
     pub async fn read_ino_size(self: TxnArc, ino: StorageIno) -> Result<Arc<InoSize>> {
-        self.caches.inode_size.read_cached(&ino, self.deref()).await
+        self.caches.inode_size.read_cached(&ino, &self.f_txn).await
     }
 
     pub async fn read_ino_lock_state(self: TxnArc, ino: StorageIno) -> Result<Arc<InoLockState>> {
-        self.caches.inode_lock_state.read_cached(&ino, self.deref()).await
+        self.caches.inode_lock_state.read_cached(&ino, &self.f_txn).await
     }
 
     pub async fn write_ino_lock_state(self: TxnArc, ino: StorageIno, state: InoLockState
     ) -> Result<()> {
-        self.caches.inode_lock_state.write_cached(ino, Arc::new(state), self.deref()).await
+        self.caches.inode_lock_state.write_cached(ino, Arc::new(state), &self.f_txn).await
     }
 
     pub async fn read_inode_arc(self: Arc<Self>, ino: StorageIno) -> Result<Arc<InoDescription>> {
@@ -620,15 +405,15 @@ impl Txn {
     }
 
     pub async fn save_inode(self: TxnArc, inode: &Arc<InoDescription>) -> Result<()> {
-        self.caches.inode_desc.write_cached(inode.storage_ino(), inode.clone(), self.deref()).await?;
+        self.caches.inode_desc.write_cached(inode.storage_ino(), inode.clone(), &self.f_txn).await?;
         debug!("saved inode: {:?}", inode);
         Ok(())
     }
 
     pub async fn remove_inode(self: TxnArc, ino: StorageIno) -> Result<()> {
         let key = Key::from(self.key_builder().inode_description(ino));
-        self.clone().delete(key).await?;
-        self.caches.inode_desc.delete_with_cache(&ino, self.deref()).await?;
+        self.f_txn.delete(key).await?;
+        self.caches.inode_desc.delete_with_cache(&ino, &self.f_txn).await?;
         Ok(())
     }
 
@@ -642,19 +427,19 @@ impl Txn {
 
     pub async fn read_static_meta(self: TxnArc) -> Result<Option<MetaStatic>> {
         let key = Key::from(self.key_builder().meta_static());
-        let opt_data = self.clone().get(key).await?;
+        let opt_data = self.f_txn.get(key).await?;
         opt_data.map(|data| MetaStatic::deserialize(&data)).transpose()
     }
 
     pub async fn read_meta(self: TxnArc) -> Result<Option<Meta>> {
         let key = Key::from(self.key_builder().meta());
-        let opt_data = self.clone().get(key).await?;
+        let opt_data = self.f_txn.get(key).await?;
         opt_data.map(|data| Meta::deserialize(&data)).transpose()
     }
 
     pub async fn save_meta(self: TxnArc, meta: &Meta) -> Result<()> {
         let key = Key::from(self.key_builder().meta());
-        self.clone().put(key, meta.serialize()?).await?;
+        self.f_txn.put(key, meta.serialize()?).await?;
         Ok(())
     }
 
@@ -662,7 +447,7 @@ impl Txn {
         debug_assert!(ino_size.size() <= self.inline_data_threshold());
         let key = Key::from(self.key_builder().block(BlockAddress { ino, index: 0 }));
         let data = ino_size.take_inline_data().unwrap();
-        self.clone().put(key, data).await?;
+        self.f_txn.put(key, data).await?;
         Ok(())
     }
 
@@ -686,7 +471,7 @@ impl Txn {
         ino_size.set_size(inlined.len() as u64, self.block_size);
         ino_size.set_inline_data(inlined);
         self.caches.inode_size.write_cached(
-            ino, Arc::new(ino_size.clone()), self.deref()).await?;
+            ino, Arc::new(ino_size.clone()), &self.f_txn).await?;
 
         Ok(size)
     }
@@ -718,11 +503,7 @@ impl Txn {
         let block_hashes = self.clone().hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
         //eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
         let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
-        let blocks_data = if self.fs_config.raw_hashed_blocks {
-            self.raw_txn.as_ref().unwrap().clone().hb_get_block_data_by_hashes(&block_hashes_set).await?
-        } else {
-            self.clone().hb_get_block_data_by_hashes(&block_hashes_set).await?
-        };
+        let blocks_data = self.clone().hb_get_block_data_by_hashes(&block_hashes_set).await?;
 
         let result = parsers::hb_read_from_blocks(ino, &block_range, &bs, &block_hashes, &blocks_data)?;
 
@@ -744,7 +525,7 @@ impl Txn {
         let end_block = target.div_ceil(self.fs_config.block_size);
 
         let block_range = self.key_builder().block_range(ino, start_block..end_block);
-        let pairs = self
+        let pairs = self.f_txn
             .scan(
                 block_range,
                 (end_block - start_block) as u32,
@@ -787,10 +568,10 @@ impl Txn {
         if update_atime {
             let atime = AccessTime(SystemTime::now());
             self.caches.inode_atime.write_cached(
-                ino, Arc::new(atime), self.deref()).await?;
+                ino, Arc::new(atime), &self.f_txn).await?;
         }
 
-        let ino_size = self.caches.inode_size.read_cached(&ino, self.deref()).await?;
+        let ino_size = self.caches.inode_size.read_cached(&ino, &self.f_txn).await?;
         if start >= ino_size.size() {
             return Ok(Vec::new());
         }
@@ -816,7 +597,7 @@ impl Txn {
             self.clone(), ino_size_key).await?;
 
         let mut ino_size = self.caches.inode_size.read_uncached(
-            &ino, self.deref()).await?.deref().clone();
+            &ino, &self.f_txn).await?.deref().clone();
         let block_cnt = ino_size.size().div_ceil(self.block_size);
 
         let mut deletes = Vec::with_capacity(block_cnt as usize);
@@ -829,12 +610,12 @@ impl Txn {
             };
             deletes.push(Mutation::Delete(key));
         }
-        self.clone().batch_mutate(deletes).await?;
+        self.f_txn.batch_mutate(deletes).await?;
 
         let clear_size = ino_size.size();
         ino_size.set_size(0, self.fs_config.block_size);
         ino_size.last_change = SystemTime::now();
-        self.caches.inode_size.write_cached(ino, Arc::new(ino_size), self.deref()).await?;
+        self.caches.inode_size.write_cached(ino, Arc::new(ino_size), &self.f_txn).await?;
         key_lock.unlock().await?;
         Ok(clear_size)
     }
@@ -850,13 +631,13 @@ impl Txn {
         let (first_block, mut rest) = data.split_at(first_block_size.min(data.len()));
 
         let mut start_value = self.clone()
-            .get(start_key.clone())
+            .f_txn.get(start_key.clone())
             .await?
             .unwrap_or_else(|| empty_block(self.block_size));
 
         start_value[start_index..start_index + first_block.len()].copy_from_slice(first_block);
 
-        self.clone().put(start_key, start_value).await?;
+        self.f_txn.put(start_key, start_value).await?;
 
         while !rest.is_empty() {
             block_index += 1;
@@ -866,13 +647,13 @@ impl Txn {
             let mut value = curent_block.to_vec();
             if value.len() < self.block_size as usize {
                 let mut last_value = self.clone()
-                    .get(key.clone())
+                    .f_txn.get(key.clone())
                     .await?
                     .unwrap_or_else(|| empty_block(self.block_size));
                 last_value[..value.len()].copy_from_slice(&value);
                 value = last_value;
             }
-            self.clone().put(key, value).await?;
+            self.f_txn.put(key, value).await?;
             rest = current_rest;
         }
 
@@ -883,7 +664,7 @@ impl Txn {
     pub async fn hb_get_block_hash_list_by_block_range(self: TxnArc, ino: StorageIno, block_range: Range<u64>
     ) -> TiFsResult<HashMap<BlockAddress, TiFsHash>> {
         let range = self.key_builder().block_hash_range(ino, block_range.clone());
-        let iter = self.scan(
+        let iter = self.f_txn.scan(
                 range,
                 block_range.count() as u32,
             )
@@ -937,7 +718,7 @@ impl Txn {
         watch.sync("cached");
 
         let mut uncached_blocks = HashMap::new();
-        let rcv_data_list = self.batch_get(keys).await?;
+        let rcv_data_list = self.f_txn.batch_get(keys).await?;
         for KvPair(k, v) in rcv_data_list {
             let key_data = Vec::from(k);
             let mut i = key_data.iter();
@@ -974,18 +755,14 @@ impl Txn {
                 for hash in key_list {
                     let key = self.key_builder().hashed_block(&hash);
                     let key_range: RangeInclusive<Key> = key.clone().into()..=key.into();
-                    let result = if self.fs_config.raw_hashed_blocks {
-                        self.raw.scan_keys(key_range, 1).await?
-                    } else {
-                        self.scan_keys(key_range, 1).await?
-                    };
+                    let result = self.f_txn.scan_keys(key_range, 1).await?;
                     if result.len() > 0 {
                         new_blocks.remove(&hash);
                     }
                 }
             } else {
                 let exists_keys_request = new_blocks.keys().map(|k| self.key_builder().hashed_block_exists(k)).collect::<Vec<_>>();
-                let exists_keys_response = self.batch_get(exists_keys_request).await?;
+                let exists_keys_response = self.f_txn.batch_get(exists_keys_request).await?;
                 for KvPair(key, _) in exists_keys_response.into_iter() {
                     let key = Vec::from(key);
                     let mut i = key.iter();
@@ -1002,42 +779,14 @@ impl Txn {
 
     pub async fn hb_upload_new_blocks(self: Arc<Self>, new_blocks: HashMap<TiFsHash, Arc<Vec<u8>>>) -> Result<()> {
         let mut mutations_txn = Vec::<Mutation>::new();
-        let mut mutations_raw = Vec::<KvPair>::new();
 
-        let new_blocks_len = new_blocks.len();
         for (k, new_block) in new_blocks {
-            if self.fs_config.raw_hashed_blocks {
-                mutations_raw.push(KvPair(self.key_builder().hashed_block(&k).into(), new_block.deref().clone()));
-            } else {
-                mutations_txn.push(Mutation::Put(self.key_builder().hashed_block(&k).into(), new_block.deref().clone()));
-            }
+            mutations_txn.push(Mutation::Put(self.key_builder().hashed_block(&k).into(), new_block.deref().clone()));
             mutations_txn.push(Mutation::Put(self.key_builder().hashed_block_exists(&k).into(), vec![]));
         }
 
-        let raw_cnt = mutations_raw.len();
-        if raw_cnt > 0 {
-            if self.fs_config.batch_raw_block_write {
-                self.raw.batch_put_with_ttl(mutations_raw, vec![0; raw_cnt]).await
-                    .map_err(|e| {
-                        eprintln!("batch-hb_write_data(blocks: {}", new_blocks_len);
-                        e
-                    })?;
-            } else {
-                for KvPair(k,v) in mutations_raw.into_iter() {
-                    let raw_clone = self.raw.clone();
-                    let packed = async move ||{
-                        let k2 = k;
-                        let v2 = v;
-                        let raw_clone2 = raw_clone;
-                        raw_clone2.put(k2, v2).await
-                    };
-                    tokio::spawn(packed());
-                }
-            }
-        }
-
         if mutations_txn.len() > 0 {
-            self.batch_mutate(mutations_txn).await?;
+            self.f_txn.batch_mutate(mutations_txn).await?;
         }
 
         Ok(())
@@ -1050,7 +799,7 @@ impl Txn {
                 kv_pairs.push(KvPair(me.key_builder().block_hash(addr).into(), hash.clone()));
             }
         }
-        Ok(Self::batch_put(me, kv_pairs).await?)
+        Ok(me.f_txn.batch_put(kv_pairs).await?)
     }
 
     pub async fn hb_write_data(self: Arc<Self>, fh: Arc<FileHandler>, start: u64, data: Bytes) -> Result<bool> {
@@ -1169,7 +918,7 @@ impl Txn {
         {
             let write_size_lock = lock.write().await;
             let mut ino_size = self.caches.inode_size.read_cached(
-                &ino, self.deref()).await?.deref().clone();
+                &ino, &self.f_txn).await?.deref().clone();
             size_changed = target > ino_size.size();
             watch.sync("read_inode");
 
@@ -1189,7 +938,7 @@ impl Txn {
 
             if transfer_needed {
                 self.caches.inode_size.write_cached(
-                    ino, Arc::new(ino_size), self.deref()).await?;
+                    ino, Arc::new(ino_size), &self.f_txn).await?;
             }
 
             drop(write_size_lock);
@@ -1207,7 +956,7 @@ impl Txn {
         if size_changed || content_was_modified {
             let wr_lock = lock.write().await;
             let mut ino_size_now = self.caches.inode_size.read_cached(
-                &ino, self.deref()).await?.deref().clone();
+                &ino, &self.f_txn).await?.deref().clone();
             // parallel writes might have done the size increment already
             let size_still_changed = target > ino_size_now.size();
             if size_still_changed {
@@ -1219,7 +968,7 @@ impl Txn {
                 ino_size_now.change_iteration += 1;
                 ino_size_now.last_change = SystemTime::now();
                 self.caches.inode_size.write_cached(
-                    ino, Arc::new(ino_size_now), self.deref()).await?;
+                    ino, Arc::new(ino_size_now), &self.f_txn).await?;
                 drop(wr_lock);
                 watch.sync("save inode");
             }
@@ -1236,13 +985,13 @@ impl Txn {
     }
 
     pub async fn read_link(self: TxnArc, ino: StorageIno) -> Result<Vec<u8>> {
-        let ino_size = self.caches.inode_size.read_cached(&ino, self.as_ref()).await?;
+        let ino_size = self.caches.inode_size.read_cached(&ino, &self.f_txn).await?;
         let size = ino_size.size();
 
         if self.fs_config.enable_atime {
             let atime = AccessTime(SystemTime::now());
             self.caches.inode_atime.write_cached(
-                ino, Arc::new(atime), self.deref()).await?;
+                ino, Arc::new(atime), &self.f_txn).await?;
         }
 
         self.read_inline_data(&ino_size, 0, size).await
@@ -1280,7 +1029,7 @@ impl Txn {
             let key_lock = CriticalSectionKeyLock::new(
                 self.clone(), key.clone()).await?;
 
-            if let Some(v) = self.clone().get(key.clone()).await? {
+            if let Some(v) = self.f_txn.get(key.clone()).await? {
                 let mut i = v.iter();
                 let mut current_count = read_big_endian::<8, u64>(&mut i)?;
                 if current_count > 0 {
@@ -1288,7 +1037,7 @@ impl Txn {
                 } else {
                     info!("unlink(): found existing, previously linked inode with zero link count");
                 }
-                self.put(key, current_count.to_be_bytes().to_vec()).await?;
+                self.f_txn.put(key, current_count.to_be_bytes().to_vec()).await?;
             }
 
             key_lock.unlock().await?;
@@ -1330,11 +1079,11 @@ impl Txn {
 
     pub async fn get_all_ino_data(self: TxnArc, ino: StorageIno,
     ) -> Result<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)> {
-        let desc = self.caches.inode_desc.read_cached(&ino, self.as_ref()).await?;
-        let attr = self.caches.inode_attr.read_cached(&ino, self.as_ref()).await?;
-        let size = self.caches.inode_size.read_cached(&ino, self.as_ref()).await?;
+        let desc = self.caches.inode_desc.read_cached(&ino, &self.f_txn).await?;
+        let attr = self.caches.inode_attr.read_cached(&ino, &self.f_txn).await?;
+        let size = self.caches.inode_size.read_cached(&ino, &self.f_txn).await?;
         let atime = self.caches.inode_atime.read_cached(
-            &ino, self.as_ref()).await.ok().as_deref().cloned().unwrap_or_else(||{
+            &ino, &self.f_txn).await.ok().as_deref().cloned().unwrap_or_else(||{
                 AccessTime(size.last_change.max(attr.last_change))
             });
         Ok((desc, attr, size, atime))
@@ -1359,17 +1108,17 @@ impl Txn {
 
         if let Some(atime_modification) = atime {
             let new_atime = AccessTime(get_time_from_time_or_now(atime_modification));
-            self.caches.inode_atime.write_cached(ino, Arc::new(new_atime), self.deref()).await?;
+            self.caches.inode_atime.write_cached(ino, Arc::new(new_atime), &self.f_txn).await?;
         }
 
         if let Some(mtime_modification) = mtime {
             let new_mtime = ModificationTime(get_time_from_time_or_now(mtime_modification));
-            self.caches.inode_mtime.write_cached(ino, Arc::new(new_mtime), self.deref()).await?;
+            self.caches.inode_mtime.write_cached(ino, Arc::new(new_mtime), &self.f_txn).await?;
         }
 
         // TODO: how to deal with fh, chgtime, bkuptime?
         let mut ino_attr = self.clone().caches.inode_attr.read_cached(
-            &ino, self.as_ref()).await?.deref().clone();
+            &ino, &self.f_txn).await?.deref().clone();
 
         let mut cnt = 0 as usize;
         set_if_changed(&mut cnt, &mut ino_attr.perm,
@@ -1384,7 +1133,7 @@ impl Txn {
 
         if cnt > 0 {
             self.caches.inode_attr.write_cached(
-                ino, Arc::new(ino_attr), self.as_ref()).await?;
+                ino, Arc::new(ino_attr), &self.f_txn).await?;
         }
 
         Ok(())
@@ -1400,7 +1149,7 @@ impl Txn {
         let lock = self.caches.get_or_create_ino_lock(fh.ino_use.ino).await;
         let wr_lock = lock.write().await;
         let mut ino_size = self.caches.inode_size.read_cached(
-            &ino, self.as_ref()).await?.deref().clone();
+            &ino, &self.f_txn).await?.deref().clone();
         let target_size = (offset + length) as u64;
         if target_size <= ino_size.size() {
             return Ok(());
@@ -1419,7 +1168,7 @@ impl Txn {
 
         ino_size.set_size(target_size, self.block_size);
         ino_size.last_change = SystemTime::now();
-        self.caches.inode_size.write_cached(ino, Arc::new(ino_size), self.as_ref()).await?;
+        self.caches.inode_size.write_cached(ino, Arc::new(ino_size), &self.f_txn).await?;
         drop(wr_lock);
         Ok(())
     }
@@ -1440,16 +1189,16 @@ impl Txn {
 
     pub async fn read_dir(self: Arc<Self>, ino: StorageIno) -> Result<StorageDirectory> {
         let range = self.key_builder().directory_child_range(ino);
-        trace!("start scan: {:?}", range);
-        let data = self.clone().scan(range, 10).await?;
-        trace!("scan result size: {:?}", data.len());
+        //trace!("start scan: {:?}", range);
+        let data = self.f_txn.scan(range, 10).await?;
+        //trace!("scan result size: {:?}", data.len());
         let mut result = StorageDirectory::with_capacity(data.len());
-        data.iter().enumerate().map(|(i, KvPair(k,v))|{
-            trace!("scan result key #{i}: {:?}, data-len: {}", k, v.len());
-        }).fold((), |_,_|{});
-        for (i, KvPair(k,v)) in data.into_iter().enumerate() {
+//        data.iter().enumerate().map(|(i, KvPair(k,v))|{
+//            trace!("scan result key #{i}: {:?}, data-len: {}", k, v.len());
+//        }).fold((), |_,_|{});
+        for (_i, KvPair(k,v)) in data.into_iter().enumerate() {
             let key_buf = Vec::from(k);
-            trace!("process scan result key #{i}: {:?}", key_buf);
+            //trace!("process scan result key #{_i}: {:?}", key_buf);
             let mut i = key_buf.iter();
             let (_p_ino, name) = self.key_parser(&mut i)?.parse_directory_child()?;
             let item = deserialize_json::<StorageDirItem>(&v)?;
@@ -1459,7 +1208,7 @@ impl Txn {
                 typ: item.typ,
             });
         }
-        trace!("read dir data: len: {}", result.len());
+        //trace!("read dir data: len: {}", result.len());
         Ok(result)
     }
 
@@ -1532,7 +1281,7 @@ impl Txn {
         typ: i32,
     ) -> TiFsResult<bool> {
         let mut inode = self.caches.inode_lock_state.read_cached(
-            &ino, self.deref()).await?.deref().clone();
+            &ino, &self.f_txn).await?.deref().clone();
         match typ {
             libc::F_WRLCK => {
                 if inode.owner_set.len() > 1 {
@@ -1541,14 +1290,14 @@ impl Txn {
                     inode.lk_type = libc::F_WRLCK;
                     inode.owner_set.insert(lock_owner);
                     self.caches.inode_lock_state.write_cached(
-                        ino, Arc::new(inode), self.deref()).await?;
+                        ino, Arc::new(inode), &self.f_txn).await?;
                     Ok(true)
                 } else if inode.owner_set.get(&lock_owner)
                     == Some(&lock_owner)
                 {
                     inode.lk_type = libc::F_WRLCK;
                     self.caches.inode_lock_state.write_cached(
-                        ino, Arc::new(inode), self.deref()).await?;
+                        ino, Arc::new(inode), &self.f_txn).await?;
                     Ok(true)
                 } else {
                     Err(FsError::InvalidLock)
@@ -1561,54 +1310,11 @@ impl Txn {
                     inode.lk_type = libc::F_RDLCK;
                     inode.owner_set.insert(lock_owner);
                     self.caches.inode_lock_state.write_cached(
-                        ino, Arc::new(inode), self.deref()).await?;
+                        ino, Arc::new(inode), &self.f_txn).await?;
                     Ok(true)
                 }
             }
             _ => Err(FsError::InvalidLock),
         }
-    }
-}
-
-impl<K, V> TxnFetch<K, V> for Txn
-where V: for<'dl> Deserialize<'dl>, ScopedKeyBuilder: KeyGenerator<K, V>
-{
-    async fn fetch(&self, key: &K) -> TiFsResult<Arc<V>> {
-        let me = self.weak.upgrade().ok_or(
-            FsError::UnknownError(format!("upgrade weak failed")))?;
-        let t = self.key_builder();
-        let key_raw = t.generate_key(key);
-        let result = me.get(key_raw).await?;
-        let Some(data) = result else {
-            return Err(FsError::KeyNotFound);
-        };
-        Ok(Arc::new(serialize::deserialize::<V>(&data)
-            .map_err(|err|FsError::UnknownError(format!("deserialize failed: {err}")))?))
-    }
-}
-
-impl<K, V> TxnPut<K, V> for Txn
-where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
-{
-    async fn put(&self, key: &K, value: Arc<V>) -> TiFsResult<()> {
-        let me = self.weak.upgrade().ok_or(FsError::UnknownError(format!("upgrade weak failed")))?;
-        let t = self.key_builder();
-        let key = t.generate_key(key);
-        let data = serialize::serialize(value.deref())
-            .map_err(|err|FsError::UnknownError(format!("serialization failed: {err}")))?;
-        me.put(key, data).await?;
-        Ok(())
-    }
-}
-
-impl<K, V> TxnDelete<K, V> for Txn
-where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
-{
-    async fn delete(&self, key: &K) -> TiFsResult<()> {
-        let me = self.weak.upgrade().ok_or(FsError::UnknownError(format!("upgrade weak failed")))?;
-        let t = self.key_builder();
-        let key = t.generate_key(key);
-        me.delete(key).await?;
-        Ok(())
     }
 }

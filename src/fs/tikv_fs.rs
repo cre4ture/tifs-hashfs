@@ -400,7 +400,7 @@ impl TiFs {
         match f(self, txn.clone()).await {
             Ok(v) => {
                 let commit_start = SystemTime::now();
-                txn.clone().commit().await?;
+                txn.f_txn.commit().await?;
                 tracing::trace!(
                     "transaction committed in {} ms",
                     commit_start.elapsed().unwrap().as_millis()
@@ -408,8 +408,8 @@ impl TiFs {
                 Ok(v)
             }
             Err(e) => {
-                txn.clone().rollback().await?;
-                debug!("transaction rollbacked");
+                txn.f_txn.rollback().await?;
+                debug!("transaction rolled back");
                 Err(e)
             }
         }

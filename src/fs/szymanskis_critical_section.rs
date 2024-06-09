@@ -144,10 +144,10 @@ impl SzymanowskiCriticalSection {
     async fn change_own_state(&mut self, new_state: SzymanskisState, txn: &Txn
     ) -> TiFsResult<()> {
         if new_state == SzymanskisState::S0Noncritical {
-            txn.weak.upgrade().unwrap().delete(self.key_for_state_report.clone()).await?;
+            txn.weak.upgrade().unwrap().f_txn.delete(self.key_for_state_report.clone()).await?;
         } else {
             let new_state_id = new_state.as_u8();
-            txn.weak.upgrade().unwrap().put(self.key_for_state_report.clone(),
+            txn.weak.upgrade().unwrap().f_txn.put(self.key_for_state_report.clone(),
                 vec![new_state_id]).await?;
         }
         self.my_state = new_state;
@@ -165,7 +165,7 @@ impl SzymanowskiCriticalSection {
     }
 
     async fn get_current_states_excluding_mine(&mut self, txn: &Txn) -> TiFsResult<Vec<(Uuid, SzymanskisState)>> {
-        let all_states_kv = txn.scan(self.key_range.clone(), MAX_TIKV_SCAN_LIMIT).await?;
+        let all_states_kv = txn.f_txn.scan(self.key_range.clone(), MAX_TIKV_SCAN_LIMIT).await?;
         let all_states = all_states_kv.into_iter().filter_map(
             |KvPair(k,v)| {
                 let key_buffer = Vec::from(k);

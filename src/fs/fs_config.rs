@@ -268,8 +268,6 @@ define_options! { MountOption (FuseMountOption) {
     define NoMtime,
     define ValidateWrites,
     define ValidateReadHashes,
-    define RawHashedBlocks,
-    define BatchRawBlockWrite,
     define PureRaw,
     define NoExistenceCheck,
     define ParallelJobs(String),
@@ -298,8 +296,6 @@ pub struct TiFsConfig {
     pub max_size: Option<u64>,
     pub validate_writes: bool,
     pub validate_read_hashes: bool,
-    pub raw_hashed_blocks: bool,
-    pub batch_raw_block_write: bool,
     pub pure_raw: bool,
     pub existence_check: bool,
     pub parallel_jobs: usize,
@@ -403,12 +399,6 @@ impl TiFsConfig {
             }).unwrap_or(false),
             validate_read_hashes: options.iter().find_map(|opt|{
                 (MountOption::ValidateReadHashes == *opt).then_some(true)
-            }).unwrap_or(false),
-            raw_hashed_blocks: options.iter().find_map(|opt|{
-                (MountOption::RawHashedBlocks == *opt).then_some(true)
-            }).unwrap_or(false),
-            batch_raw_block_write: options.iter().find_map(|opt|{
-                (MountOption::BatchRawBlockWrite == *opt).then_some(true)
             }).unwrap_or(false),
             pure_raw: options.iter().find_map(|opt|{
                 (MountOption::PureRaw == *opt).then_some(true)
