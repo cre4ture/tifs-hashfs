@@ -58,17 +58,22 @@ impl FlexibleTransaction {
         Ok(transaction)
     }
 
+    async fn finish_txn<R>(result: TiKvResult<R>, mut mini: Transaction) -> TiFsResult<R> {
+        if result.is_ok() {
+            mini.commit().await?;
+        } else {
+            mini.rollback().await?;
+        }
+        Ok(result?)
+    }
+
     pub async fn get(&self, key: impl Into<Key>) -> TiFsResult<Option<Value>> {
         if let Some(txn) = &self.txn {
             Ok(txn.write().await.get(key).await?)
         } else {
             if self.fs_config.small_transactions {
                 let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.get(key).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
+                Self::finish_txn(mini.get(key).await, mini).await
             } else {
                 Ok(self.raw.get(key).await?)
             }
@@ -85,12 +90,10 @@ impl FlexibleTransaction {
         } else {
             if self.fs_config.small_transactions {
                 let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.batch_get(keys).await
-                    .map(|iter|iter.collect::<Vec<_>>())?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
+                Self::finish_txn(mini.batch_get(keys).await
+                    .map(|iter|iter.collect::<Vec<_>>())
+                    , mini
+                ).await
             } else {
                 Ok(self.raw.batch_get(keys).await?)
             }
@@ -103,11 +106,7 @@ impl FlexibleTransaction {
         } else {
             if self.fs_config.small_transactions {
                 let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.put(key, value).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
+                Self::finish_txn(mini.put(key, value).await, mini).await
             } else {
                 Ok(self.raw.put(key, value).await?)
             }
@@ -122,11 +121,7 @@ impl FlexibleTransaction {
             if self.fs_config.small_transactions {
                 let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
                 let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.batch_mutate(mutations).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
+                Self::finish_txn(mini.batch_mutate(mutations).await, mini).await
             } else {
                 Ok(self.raw.batch_put(pairs).await?)
             }
@@ -139,11 +134,7 @@ impl FlexibleTransaction {
         } else {
             if self.fs_config.small_transactions {
                 let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.delete(key).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
+                Self::finish_txn(mini.delete(key).await, mini).await
             } else {
                 Ok(self.raw.delete(key).await?)
             }
@@ -156,11 +147,7 @@ impl FlexibleTransaction {
         } else {
             if self.fs_config.small_transactions {
                 let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.batch_mutate(mutations).await?);
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
+                Self::finish_txn(mini.batch_mutate(mutations).await, mini).await
             } else {
                 let mut deletes = Vec::new();
                 let mut put_pairs = Vec::new();
@@ -194,12 +181,8 @@ impl FlexibleTransaction {
         } else {
             if self.fs_config.small_transactions {
                 let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.scan(range, limit).await?
-                    .collect::<Vec<KvPair>>());
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
+                Ok(Self::finish_txn(mini.scan(range, limit).await, mini).await?
+                    .collect::<Vec<KvPair>>())
             } else {
                 Ok(self.raw.scan(range, limit).await?)
             }
@@ -217,12 +200,8 @@ impl FlexibleTransaction {
         } else {
             if self.fs_config.small_transactions {
                 let mut mini = self.mini_txn().await?;
-                let result = Ok(mini.scan_keys(range, limit).await?
-                    .collect::<Vec<Key>>());
-                if result.is_ok() {
-                    mini.commit().await?;
-                }
-                result
+                Ok(Self::finish_txn(mini.scan_keys(range, limit).await, mini).await?
+                    .collect::<Vec<Key>>())
             } else {
                 Ok(self.raw.scan_keys(range, limit).await?)
             }

@@ -56,7 +56,7 @@ impl AutoStopWatch {
 
 impl Drop for AutoStopWatch {
     fn drop(&mut self) {
-        eprintln!("AutoStopWatch:{}", self.watch);
+        tracing::debug!("AutoStopWatch:{}", self.watch);
     }
 }
 

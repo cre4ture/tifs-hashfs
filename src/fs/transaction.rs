@@ -179,7 +179,7 @@ impl Txn {
         // publish opened state
         let key = Key::from(self.key_builder().opened_inode(ino, use_id));
         self.f_txn.put(key, &[]).await?;
-        eprintln!("open-ino: {ino}, use_id: {use_id}");
+        tracing::debug!("open-ino: {ino}, use_id: {use_id}");
         Ok(())
     }
 
@@ -189,7 +189,7 @@ impl Txn {
         // de-publish opened state
         let key = Key::from(self.key_builder().opened_inode(ino, use_id));
         self.f_txn.delete(key).await?;
-        eprintln!("close-ino: {ino}, use_id: {use_id}");
+        tracing::debug!("close-ino: {ino}, use_id: {use_id}");
         Ok(())
     }
 
@@ -501,7 +501,7 @@ impl Txn {
         let block_range = bs.block_range();
 
         let block_hashes = self.clone().hb_get_block_hash_list_by_block_range(ino, block_range.clone()).await?;
-        //eprintln!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
+        //tracing::debug!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
         let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
         let blocks_data = self.clone().hb_get_block_data_by_hashes(&block_hashes_set).await?;
 
@@ -509,11 +509,11 @@ impl Txn {
 
         let mut buf_start = Buffer::default();
         buf_start.write_formatted(&start, &Locale::en);
-        eprintln!("hb_read_data(ino: {ino}, start:{buf_start}, size: {size}) - block_size: {}, blocks_count: {}, range: [{}..{}[ -> {} read", bs.block_size, bs.block_count, block_range.start, block_range.end, result.len());
+        tracing::debug!("hb_read_data(ino: {ino}, start:{buf_start}, size: {size}) - block_size: {}, blocks_count: {}, range: [{}..{}[ -> {} read", bs.block_size, bs.block_count, block_range.start, block_range.end, result.len());
 
         if result.len() < size as usize {
             let block_data_lengths = blocks_data.iter().map(|(key, data)|(key, data.len())).collect::<Vec<_>>();
-            eprintln!("incomplete read - (ino: {ino}, start:{buf_start}, size: {size}): len:{}, block_hashes:{:?}, block_lengths:{:?}", result.len(), block_hashes, block_data_lengths);
+            tracing::debug!("incomplete read - (ino: {ino}, start:{buf_start}, size: {size}): len:{}, block_hashes:{:?}, block_lengths:{:?}", result.len(), block_hashes, block_data_lengths);
         }
 
         Ok(result)
@@ -898,7 +898,7 @@ impl Txn {
 
         watch.sync("pm");
 
-        eprintln!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,jobs:{total_jobs}({skipped_new_block_hashes}/{input_block_hashes} skipped)", ino, start.to_formatted_string(&Locale::en), data.len().to_formatted_string(&Locale::en), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
+        tracing::debug!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,jobs:{total_jobs}({skipped_new_block_hashes}/{input_block_hashes} skipped)", ino, start.to_formatted_string(&Locale::en), data.len().to_formatted_string(&Locale::en), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
 
         let was_modified = new_block_hashes_len > 0;
         Ok(was_modified)
