@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::mem;
-use std::ops::DerefMut;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -14,6 +14,7 @@ use fuser::{FileAttr, FileType};
 use futures::FutureExt;
 
 use moka::future::Cache;
+use range_collections::range_set::RangeSetRange;
 use tikv_client::Config;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -340,10 +341,10 @@ impl TiFs {
         flags: i32,
         lock_owner: Option<u64>,
     ) -> Result<Data> {
-        let mut ra_lock = file_handler.read_ahead.write().await;
-        ra_lock.wait_finish_all().await;
-        ra_lock.get_results_so_far();
-        mem::drop(ra_lock);
+        let mut write_ahead_lock = file_handler.write_cache.write().await;
+        write_ahead_lock.wait_finish_all().await;
+        write_ahead_lock.get_results_so_far();
+        mem::drop(write_ahead_lock);
 
         let start = start as u64;
         let arc = self.weak.upgrade().unwrap();
@@ -352,9 +353,29 @@ impl TiFs {
         if (self.fs_config.read_ahead_size > 0) && (result.data.len() == size as usize) {
             let target = start + size as u64;
             let read_ahead_size = self.fs_config.read_ahead_size;
-            let mut lock = file_handler.read_ahead.write().await;
-            lock.push(arc.read_transaction_arc(ino, target, read_ahead_size as u32, flags, lock_owner)
-                                .map(|d|{ d.map(|_|{}) }).boxed()).await;
+            let mut lock_range_sets = file_handler.read_ahead_map.write().await;
+            let remaining = lock_range_sets.get_remaining_to_be_read_size(
+                target..target+read_ahead_size);
+            let remaining = remaining.iter().filter_map(|x| {
+                    if let RangeSetRange::Range(range) = x {
+                        Some(*range.start..*range.end)
+                    } else { None }}).collect::<Vec<_>>();
+            let count = remaining.iter()
+                .fold(0, |x, v| {
+                x + (v.end - v.start)
+            });
+            eprintln!("read ahead remaining: {}", count);
+            if count > (self.fs_config.read_ahead_size / 2) {
+                let fp = remaining.iter().next().unwrap().clone();
+                lock_range_sets.update_read_size(fp.clone());
+                let start = fp.start;
+                let size = fp.end - fp.start;
+                eprintln!("read ahead step: pos: {}, size: {}", start, size);
+                let mut lock = file_handler.read_ahead.write().await;
+                lock.push(arc.read_transaction_arc(ino, start, size as u32,
+                     flags, lock_owner)
+                        .map(|d|{ d.map(|_|{}) }).boxed()).await;
+            }
         }
 
         Ok(result)

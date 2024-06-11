@@ -43,6 +43,7 @@ strum = { version = "0.26.2", features = ["derive"] }
 struct_iterable = "0.1.1"
 tokio-console = "0.1.10"
 console-subscriber = "0.2.0"
+range-collections = "0.4.5"
 
 bincode = {version = "1.3.1", optional = true}
 serde_json = {version = "1", optional = true}

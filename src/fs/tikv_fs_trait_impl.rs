@@ -178,7 +178,7 @@ impl AsyncFileSystem for TiFs {
             return Err(FsError::UnknownError("failed to get ino_use!".into()));
         };
 
-        let file_handler = FileHandler::new(ino_use, self.fs_config.write_in_progress_limit);
+        let file_handler = FileHandler::new(ino_use, self.fs_config.clone());
         let fh = self.with_mut_data(|d| {
             let new_fh = d.get_free_fh();
             d.file_handlers.insert(new_fh, Arc::new(file_handler));

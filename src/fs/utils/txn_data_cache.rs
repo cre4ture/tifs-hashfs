@@ -1,4 +1,6 @@
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{ops::Deref, sync::Arc, time::{Duration, Instant}};
+
+use tikv_client::{Key, Transaction};
 
 use crate::fs::error::TiFsResult;
 
@@ -69,4 +71,65 @@ where
         self.cache.remove(key).await;
         txn.delete(key).await
     }
+}
+
+
+pub struct GenericDataCache {
+    cache: moka::future::Cache<Key, (Instant, Option<Arc<Vec<u8>>>)>,
+    time_limit: Duration,
+}
+
+impl GenericDataCache {
+    pub fn new(capacity: u64, time_limit: Duration) -> Self {
+        Self{
+            cache: moka::future::Cache::new(capacity),
+            time_limit,
+        }
+    }
+
+    pub async fn read_uncached(
+        &self,
+        key: Key,
+        txn: &mut Transaction
+    ) -> TiFsResult<Option<Arc<Vec<u8>>>> {
+        let value = txn.get(key.clone()).await?.map(|v| Arc::new(v));
+        self.cache.insert(key, (Instant::now(), value.clone())).await;
+        Ok(value)
+    }
+
+    pub async fn read_cached(
+        &self,
+        key: &Key,
+        txn: &mut Transaction
+    ) -> TiFsResult<Option<Arc<Vec<u8>>>> {
+        if let Some((time, value)) = self.cache.get(key).await {
+            if time.elapsed() < self.time_limit {
+                return Ok(value);
+            } else {
+                self.cache.remove(key).await;
+            }
+        }
+        self.read_uncached(key.clone(), txn).await
+    }
+
+    pub async fn write_cached(&self, key: Key, value: Arc<Vec<u8>>, txn: &mut Transaction) -> TiFsResult<()> {
+        self.cache.insert(key.clone(), (Instant::now(), Some(value.clone()))).await;
+        Ok(txn.put(key, value.deref().clone()).await?)
+    }
+
+    pub async fn delete_with_cache(&self, key: Key, txn: &mut Transaction) -> TiFsResult<()> {
+        self.cache.remove(&key).await;
+        Ok(txn.delete(key).await?)
+    }
+
+    /*
+    pub async fn scan_range_uncached(
+        &self,
+        range: BoundRange,
+        limit: u32,
+        txn: &mut Transaction,
+    ) -> TiFsResult<> {
+        let values = txn.scan(range, limit).await?;
+    }
+    */
 }
