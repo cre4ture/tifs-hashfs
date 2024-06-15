@@ -13,7 +13,7 @@ use num_format::{Buffer, Locale, ToFormattedString};
 use num_traits::FromPrimitive;
 use tikv_client::{Backoff, Key, KvPair, RetryOptions, Transaction, TransactionOptions};
 use tokio::sync::RwLock;
-use tracing::{debug, info, instrument, trace};
+use tracing::{debug, instrument, trace};
 use tikv_client::transaction::Mutation;
 use uuid::Uuid;
 
@@ -325,7 +325,7 @@ impl Txn {
                     file: name.to_string(),
                 });
             }
-            self.clone().set_directory_child(
+            self.clone().add_directory_child(
                 parent,
                 name.clone(),
                 &StorageDirItem { ino: inode.ino, typ: inode.typ },
@@ -385,7 +385,7 @@ impl Txn {
             })
     }
 
-    pub async fn set_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, item: &StorageDirItem) -> TiFsResult<()> {
+    pub async fn add_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, item: &StorageDirItem) -> TiFsResult<()> {
         let lock_key = self.key_builder().inode_link_count(item.ino);
         let _critical_section = CriticalSectionKeyLock::new(self.clone(), lock_key).await?;
         let key = Key::from(self.key_builder().directory_child(parent, &name));
@@ -398,6 +398,7 @@ impl Txn {
         Ok(self.f_txn.batch_put(put_pairs).await?)
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn remove_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, ino: StorageIno) -> TiFsResult<()> {
         let lock_key = self.key_builder().inode_link_count(ino);
         let _critical_section = CriticalSectionKeyLock::new(self.clone(), lock_key).await?;
@@ -411,7 +412,8 @@ impl Txn {
         let key_usages = self.key_builder().parent_link_scan(ino);
         let usage_count = self.f_txn.scan_keys(key_usages, MAX_TIKV_SCAN_LIMIT).await?.len();
         if usage_count == 0 {
-            self.remove_inode(ino).await?;
+            self.clone().remove_inode(ino).await?;
+            self.remove_inode_data(ino).await?;
         }
         Ok(())
     }
@@ -447,10 +449,21 @@ impl Txn {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn remove_inode(self: TxnArc, ino: StorageIno) -> TiFsResult<()> {
         let key = Key::from(self.key_builder().inode_description(ino));
         self.f_txn.delete(key).await?;
         self.caches.inode_desc.delete_with_cache(&ino, &self.f_txn).await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn remove_inode_data(self: TxnArc, ino: StorageIno) -> TiFsResult<()> {
+        if self.fs_config.hashed_blocks {
+            self.hb_clear_data(ino).await?;
+        } else {
+            self.traditional_clear_data(ino).await?;
+        }
         Ok(())
     }
 
@@ -627,7 +640,68 @@ impl Txn {
         }
     }
 
-    pub async fn clear_data(self: TxnArc, ino: StorageIno) -> TiFsResult<u64> {
+    pub async fn hb_clear_data_single_block(self: TxnArc, addr: BlockAddress) -> TiFsResult<()> {
+        let key = self.key_builder().block_hash(addr);
+        let mut spin = SpinningTxn {
+            backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10),
+        };
+        let prev_hash = loop {
+            let mut mini = self.f_txn.mini_txn().await?;
+            let result = Self::hb_replace_block_hash_for_address(&mut mini, &key, None).await;
+            match spin.end_iter(result, mini).await {
+                SpinningIterResult::Done(prev_hash) => break prev_hash,
+                SpinningIterResult::TryAgain => {},
+                SpinningIterResult::Failed(err) => return Err(err.into()),
+            }
+        };
+
+        let mut spin = SpinningTxn {
+            backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10),
+        };
+        if let Some(prev_h) = prev_hash {
+            loop {
+                let mut mini = self.f_txn.mini_txn().await?;
+                let result = self.hb_decrement_blocks_reference_count_and_delete_if_zero_reached(&mut mini, &prev_h, 1).await;
+                match spin.end_iter(result, mini).await {
+                    SpinningIterResult::Done(prev_hash) => break prev_hash,
+                    SpinningIterResult::TryAgain => {},
+                    SpinningIterResult::Failed(err) => return Err(err.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn hb_clear_data(self: TxnArc, ino: StorageIno) -> TiFsResult<u64> {
+
+        let ino_size_key = self.key_builder().inode_size(ino);
+        let key_lock = CriticalSectionKeyLock::new(
+            self.clone(), ino_size_key).await?;
+
+        let mut ino_size = self.caches.inode_size.read_uncached(
+            &ino, &self.f_txn).await?.deref().clone();
+        let block_cnt = ino_size.size().div_ceil(self.block_size);
+
+        let mut parallel_executor = AsyncParallelPipeStage::new(
+            self.fs_config.parallel_jobs_delete);
+        for block in 0..block_cnt {
+            let addr = BlockAddress { ino, index: block };
+            parallel_executor.push(self.clone().hb_clear_data_single_block(addr)).await;
+        }
+        parallel_executor.wait_finish_all().await;
+        for r in parallel_executor.get_results_so_far() {
+            r?;
+        }
+
+        let clear_size = ino_size.size();
+        ino_size.set_size(0, self.fs_config.block_size);
+        ino_size.last_change = SystemTime::now();
+        self.caches.inode_size.write_cached(ino, Arc::new(ino_size), &self.f_txn).await?;
+        key_lock.unlock().await?;
+        Ok(clear_size)
+    }
+
+    pub async fn traditional_clear_data(self: TxnArc, ino: StorageIno) -> TiFsResult<u64> {
 
         let ino_size_key = self.key_builder().inode_size(ino);
         let key_lock = CriticalSectionKeyLock::new(
@@ -824,19 +898,51 @@ impl Txn {
         Ok(prev_counter_value)
     }
 
+    async fn hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
+        &self,
+        mini: &mut Transaction,
+        hash: &Vec<u8>,
+        cnt: u64,
+    ) -> TiKvResult<()> {
+        let block_ref_cnt_key = self.key_builder().named_hashed_block_x(
+            hash, Some(HashedBlockMeta::CCountedNamedUsages), None);
+
+        let prev_counter_value = mini.get(block_ref_cnt_key.clone()).await?
+            .map(|vec|BigUint::from_bytes_be(&vec))
+            .unwrap_or(BigUint::from_u8(0u8).unwrap());
+        let mut actual_dec = BigUint::from_u64(cnt).unwrap();
+        if prev_counter_value < actual_dec {
+            tracing::error!("full decrement by {cnt} of block reference counter not possible with value {prev_counter_value}.");
+            actual_dec = prev_counter_value.clone();
+        }
+        let new_counter_value = prev_counter_value.clone() - actual_dec;
+        if new_counter_value == BigUint::from_u8(0).unwrap() {
+            let block_key = self.key_builder().hashed_block(hash);
+            let mut deletes = Vec::with_capacity(2);
+            deletes.push(Mutation::Delete(Key::from(block_ref_cnt_key)));
+            deletes.push(Mutation::Delete(Key::from(block_key)));
+            mini.batch_mutate(deletes).await?;
+            tracing::warn!("deleting block with hash: {hash:?}");
+        } else {
+            mini.put(block_ref_cnt_key.clone(), new_counter_value.to_bytes_be()).await?;
+        }
+        Ok(())
+    }
+
     pub async fn hb_upload_block_reference_counting(&self, hash: &TiFsHash, cnt: u64, data: Vec<u8>
     ) -> TiFsResult<()> {
-        let block_key = self.key_builder().named_hashed_block_x(
-            hash, Some(HashedBlockMeta::CCountedNamedUsages), None);
         let mut spin = SpinningTxn{
             backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10)
         };
+        let block_ref_cnt_key = self.key_builder().named_hashed_block_x(
+            hash, Some(HashedBlockMeta::CCountedNamedUsages), None);
+
         // get and increment block reference counter (with automatic retry)
         let prev_cnt = loop {
             let mut mini = self.f_txn.mini_txn().await?;
             let result = self.hb_increment_blocks_reference_count(
-                &mut mini, block_key.clone(), cnt).await;
-            match spin.end_iter(result, &mut mini).await {
+                &mut mini, block_ref_cnt_key.clone(), cnt).await;
+            match spin.end_iter(result, mini).await {
                 SpinningIterResult::Done(prev_cnt) => break prev_cnt,
                 SpinningIterResult::TryAgain => {},
                 SpinningIterResult::Failed(err) => return Err(err.into()),
@@ -851,14 +957,64 @@ impl Txn {
         Ok(())
     }
 
+    pub async fn hb_replace_block_hash_for_address(
+        mini: &mut Transaction,
+        key: &Vec<u8>,
+        new_hash: Option<&TiFsHash>,
+    ) -> TiKvResult<Option<TiFsHash>> {
+        let prev_block_hash = mini.get(key.clone()).await?;
+        if let Some(new_hash) = new_hash {
+            mini.put(key.clone(), new_hash.clone()).await?;
+        } else {
+            mini.delete(key.clone()).await?;
+        }
+        Ok(prev_block_hash)
+    }
+
     pub async fn hb_upload_block_reference_counting_and_write_addresses(
         self: TxnArc, hash: TiFsHash, cnt: u64, data: Vec<u8>, addresses: Vec<BlockAddress>,
     ) -> TiFsResult<()> {
         self.hb_upload_block_reference_counting(&hash, cnt, data).await?;
 
+        let mut decrement_cnts = HashMap::<TiFsHash, u64>::new();
         for addr in addresses {
             let key = self.key_builder().block_hash(addr);
-            self.f_txn.put(key, hash.clone()).await?;
+            let mut spin = SpinningTxn {
+                backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10),
+            };
+            let prev_hash = loop {
+                let mut mini: Transaction = self.f_txn.mini_txn().await?;
+                let result = Self::hb_replace_block_hash_for_address(&mut mini, &key, Some(&hash)).await;
+                match spin.end_iter(result, mini).await {
+                    SpinningIterResult::Done(prev_hash) => break prev_hash,
+                    SpinningIterResult::TryAgain => {},
+                    SpinningIterResult::Failed(err) => {
+                        tracing::error!("failed to exchange hash for block-address");
+                        return Err(err.into());
+                    }
+                }
+            };
+
+            if let Some(pre_hash) = prev_hash {
+                decrement_cnts.insert(pre_hash.clone(),
+                    1 + decrement_cnts.get(&pre_hash).copied().unwrap_or(0));
+            }
+        }
+
+        for (prev_hash, dec_cnt) in decrement_cnts {
+            let mut spin = SpinningTxn {
+                backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10),
+            };
+            loop {
+                let mut mini: Transaction = self.f_txn.mini_txn().await?;
+                let result = self.hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
+                    &mut mini, &prev_hash, dec_cnt).await;
+                match spin.end_iter(result, mini).await {
+                    SpinningIterResult::Done(()) => break,
+                    SpinningIterResult::TryAgain => {},
+                    SpinningIterResult::Failed(err) => return Err(err.into()),
+                }
+            }
         }
         Ok(())
     }
@@ -962,9 +1118,6 @@ impl Txn {
 
             parallel_executor.push(fut).await;
         }
-
-        // remove outdated blocks:
-        // TODO!
 
         parallel_executor.wait_finish_all().await;
         let total_jobs = parallel_executor.get_total();
@@ -1130,7 +1283,7 @@ impl Txn {
 
         let inode = self.clone().read_inode(ino).await?.deref().clone();
         // attach existing ino to a further directory with a new name:
-        self.clone().set_directory_child(
+        self.clone().add_directory_child(
             further_parent,
             new_name.clone(),
             &StorageDirItem { ino, typ: inode.typ }).await?;
@@ -1138,6 +1291,7 @@ impl Txn {
         Ok(Arc::new(inode))
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn unlink(
             self: TxnArc,
             parent: StorageIno,
@@ -1146,28 +1300,8 @@ impl Txn {
         let Some(dir_entry) = self.clone().get_directory_item(parent, name.clone()).await? else {
             return Err(FsError::FileNotFound { file: name.to_string() });
         };
-
+        tracing::info!("remove_directory_child. parent: {:?}, name: {:?}, entry: {:?}", parent, name, dir_entry);
         self.clone().remove_directory_child(parent, name.clone(), dir_entry.ino).await?;
-
-        {
-            let key = self.key_builder().inode_link_count(dir_entry.ino);
-            let key_lock = CriticalSectionKeyLock::new(
-                self.clone(), key.clone()).await?;
-
-            if let Some(v) = self.f_txn.get(key.clone()).await? {
-                let mut i = v.iter();
-                let mut current_count = read_big_endian::<8, u64>(&mut i)?;
-                if current_count > 0 {
-                    current_count -= 1;
-                } else {
-                    info!("unlink(): found existing, previously linked inode with zero link count");
-                }
-                self.f_txn.put(key, current_count.to_be_bytes().to_vec()).await?;
-            }
-
-            key_lock.unlock().await?;
-        }
-
         Ok(())
     }
 

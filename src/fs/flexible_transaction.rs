@@ -27,7 +27,7 @@ pub struct SpinningTxn {
 }
 
 impl SpinningTxn {
-    pub async fn end_iter<R: std::fmt::Debug>(&mut self, result: TiKvResult<R>, mini: &mut Transaction
+    pub async fn end_iter<R: std::fmt::Debug>(&mut self, result: TiKvResult<R>, mut mini: Transaction
     ) -> SpinningIterResult<R> {
         if let Ok(val) = result {
             match mini.commit().await {

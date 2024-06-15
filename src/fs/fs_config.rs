@@ -271,6 +271,7 @@ define_options! { MountOption (FuseMountOption) {
     define PureRaw,
     define NoExistenceCheck,
     define ParallelJobs(String),
+    define ParallelJobsDelete(String),
     define MaxChunkSize(String),
     define WriteInProgressLimit(String),
     define ReadAheadSize(String),
@@ -299,6 +300,7 @@ pub struct TiFsConfig {
     pub pure_raw: bool,
     pub existence_check: bool,
     pub parallel_jobs: usize,
+    pub parallel_jobs_delete: usize,
     pub max_chunk_size: usize,
     pub write_in_progress_limit: usize,
     pub read_ahead_size: u64,
@@ -319,6 +321,8 @@ impl TiFsConfig {
         const INLINE_DATA_THRESHOLD_BASE: u64 = 1 << 4;
         let mut inline_data_limit = block_size / INLINE_DATA_THRESHOLD_BASE;
         let mut small_transactions = false;
+        let mut parallel_jobs = 0;
+        let mut parallel_jobs_delete = 0;
 
         // iterate over options and overwrite defaults
         for option in options {
@@ -353,6 +357,20 @@ impl TiFsConfig {
                         })?;
                 }
                 MountOption::SmallTxns => small_transactions = true,
+                MountOption::ParallelJobs(value) => {
+                    parallel_jobs = value.parse::<usize>()
+                        .map_err(|err|{
+                            FsError::ConfigParsingFailed {
+                                msg: format!("fail to parse ParallelJobs({}): {}", value, err) }
+                        })?;
+                }
+                MountOption::ParallelJobsDelete(value) => {
+                    parallel_jobs_delete = value.parse::<usize>()
+                        .map_err(|err|{
+                            FsError::ConfigParsingFailed {
+                                msg: format!("fail to parse ParallelJobsDelete({}): {}", value, err) }
+                        })?;
+                }
                 _ => {}
             }
         }
@@ -406,13 +424,8 @@ impl TiFsConfig {
             existence_check: options.iter().find_map(|opt|{
                 (MountOption::NoExistenceCheck == *opt).then_some(false)
             }).unwrap_or(true),
-            parallel_jobs: options.iter().find_map(|opt|{
-                if let MountOption::ParallelJobs(value) = &opt {
-                    value.parse::<usize>().map_err(|err|{
-                        error!("fail to parse ParallelJobs({}): {}", value, err);
-                    }).ok()
-                } else { None }
-            }).unwrap_or(1),
+            parallel_jobs,
+            parallel_jobs_delete,
             max_chunk_size: options.iter().find_map(|opt|{
                 if let MountOption::MaxChunkSize(value) = &opt {
                     value.parse::<usize>().map_err(|err|{
