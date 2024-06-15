@@ -2,9 +2,10 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tikv_client::{BoundRange, Key, KvPair, Result, RetryOptions, Timestamp, Transaction, TransactionOptions, Value};
+use tikv_client::{Backoff, BoundRange, Key, KvPair, Result, RetryOptions, Timestamp, Transaction, TransactionOptions, Value};
 use tikv_client::transaction::Mutation;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 
 use super::error::FsError;
 use super::fs_config::TiFsConfig;
@@ -14,6 +15,40 @@ use super::utils::txn_data_cache::{TxnDelete, TxnFetch, TxnPut};
 use super::{error::TiFsResult, transaction::{DEFAULT_REGION_BACKOFF, OPTIMISTIC_BACKOFF}, transaction_client_mux::TransactionClientMux};
 
 use tikv_client::Result as TiKvResult;
+
+pub enum SpinningIterResult<R> {
+    Done(R),
+    TryAgain,
+    Failed(tikv_client::Error),
+}
+
+pub struct SpinningTxn {
+    pub backoff: Backoff,
+}
+
+impl SpinningTxn {
+    pub async fn end_iter<R: std::fmt::Debug>(&mut self, result: TiKvResult<R>, mini: &mut Transaction
+    ) -> SpinningIterResult<R> {
+        if let Ok(val) = result {
+            match mini.commit().await {
+                Ok(_t) => return SpinningIterResult::Done(val),
+                Err(error) => {
+                    if let Some(delay) = self.backoff.next_delay_duration() {
+                        sleep(delay).await;
+                        return SpinningIterResult::TryAgain;
+                    } else {
+                        return SpinningIterResult::Failed(error);
+                    }
+                }
+            }
+        } else {
+            if let Err(error) = mini.rollback().await {
+                tracing::error!("failed to rollback mini transaction. Err: {error:?}");
+            }
+            return SpinningIterResult::Failed(result.unwrap_err());
+        }
+    }
+}
 
 pub struct FlexibleTransaction {
     txn_client_mux: Arc<TransactionClientMux>,
@@ -58,7 +93,7 @@ impl FlexibleTransaction {
         Ok(transaction)
     }
 
-    async fn finish_txn<R>(result: TiKvResult<R>, mut mini: Transaction) -> TiFsResult<R> {
+    pub async fn finish_txn<R>(result: TiKvResult<R>, mut mini: Transaction) -> TiFsResult<R> {
         if result.is_ok() {
             mini.commit().await?;
         } else {

@@ -1,16 +1,17 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
-use std::ops::{Deref, Range, RangeInclusive};
+use std::ops::{Deref, Range};
 use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::TimeOrNow;
-use futures::TryFutureExt;
 use multimap::MultiMap;
+use num_bigint::BigUint;
 use num_format::{Buffer, Locale, ToFormattedString};
-use tikv_client::{Backoff, Key, KvPair, RetryOptions, TransactionOptions};
+use num_traits::FromPrimitive;
+use tikv_client::{Backoff, Key, KvPair, RetryOptions, Transaction, TransactionOptions};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, trace};
 use tikv_client::transaction::Mutation;
@@ -25,15 +26,15 @@ use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 use super::block::empty_block;
 use super::dir::StorageDirectory;
-use super::error::{FsError, Result, TiFsResult};
+use super::error::{FsError, TiFsResult};
 use super::file_handler::FileHandler;
-use super::flexible_transaction::FlexibleTransaction;
+use super::flexible_transaction::{FlexibleTransaction, SpinningIterResult, SpinningTxn};
 use super::fs_config::TiFsConfig;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::index::serialize_json;
 use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageFileAttr, StorageFilePermission, TiFsHash};
-use super::key::{read_big_endian, HashedBlockMeta, KeyKind, KeyParser, PendingDeleteMeta, ScopedKeyBuilder, ROOT_INODE};
+use super::key::{read_big_endian, HashedBlockMeta, KeyParser, PendingDeleteMeta, ScopedKeyBuilder, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::as_file_perm;
 use super::pending_deletes::PendingDeletes;
@@ -43,7 +44,7 @@ use super::reply::StatFs;
 use super::tikv_fs::TiFsCaches;
 use super::transaction_client_mux::TransactionClientMux;
 
-
+use tikv_client::Result as TiKvResult;
 
 pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000, 100);
 pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000);
@@ -93,17 +94,17 @@ fn set_if_changed<T: std::cmp::PartialEq>(
 }
 
 pub struct HashedBlockMetaData {
-    existing: BTreeSet<Uuid>,
-    named_usages: HashSet<Uuid>,
-    counters: HashSet<Uuid>,
+    pub existing: BTreeSet<Uuid>,
+    pub named_usages: HashSet<Uuid>,
+    pub counters: HashSet<Uuid>,
 }
 
 impl HashedBlockMetaData {
     pub fn new() -> Self {
         Self {
-            existing: HashSet::new(),
+            existing: BTreeSet::new(),
             named_usages: HashSet::new(),
-            counters: HashMap::new(),
+            counters: HashSet::new(),
         }
     }
 }
@@ -133,7 +134,7 @@ impl Txn {
         self.fs_config.clone()
     }
 
-    fn check_space_left(self: TxnArc, meta: &Meta) -> Result<()> {
+    fn check_space_left(self: TxnArc, meta: &Meta) -> TiFsResult<()> {
         match meta.last_stat {
             Some(ref stat) if stat.bavail == 0 => {
                 Err(FsError::NoSpaceLeft(stat.bsize as u64 * stat.blocks))
@@ -149,7 +150,7 @@ impl Txn {
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
         max_name_len: u32,
-    ) -> Result<TxnArc> {
+    ) -> TiFsResult<TxnArc> {
         let txn = if fs_config.pure_raw { None } else {
             let options = TransactionOptions::new_optimistic().use_async_commit();
             let options = options.retry_options(RetryOptions {
@@ -190,7 +191,7 @@ impl Txn {
         })
     }
 
-    pub async fn open(self: Arc<Self>, ino: StorageIno, use_id: Uuid) -> Result<()> {
+    pub async fn open(self: Arc<Self>, ino: StorageIno, use_id: Uuid) -> TiFsResult<()> {
         // check for existence
         let _inode = self.clone().read_inode(ino).await?;
         // publish opened state
@@ -200,7 +201,7 @@ impl Txn {
         Ok(())
     }
 
-    pub async fn close(self: Arc<Self>, ino: StorageIno, use_id: Uuid) -> Result<()> {
+    pub async fn close(self: Arc<Self>, ino: StorageIno, use_id: Uuid) -> TiFsResult<()> {
         // check for existence
         let _inode = self.clone().read_inode(ino).await?;
         // de-publish opened state
@@ -211,7 +212,7 @@ impl Txn {
     }
 
     #[instrument(skip(self))]
-    pub async fn read_hash_of_file(self: TxnArc, ino: StorageIno, offset: u64, size: u64) -> Result<Vec<u8>> {
+    pub async fn read_hash_of_file(self: TxnArc, ino: StorageIno, offset: u64, size: u64) -> TiFsResult<Vec<u8>> {
 
         let hash_size = self.fs_config.hash_len as u64;
         let offset = offset.clamp(0, hash_size);
@@ -249,7 +250,7 @@ impl Txn {
     }
 
     #[instrument(skip(self))]
-    pub async fn read_hashes_of_file(self: TxnArc, ino: StorageIno, offset: u64, size: u32) -> Result<Vec<u8>> {
+    pub async fn read_hashes_of_file(self: TxnArc, ino: StorageIno, offset: u64, size: u32) -> TiFsResult<Vec<u8>> {
         let hash_size = self.fs_config.hash_len as u64;
         let first_block = offset / hash_size;
         let first_block_offset = offset % hash_size;
@@ -272,11 +273,11 @@ impl Txn {
         Ok(result)
     }
 
-    pub async fn read(self: Arc<Self>, ino: StorageIno, start: u64, size: u32) -> Result<Vec<u8>> {
+    pub async fn read(self: Arc<Self>, ino: StorageIno, start: u64, size: u32) -> TiFsResult<Vec<u8>> {
         self.clone().read_data(ino, start, Some(size as u64), self.fs_config.enable_atime).await
     }
 
-    pub async fn reserve_new_ino(self: TxnArc) -> Result<StorageIno> {
+    pub async fn reserve_new_ino(self: TxnArc) -> TiFsResult<StorageIno> {
         let read_meta = self
             .clone().read_meta()
             .await?;
@@ -308,7 +309,7 @@ impl Txn {
         Ok(StorageIno(ino))
     }
 
-    pub async fn check_if_dir_entry_exists(self: Arc<Self>, parent: StorageIno, name: &ByteString) -> Result<bool> {
+    pub async fn check_if_dir_entry_exists(self: Arc<Self>, parent: StorageIno, name: &ByteString) -> TiFsResult<bool> {
         Ok(self.get_directory_item(parent, name.clone()).await?.is_some())
     }
 
@@ -317,7 +318,7 @@ impl Txn {
         parent: StorageIno,
         name: &ByteString,
         inode: &InoDescription
-    ) -> Result<()> {
+    ) -> TiFsResult<()> {
         if parent >= ROOT_INODE {
             if self.clone().check_if_dir_entry_exists(parent, name).await? {
                 return Err(FsError::FileExist {
@@ -343,7 +344,7 @@ impl Txn {
         uid: u32,
         rdev: u32,
         inline_data: Option<Vec<u8>>,
-    ) -> Result<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)> {
+    ) -> TiFsResult<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)> {
         let ino = self.clone().reserve_new_ino().await?;
 
         let ino_desc = Arc::new(InoDescription{
@@ -371,7 +372,7 @@ impl Txn {
         Ok((ino_desc, ino_size, ino_attr))
     }
 
-    pub async fn get_directory_item(self: Arc<Self>, parent: StorageIno, name: ByteString) -> Result<Option<StorageDirItem>> {
+    pub async fn get_directory_item(self: Arc<Self>, parent: StorageIno, name: ByteString) -> TiFsResult<Option<StorageDirItem>> {
         let key = Key::from(self.key_builder().directory_child(parent, &name));
         trace!("get dir item by key: {:?}", key);
         self.f_txn.get(key)
@@ -384,7 +385,7 @@ impl Txn {
             })
     }
 
-    pub async fn set_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, item: &StorageDirItem) -> Result<()> {
+    pub async fn set_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, item: &StorageDirItem) -> TiFsResult<()> {
         let lock_key = self.key_builder().inode_link_count(item.ino);
         let _critical_section = CriticalSectionKeyLock::new(self.clone(), lock_key).await?;
         let key = Key::from(self.key_builder().directory_child(parent, &name));
@@ -397,7 +398,7 @@ impl Txn {
         Ok(self.f_txn.batch_put(put_pairs).await?)
     }
 
-    pub async fn remove_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, ino: StorageIno) -> Result<()> {
+    pub async fn remove_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, ino: StorageIno) -> TiFsResult<()> {
         let lock_key = self.key_builder().inode_link_count(ino);
         let _critical_section = CriticalSectionKeyLock::new(self.clone(), lock_key).await?;
         let key = Key::from(self.key_builder().directory_child(parent, &name));
@@ -415,38 +416,38 @@ impl Txn {
         Ok(())
     }
 
-    pub async fn read_inode_uncached(self: TxnArc, ino: StorageIno) -> Result<Arc<InoDescription>> {
+    pub async fn read_inode_uncached(self: TxnArc, ino: StorageIno) -> TiFsResult<Arc<InoDescription>> {
         self.caches.inode_desc.read_uncached(&ino, &self.f_txn).await
     }
 
-    pub async fn read_inode(self: TxnArc, ino: StorageIno) -> Result<Arc<InoDescription>> {
+    pub async fn read_inode(self: TxnArc, ino: StorageIno) -> TiFsResult<Arc<InoDescription>> {
         self.caches.inode_desc.read_cached(&ino, &self.f_txn).await
     }
 
-    pub async fn read_ino_size(self: TxnArc, ino: StorageIno) -> Result<Arc<InoSize>> {
+    pub async fn read_ino_size(self: TxnArc, ino: StorageIno) -> TiFsResult<Arc<InoSize>> {
         self.caches.inode_size.read_cached(&ino, &self.f_txn).await
     }
 
-    pub async fn read_ino_lock_state(self: TxnArc, ino: StorageIno) -> Result<Arc<InoLockState>> {
+    pub async fn read_ino_lock_state(self: TxnArc, ino: StorageIno) -> TiFsResult<Arc<InoLockState>> {
         self.caches.inode_lock_state.read_cached(&ino, &self.f_txn).await
     }
 
     pub async fn write_ino_lock_state(self: TxnArc, ino: StorageIno, state: InoLockState
-    ) -> Result<()> {
+    ) -> TiFsResult<()> {
         self.caches.inode_lock_state.write_cached(ino, Arc::new(state), &self.f_txn).await
     }
 
-    pub async fn read_inode_arc(self: Arc<Self>, ino: StorageIno) -> Result<Arc<InoDescription>> {
+    pub async fn read_inode_arc(self: Arc<Self>, ino: StorageIno) -> TiFsResult<Arc<InoDescription>> {
         self.read_inode(ino).await
     }
 
-    pub async fn save_inode(self: TxnArc, inode: &Arc<InoDescription>) -> Result<()> {
+    pub async fn save_inode(self: TxnArc, inode: &Arc<InoDescription>) -> TiFsResult<()> {
         self.caches.inode_desc.write_cached(inode.storage_ino(), inode.clone(), &self.f_txn).await?;
         debug!("saved inode: {:?}", inode);
         Ok(())
     }
 
-    pub async fn remove_inode(self: TxnArc, ino: StorageIno) -> Result<()> {
+    pub async fn remove_inode(self: TxnArc, ino: StorageIno) -> TiFsResult<()> {
         let key = Key::from(self.key_builder().inode_description(ino));
         self.f_txn.delete(key).await?;
         self.caches.inode_desc.delete_with_cache(&ino, &self.f_txn).await?;
@@ -461,25 +462,25 @@ impl Txn {
         KeyParser::start(i, &self.fs_config.key_prefix, self.fs_config.hash_len)
     }
 
-    pub async fn read_static_meta(self: TxnArc) -> Result<Option<MetaStatic>> {
+    pub async fn read_static_meta(self: TxnArc) -> TiFsResult<Option<MetaStatic>> {
         let key = Key::from(self.key_builder().meta_static());
         let opt_data = self.f_txn.get(key).await?;
         opt_data.map(|data| MetaStatic::deserialize(&data)).transpose()
     }
 
-    pub async fn read_meta(self: TxnArc) -> Result<Option<Meta>> {
+    pub async fn read_meta(self: TxnArc) -> TiFsResult<Option<Meta>> {
         let key = Key::from(self.key_builder().meta());
         let opt_data = self.f_txn.get(key).await?;
         opt_data.map(|data| Meta::deserialize(&data)).transpose()
     }
 
-    pub async fn save_meta(self: TxnArc, meta: &Meta) -> Result<()> {
+    pub async fn save_meta(self: TxnArc, meta: &Meta) -> TiFsResult<()> {
         let key = Key::from(self.key_builder().meta());
         self.f_txn.put(key, meta.serialize()?).await?;
         Ok(())
     }
 
-    async fn transfer_inline_data_to_block(self: TxnArc, ino: StorageIno, ino_size: &mut InoSize) -> Result<()> {
+    async fn transfer_inline_data_to_block(self: TxnArc, ino: StorageIno, ino_size: &mut InoSize) -> TiFsResult<()> {
         debug_assert!(ino_size.size() <= self.inline_data_threshold());
         let key = Key::from(self.key_builder().block(BlockAddress { ino, index: 0 }));
         let data = ino_size.take_inline_data().unwrap();
@@ -493,7 +494,7 @@ impl Txn {
         ino_size: &mut InoSize,
         start: u64,
         data: &[u8],
-    ) -> Result<usize> {
+    ) -> TiFsResult<usize> {
         let size = data.len();
         let start = start as usize;
 
@@ -517,7 +518,7 @@ impl Txn {
         inode: &InoSize,
         start: u64,
         size: u64,
-    ) -> Result<Vec<u8>> {
+    ) -> TiFsResult<Vec<u8>> {
         let start = start as usize;
         let size = size as usize;
 
@@ -531,7 +532,7 @@ impl Txn {
         Ok(data)
     }
 
-    async fn hb_read_data(self: TxnArc, ino: StorageIno, start: u64, size: u64) -> Result<Vec<u8>> {
+    async fn hb_read_data(self: TxnArc, ino: StorageIno, start: u64, size: u64) -> TiFsResult<Vec<u8>> {
 
         let bs = BlockSplitterRead::new(self.block_size, start, size);
         let block_range = bs.block_range();
@@ -555,7 +556,7 @@ impl Txn {
         Ok(result)
     }
 
-    async fn read_data_traditional(self: TxnArc, ino: StorageIno, start: u64, size: u64) -> Result<Vec<u8>> {
+    async fn read_data_traditional(self: TxnArc, ino: StorageIno, start: u64, size: u64) -> TiFsResult<Vec<u8>> {
         let target = start + size;
         let start_block = start.div_floor(self.fs_config.block_size);
         let end_block = target.div_ceil(self.fs_config.block_size);
@@ -599,7 +600,7 @@ impl Txn {
         start: u64,
         chunk_size: Option<u64>,
         update_atime: bool,
-    ) -> Result<Vec<u8>> {
+    ) -> TiFsResult<Vec<u8>> {
 
         if update_atime {
             let atime = AccessTime(SystemTime::now());
@@ -626,7 +627,7 @@ impl Txn {
         }
     }
 
-    pub async fn clear_data(self: TxnArc, ino: StorageIno) -> Result<u64> {
+    pub async fn clear_data(self: TxnArc, ino: StorageIno) -> TiFsResult<u64> {
 
         let ino_size_key = self.key_builder().inode_size(ino);
         let key_lock = CriticalSectionKeyLock::new(
@@ -656,7 +657,7 @@ impl Txn {
         Ok(clear_size)
     }
 
-    pub async fn write_blocks_traditional(self: TxnArc, ino: StorageIno, start: u64, data: &Bytes) -> Result<()> {
+    pub async fn write_blocks_traditional(self: TxnArc, ino: StorageIno, start: u64, data: &Bytes) -> TiFsResult<()> {
 
         let mut block_index = start / self.block_size;
         let start_key = Key::from(self.key_builder().block(BlockAddress { ino, index: block_index }));
@@ -722,7 +723,7 @@ impl Txn {
 
     #[tracing::instrument(skip(self))]
     pub async fn hb_get_block_hash_list_by_block_range_chunked(self: TxnArc, ino: StorageIno, block_range: Range<u64>
-    ) -> Result<HashMap<BlockAddress, TiFsHash>> {
+    ) -> TiFsResult<HashMap<BlockAddress, TiFsHash>> {
         let mut i = block_range.start;
         let mut result = HashMap::with_capacity(block_range.clone().count());
         while i < block_range.end {
@@ -738,7 +739,7 @@ impl Txn {
     }
 
     pub async fn hb_get_block_data_by_hashes(self: TxnArc, hash_list: &HashSet<TiFsHash>
-    ) -> Result<HashMap<TiFsHash, Arc<Vec<u8>>>> {
+    ) -> TiFsResult<HashMap<TiFsHash, Arc<Vec<u8>>>> {
         let mut watch = AutoStopWatch::start("get_hash_blocks_data");
 
         let mut result = HashMap::new();
@@ -784,7 +785,7 @@ impl Txn {
         Ok(result)
     }
 
-    fn parse_keys_to_struct(&self, result: Vec<Key>, my_uuid: &Uuid) -> TiFsResult<HashedBlockMetaData> {
+    pub fn parse_keys_to_struct(&self, result: Vec<Key>, my_uuid: &Uuid) -> TiFsResult<HashedBlockMetaData> {
         let mut all = HashedBlockMetaData::new();
         for key in result.into_iter().map(|k|Vec::from(k)) {
             let mut i = key.iter();
@@ -806,72 +807,63 @@ impl Txn {
                 }
             }
         }
-        all
+        Ok(all)
     }
 
-    pub async fn hb_register_usages_and_filter_existent_blocks(
-        self: Arc<Self>,
-        mut new_blocks: HashMap<TiFsHash, Arc<Vec<u8>>>
-    ) -> Result<HashMap<TiFsHash, Arc<Vec<u8>>>> {
+    async fn hb_increment_blocks_reference_count(
+        &self,
+        mini: &mut Transaction,
+        block_key: Vec<u8>,
+        cnt: u64,
+    ) -> TiKvResult<BigUint> {
+        let prev_counter_value = mini.get(block_key.clone()).await?
+        .map(|vec|BigUint::from_bytes_be(&vec))
+        .unwrap_or(BigUint::from_u8(0u8).unwrap());
+        let new_counter_value = prev_counter_value.clone() + cnt;
+        mini.put(block_key.clone(), new_counter_value.to_bytes_be()).await?;
+        Ok(prev_counter_value)
+    }
 
-
-
-
-        // REGISTER
-        let my_uuid = Uuid::new_v4();
-        let key_list = new_blocks.keys().cloned().collect::<Vec<_>>();
-        let mut mutations = Vec::with_capacity(key_list.len());
-        key_list.iter().map(|hash|{
-            let key = self.key_builder().named_hashed_block_x(
-                &hash,
-                HashedBlockMeta::BNamedUsages,
-                Some(my_uuid)
-            );
-            mutations.push(Mutation::Put(Key::from(key), vec![]));
-        });
-        self.f_txn.batch_mutate(mutations).await?;
-
-        // SCAN+CHECK
-        let mut mutations_step1 = Vec::with_capacity(16);
-        let mut mutations_step2 = Vec::with_capacity(16);
-        for hash in key_list {
-            let range_key = self.key_builder().hashed_block_all_range(&hash);
-            let result = self.f_txn.scan_keys(range_key, 20).await?;
-            let all = self.parse_keys_to_struct(result, &my_uuid)?;
-
-            let combined = all.counters.union(&all.named_usages).cloned().collect::<BTreeSet<_>>();
-            let use_and_block_exists = combined.intersection(&all.existing).cloned().collect::<BTreeSet<_>>();
-
-            if use_and_block_exists.len() > 0 {
-                let existing_name = use_and_block_exists.first().unwrap();
-                // usual case, DONE
-                new_blocks.remove(&hash);
-                let new_key = self.key_builder().named_hashed_block_x(
-                    &hash,
-                    HashedBlockMeta::BNamedUsages,
-                    Some(*existing_name)
-                );
-                mutations_step1.push(Mutation::Put(Key::from(new_key), vec![]));
-                let old_key = self.key_builder().named_hashed_block_x(
-                    &hash,
-                    HashedBlockMeta::BNamedUsages,
-                    Some(my_uuid)
-                );
-                mutations_step2.push(Mutation::Delete(Key::from(old_key)));
+    pub async fn hb_upload_block_reference_counting(&self, hash: &TiFsHash, cnt: u64, data: Vec<u8>
+    ) -> TiFsResult<()> {
+        let block_key = self.key_builder().named_hashed_block_x(
+            hash, Some(HashedBlockMeta::CCountedNamedUsages), None);
+        let mut spin = SpinningTxn{
+            backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10)
+        };
+        // get and increment block reference counter (with automatic retry)
+        let prev_cnt = loop {
+            let mut mini = self.f_txn.mini_txn().await?;
+            let result = self.hb_increment_blocks_reference_count(
+                &mut mini, block_key.clone(), cnt).await;
+            match spin.end_iter(result, &mut mini).await {
+                SpinningIterResult::Done(prev_cnt) => break prev_cnt,
+                SpinningIterResult::TryAgain => {},
+                SpinningIterResult::Failed(err) => return Err(err.into()),
             }
+        };
 
-            if result.len() > 0 {
-                new_blocks.remove(&hash);
-            }
+        // Upload block if new
+        if prev_cnt == BigUint::from_u8(0).unwrap() {
+            let key = self.f_txn.key_builder().hashed_block(hash);
+            self.f_txn.put(key, data).await?;
         }
-        self.f_txn.batch_mutate(mutations_step1).await?;
-        self.f_txn.batch_mutate(mutations_step2).await?;
-
-        Ok(new_blocks)
+        Ok(())
     }
 
+    pub async fn hb_upload_block_reference_counting_and_write_addresses(
+        self: TxnArc, hash: TiFsHash, cnt: u64, data: Vec<u8>, addresses: Vec<BlockAddress>,
+    ) -> TiFsResult<()> {
+        self.hb_upload_block_reference_counting(&hash, cnt, data).await?;
 
-    pub async fn hb_upload_new_blocks(self: Arc<Self>, new_blocks: HashMap<TiFsHash, Arc<Vec<u8>>>) -> Result<()> {
+        for addr in addresses {
+            let key = self.key_builder().block_hash(addr);
+            self.f_txn.put(key, hash.clone()).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn hb_upload_new_blocks(self: Arc<Self>, new_blocks: HashMap<TiFsHash, Arc<Vec<u8>>>) -> TiFsResult<()> {
         let mut mutations_txn = Vec::<Mutation>::new();
 
         for (k, new_block) in new_blocks {
@@ -886,7 +878,7 @@ impl Txn {
         Ok(())
     }
 
-    pub async fn hb_upload_new_block_addresses(me: Arc<Self>, blocks_to_assign: VecDeque<(TiFsHash, Vec<BlockAddress>)>) -> Result<()> {
+    pub async fn hb_upload_new_block_addresses(me: Arc<Self>, blocks_to_assign: VecDeque<(TiFsHash, Vec<BlockAddress>)>) -> TiFsResult<()> {
         let mut kv_pairs = Vec::<KvPair>::new();
         for (hash, addresses) in blocks_to_assign {
             for addr in addresses {
@@ -896,7 +888,7 @@ impl Txn {
         Ok(me.f_txn.batch_put(kv_pairs).await?)
     }
 
-    pub async fn hb_write_data(self: Arc<Self>, fh: Arc<FileHandler>, start: u64, data: Bytes) -> Result<bool> {
+    pub async fn hb_write_data(self: Arc<Self>, fh: Arc<FileHandler>, start: u64, data: Bytes) -> TiFsResult<bool> {
 
         let mut watch = AutoStopWatch::start("hb_wrt");
         let bs = BlockSplitterWrite::new(self.block_size, start, &data);
@@ -959,27 +951,14 @@ impl Txn {
         }
 
         let new_block_hashes_len = new_block_hashes.len();
-        let mut mm = new_block_hashes.into_iter()
+        let mm = new_block_hashes.into_iter()
             .map(|(k,v)| (v,k)).collect::<MultiMap<_,_>>();
 
-        let chunks: VecDeque<HashMap<TiFsHash, Arc<Vec<u8>>>> = make_chunks_hash_map(
-            new_blocks, self.fs_config.max_chunk_size);
+        for (hash, addresses) in mm {
 
-        for chunk in chunks {
-            let blocks_to_assign = chunk.keys().filter_map(|hash| {
-                let values = mm.remove(hash);
-                values.map(|values|(hash.clone(), values))
-            }).collect::<VecDeque<_>>();
-
-            let r = self.weak.upgrade().unwrap();
-            let r2 = r.clone();
-
-            let fut = Self::hb_register_usages_and_filter_existent_blocks(r.clone(), chunk)
-            .and_then(move |remaining_new_blocks|{
-                Self::hb_upload_new_blocks(r, remaining_new_blocks)
-            }).and_then(move |_|{
-                Self::hb_upload_new_block_addresses(r2, blocks_to_assign)
-            });
+            let data = new_blocks.get(&hash).unwrap();
+            let fut = self.clone().hb_upload_block_reference_counting_and_write_addresses(
+                hash, addresses.len() as u64, data.deref().clone(), addresses);
 
             parallel_executor.push(fut).await;
         }
@@ -998,7 +977,7 @@ impl Txn {
         Ok(was_modified)
     }
 
-    pub async fn read_pending_deletes(self: TxnArc) -> Result<PendingDeletes> {
+    pub async fn read_pending_deletes(self: TxnArc) -> TiFsResult<PendingDeletes> {
         let range = self.key_builder().pending_delete_scan_list();
         let pairs = self.f_txn.scan(range, MAX_TIKV_SCAN_LIMIT).await?;
         let mut iteration_number = None;
@@ -1034,19 +1013,19 @@ impl Txn {
         })
     }
 
-    pub async fn publish_active_writer_state(self: TxnArc, iteration_number: u64, writer_id: Uuid) -> Result<()> {
+    pub async fn publish_active_writer_state(self: TxnArc, iteration_number: u64, writer_id: Uuid) -> TiFsResult<()> {
         let key = self.key_builder().pending_delete_active_writer(iteration_number, writer_id);
         let unix_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         self.f_txn.put(key, unix_timestamp.to_be_bytes().to_vec()).await
     }
 
-    pub async fn read_pending_deletes_and_publish_writer_state(self: TxnArc, writer_id: Uuid) -> Result<PendingDeletes> {
+    pub async fn read_pending_deletes_and_publish_writer_state(self: TxnArc, writer_id: Uuid) -> TiFsResult<PendingDeletes> {
         let output = self.clone().read_pending_deletes().await?;
         self.publish_active_writer_state(output.iteration_number, writer_id).await?;
         Ok(output)
     }
 
-    pub async fn write(self: TxnArc, fh: Arc<FileHandler>, start: u64, data: Bytes) -> Result<usize> {
+    pub async fn write(self: TxnArc, fh: Arc<FileHandler>, start: u64, data: Bytes) -> TiFsResult<usize> {
         let mut watch = AutoStopWatch::start("write_data");
         let ino = fh.ino();
         debug!("write data at ({})[{}]", ino, start);
@@ -1126,7 +1105,7 @@ impl Txn {
         ino_size.set_size(data.len() as u64, block_size);
     }
 
-    pub async fn read_link(self: TxnArc, ino: StorageIno) -> Result<Vec<u8>> {
+    pub async fn read_link(self: TxnArc, ino: StorageIno) -> TiFsResult<Vec<u8>> {
         let ino_size = self.caches.inode_size.read_cached(&ino, &self.f_txn).await?;
         let size = ino_size.size();
 
@@ -1140,7 +1119,7 @@ impl Txn {
     }
 
     pub async fn add_hard_link(self: TxnArc, ino: StorageIno, further_parent: StorageIno, new_name: ByteString
-    ) -> Result<Arc<InoDescription>> {
+    ) -> TiFsResult<Arc<InoDescription>> {
         // check and remove any inode at destination:
         if let Some(old_dir_item) = self.clone().get_directory_item(further_parent, new_name.clone()).await? {
             match old_dir_item.typ {
@@ -1163,7 +1142,7 @@ impl Txn {
             self: TxnArc,
             parent: StorageIno,
             name: ByteString
-    ) -> Result<()> {
+    ) -> TiFsResult<()> {
         let Some(dir_entry) = self.clone().get_directory_item(parent, name.clone()).await? else {
             return Err(FsError::FileNotFound { file: name.to_string() });
         };
@@ -1192,7 +1171,7 @@ impl Txn {
         Ok(())
     }
 
-    pub async fn rmdir(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {
+    pub async fn rmdir(self: TxnArc, parent: StorageIno, name: ByteString) -> TiFsResult<()> {
         match self.clone().get_directory_item(parent, name.clone()).await? {
             None => Err(FsError::FileNotFound {
                 file: name.to_string(),
@@ -1215,7 +1194,7 @@ impl Txn {
         }
     }
 
-    pub async fn lookup_ino(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<StorageDirItem> {
+    pub async fn lookup_ino(self: TxnArc, parent: StorageIno, name: ByteString) -> TiFsResult<StorageDirItem> {
         self.get_directory_item(parent, name.clone())
             .await?
             .ok_or_else(|| FsError::FileNotFound {
@@ -1224,7 +1203,7 @@ impl Txn {
     }
 
     pub async fn get_all_ino_data(self: TxnArc, ino: StorageIno,
-    ) -> Result<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)> {
+    ) -> TiFsResult<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)> {
         let desc = self.caches.inode_desc.read_cached(&ino, &self.f_txn).await?;
         let attr = self.caches.inode_attr.read_cached(&ino, &self.f_txn).await?;
         let size = self.caches.inode_size.read_cached(&ino, &self.f_txn).await?;
@@ -1291,7 +1270,7 @@ impl Txn {
         ino: StorageIno,
         offset: i64,
         length: i64
-    ) -> Result<()> {
+    ) -> TiFsResult<()> {
         let lock = self.caches.get_or_create_ino_lock(fh.ino_use.ino).await;
         let wr_lock = lock.write().await;
         let mut ino_size = self.caches.inode_size.read_cached(
@@ -1326,14 +1305,14 @@ impl Txn {
         perm: StorageFilePermission,
         gid: u32,
         uid: u32,
-    ) -> Result<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)> {
+    ) -> TiFsResult<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)> {
         let (ino_desc, ino_size, ino_attr)
             = self.clone().make_inode(parent, name, StorageDirItemKind::Directory,
                 perm, gid, uid, 0, None).await?;
         Ok((ino_desc, ino_size, ino_attr))
     }
 
-    pub async fn read_dir(self: Arc<Self>, ino: StorageIno) -> Result<StorageDirectory> {
+    pub async fn read_dir(self: Arc<Self>, ino: StorageIno) -> TiFsResult<StorageDirectory> {
         let range = self.key_builder().directory_child_range(ino);
         //trace!("start scan: {:?}", range);
         let data = self.f_txn.scan(range, 10).await?;
@@ -1358,7 +1337,7 @@ impl Txn {
         Ok(result)
     }
 
-    pub async fn statfs(self: TxnArc) -> Result<StatFs> {
+    pub async fn statfs(self: TxnArc) -> TiFsResult<StatFs> {
 
         /*
         let bsize = self.block_size as u32;

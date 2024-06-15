@@ -191,11 +191,11 @@ impl<'ol> KeyParser<'ol> {
     }
     */
 
-    pub fn parse_pending_deletes_x<'fl>(mut self) -> TiFsResult<KeyParserPendingDelete<'ol>> {
+    pub fn parse_pending_deletes_x<'fl>(self) -> TiFsResult<KeyParserPendingDelete<'ol>> {
         if self.kind != KeyKind::PendingDelete {
             return Err(FsError::UnknownError(format!("expected a pending delete key. got: {:?}", self.kind)))
         }
-        let kind_id = *self.i.next().unwrap_or(&0xFF);
+        let kind_id = self.i.next().unwrap_or(&0xFF).clone();
         let kind = *PENDING_DELETE_META_KEY_IDS.get_by_left(&kind_id).ok_or(
             FsError::UnknownError(format!("key with unknown pending deletes kind: {}", kind_id)))?;
         Ok(KeyParserPendingDelete {
@@ -219,16 +219,16 @@ impl<'ol> KeyParser<'ol> {
         })
     }
 
-    pub fn parse_hash_block_key_x<'fl>(mut self) -> TiFsResult<KeyParserHashBlock<'ol>> {
+    pub fn parse_hash_block_key_x<'fl>(self) -> TiFsResult<KeyParserHashBlock<'ol>> {
         if self.kind != KeyKind::HashedBlock {
             return Err(FsError::UnknownError(format!("expected a HashedBlock key. got: {:?}", self.kind)))
         }
         let (me, hash) = self.parse_hash()?;
-        let kind_id = *self.i.next().unwrap_or(&0xFF);
+        let kind_id = me.i.next().unwrap_or(&0xFF).clone();
         let kind = *HASHED_BLOCK_META_KEY_IDS.get_by_left(&kind_id).ok_or(
             FsError::UnknownError(format!("key with unknown hash block kind: {}", kind_id)))?;
         Ok(KeyParserHashBlock {
-            pre: self,
+            pre: me,
             hash,
             meta: kind,
         })
@@ -244,7 +244,7 @@ impl<'ol> KeyParser<'ol> {
         Ok((self, hash[0..hash_len].to_vec()))
     }
 
-    pub fn __parse_key_hashed_block(self) -> TiFsResult<TiFsHash> {
+    pub fn parse_key_hashed_block(self) -> TiFsResult<TiFsHash> {
         Ok(match self.kind {
             KeyKind::HashedBlock => self.parse_hash()?.1,
             KeyKind::HashedBlockExists => self.parse_hash()?.1,
@@ -264,14 +264,14 @@ impl<'ol> KeyParser<'ol> {
         })
     }
 
-    pub fn parse_uuid(mut self) -> TiFsResult<(Self, Uuid)> {
+    pub fn parse_uuid(self) -> TiFsResult<(Self, Uuid)> {
         const UUID_LEN: usize = 16;
         let chunk = self.i.as_slice().array_chunks::<UUID_LEN>().next();
         let Some(chunk) = chunk else {
             return Err(FsError::UnknownError(
                 format!("parse_lock_key(): key length too small")));
         };
-        self.i.advance_by(UUID_LEN);
+        self.i.advance_by(UUID_LEN).unwrap();
         Ok((self, Uuid::from_bytes_ref(chunk).clone()))
     }
 
@@ -455,15 +455,19 @@ impl ScopedKeyBuilder {
     pub fn named_hashed_block_x<'fl>(
         self,
         hash: &'fl[u8],
-        meta: HashedBlockMeta,
+        meta: Option<HashedBlockMeta>,
         name: Option<Uuid>
     ) -> KeyBuffer {
         let mut me = self.write_key_kind(KeyKind::HashedBlock);
         me.buf.extend_from_slice(hash);
+        let Some(meta) = meta else {
+            return me.buf;
+        };
         me.buf.push(*HASHED_BLOCK_META_KEY_IDS.get_by_right(&meta).unwrap());
-        if let Some(name) = name {
-            me.buf.extend_from_slice(name.as_bytes());
-        }
+        let Some(name) = name else {
+            return me.buf;
+        };
+        me.buf.extend_from_slice(name.as_bytes());
         me.buf
     }
 
@@ -476,15 +480,21 @@ impl ScopedKeyBuilder {
         }
     }
 
-    pub fn hashed_block_range<'fl>(self, hash: &'fl[u8]) -> BoundRange {
+    pub fn hashed_block<'fl>(self, hash: &'fl[u8]) -> KeyBuffer {
         let mut me = self.write_key_kind(KeyKind::HashedBlock);
+        me.buf.extend_from_slice(hash);
+        me.buf
+    }
+
+    pub fn named_hashed_block_range<'fl>(self, hash: &'fl[u8]) -> BoundRange {
+        let mut me = self.write_key_kind(KeyKind::NamedHashedBlock);
         me.buf.extend_from_slice(hash);
         me.buf.push(*HASHED_BLOCK_META_KEY_IDS.get_by_right(&HashedBlockMeta::ANamedBlock).unwrap());
         me.sub_key_range()
     }
 
-    pub fn hashed_block_all_range<'fl>(self, hash: &'fl[u8]) -> BoundRange {
-        let mut me = self.write_key_kind(KeyKind::HashedBlock);
+    pub fn named_hashed_block_all_range<'fl>(self, hash: &'fl[u8]) -> BoundRange {
+        let mut me = self.write_key_kind(KeyKind::NamedHashedBlock);
         me.buf.extend_from_slice(hash);
         me.sub_key_range()
     }
