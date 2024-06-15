@@ -5,7 +5,7 @@ use strum::{EnumIter, IntoEnumIterator};
 use tikv_client::{BoundRange, Key, KvPair};
 use uuid::Uuid;
 
-use super::{error::TiFsResult, key::ScopedKeyBuilder, transaction::{Txn, TxnArc, MAX_TIKV_SCAN_LIMIT}};
+use super::{error::TiFsResult, key::ScopedKeyBuilder, transaction::{Txn, MAX_TIKV_SCAN_LIMIT}};
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
 pub enum SzymanskisState {
@@ -116,7 +116,7 @@ impl SzymanowskiCriticalSection {
         Ok(())
     }
 
-    pub async fn leave_arc(mut self, txn: TxnArc) -> TiFsResult<()> {
+    pub async fn leave_arc(mut self, txn: Arc<Txn>) -> TiFsResult<()> {
         self.leave(&txn).await
     }
 
@@ -216,12 +216,12 @@ impl CriticalSectionKeyLock {
 
 impl Drop for CriticalSectionKeyLock {
     fn drop(&mut self) {
-        let moved_self = Self {
-            critical_section: self.critical_section.take(),
-            txn: self.txn.clone(),
-        };
-        tokio::spawn((move || {
-            moved_self.unlock()
-        })());
+        let cs = self.critical_section.take();
+        let txn = self.txn.clone();
+        if let Some(cs) = cs {
+            tokio::spawn((move || {
+                cs.leave_arc(txn)
+            })());
+        }
     }
 }
