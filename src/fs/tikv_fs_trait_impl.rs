@@ -275,10 +275,6 @@ impl AsyncFileSystem for TiFs {
         let fh_clone = file_handler.clone();
         let arc = self.weak.upgrade().unwrap();
 
-        let pending_deletes = arc.clone().spin_no_delay_arc(format!("update pending deletes"), |me, txn|{
-            txn.read_pending_deletes_and_publish_writer_state(arc.instance_id).boxed()
-        }).await?;
-
         let fut =
             arc.clone().spin_no_delay_arc(format!("write, ino:{ino}, fh:{fh}, offset:{offset}, data.len:{}", size),
                 move |_me, txn| txn.write(fh_clone.clone(), start as u64, data.clone()).boxed());

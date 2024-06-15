@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
 use std::ops::{Deref, Range, RangeInclusive};
 use std::sync::{Arc, Weak};
@@ -33,7 +33,7 @@ use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::index::serialize_json;
 use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageFileAttr, StorageFilePermission, TiFsHash};
-use super::key::{read_big_endian, KeyKind, KeyParser, PendingDeleteMeta, ScopedKeyBuilder, ROOT_INODE};
+use super::key::{read_big_endian, HashedBlockMeta, KeyKind, KeyParser, PendingDeleteMeta, ScopedKeyBuilder, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::as_file_perm;
 use super::pending_deletes::PendingDeletes;
@@ -88,6 +88,22 @@ fn set_if_changed<T: std::cmp::PartialEq>(
         if changed {
             *change_cnt += 1;
             *field = new_value;
+        }
+    }
+}
+
+pub struct HashedBlockMetaData {
+    existing: BTreeSet<Uuid>,
+    named_usages: HashSet<Uuid>,
+    counters: HashSet<Uuid>,
+}
+
+impl HashedBlockMetaData {
+    pub fn new() -> Self {
+        Self {
+            existing: HashSet::new(),
+            named_usages: HashSet::new(),
+            counters: HashMap::new(),
         }
     }
 }
@@ -768,31 +784,89 @@ impl Txn {
         Ok(result)
     }
 
-    pub async fn hb_filter_existent_blocks(self: Arc<Self>, mut new_blocks: HashMap<TiFsHash, Arc<Vec<u8>>>) -> Result<HashMap<TiFsHash, Arc<Vec<u8>>>> {
-        if self.fs_config.existence_check {
-            if self.fs_config.validate_writes {
-                let key_list = new_blocks.keys().cloned().collect::<Vec<_>>();
-                for hash in key_list {
-                    let key = self.key_builder().hashed_block(&hash);
-                    let key_range: RangeInclusive<Key> = key.clone().into()..=key.into();
-                    let result = self.f_txn.scan_keys(key_range, 1).await?;
-                    if result.len() > 0 {
-                        new_blocks.remove(&hash);
+    fn parse_keys_to_struct(&self, result: Vec<Key>, my_uuid: &Uuid) -> TiFsResult<HashedBlockMetaData> {
+        let mut all = HashedBlockMetaData::new();
+        for key in result.into_iter().map(|k|Vec::from(k)) {
+            let mut i = key.iter();
+            let kp = self.key_parser(&mut i)?.parse_hash_block_key_x()?;
+            match kp.meta {
+                HashedBlockMeta::ANamedBlock => {
+                    let (_kp, uuid) = kp.pre.parse_uuid()?;
+                    all.existing.insert(uuid);
+                }
+                HashedBlockMeta::BNamedUsages => {
+                    let (_kp, uuid) = kp.pre.parse_uuid()?;
+                    if uuid != *my_uuid { // filter own registration
+                        all.named_usages.insert(uuid);
                     }
                 }
-            } else {
-                let exists_keys_request = new_blocks.keys().map(|k| self.key_builder().hashed_block_exists(k)).collect::<Vec<_>>();
-                let exists_keys_response = self.f_txn.batch_get(exists_keys_request).await?;
-                for KvPair(key, _) in exists_keys_response.into_iter() {
-                    let key = Vec::from(key);
-                    let mut i = key.iter();
-                    let hash = self.key_parser(&mut i)
-                        .and_then(|x|x.parse_key_hashed_block())
-                        .map_err(|e|FsError::UnknownError(format!("failed parsing hash from response: {}", e)))?;
-                    new_blocks.remove(&hash);
+                HashedBlockMeta::CCountedNamedUsages => {
+                    let (_kp, uuid) = kp.pre.parse_uuid()?;
+                    all.counters.insert(uuid);
                 }
             }
         }
+        all
+    }
+
+    pub async fn hb_register_usages_and_filter_existent_blocks(
+        self: Arc<Self>,
+        mut new_blocks: HashMap<TiFsHash, Arc<Vec<u8>>>
+    ) -> Result<HashMap<TiFsHash, Arc<Vec<u8>>>> {
+
+
+
+
+        // REGISTER
+        let my_uuid = Uuid::new_v4();
+        let key_list = new_blocks.keys().cloned().collect::<Vec<_>>();
+        let mut mutations = Vec::with_capacity(key_list.len());
+        key_list.iter().map(|hash|{
+            let key = self.key_builder().named_hashed_block_x(
+                &hash,
+                HashedBlockMeta::BNamedUsages,
+                Some(my_uuid)
+            );
+            mutations.push(Mutation::Put(Key::from(key), vec![]));
+        });
+        self.f_txn.batch_mutate(mutations).await?;
+
+        // SCAN+CHECK
+        let mut mutations_step1 = Vec::with_capacity(16);
+        let mut mutations_step2 = Vec::with_capacity(16);
+        for hash in key_list {
+            let range_key = self.key_builder().hashed_block_all_range(&hash);
+            let result = self.f_txn.scan_keys(range_key, 20).await?;
+            let all = self.parse_keys_to_struct(result, &my_uuid)?;
+
+            let combined = all.counters.union(&all.named_usages).cloned().collect::<BTreeSet<_>>();
+            let use_and_block_exists = combined.intersection(&all.existing).cloned().collect::<BTreeSet<_>>();
+
+            if use_and_block_exists.len() > 0 {
+                let existing_name = use_and_block_exists.first().unwrap();
+                // usual case, DONE
+                new_blocks.remove(&hash);
+                let new_key = self.key_builder().named_hashed_block_x(
+                    &hash,
+                    HashedBlockMeta::BNamedUsages,
+                    Some(*existing_name)
+                );
+                mutations_step1.push(Mutation::Put(Key::from(new_key), vec![]));
+                let old_key = self.key_builder().named_hashed_block_x(
+                    &hash,
+                    HashedBlockMeta::BNamedUsages,
+                    Some(my_uuid)
+                );
+                mutations_step2.push(Mutation::Delete(Key::from(old_key)));
+            }
+
+            if result.len() > 0 {
+                new_blocks.remove(&hash);
+            }
+        }
+        self.f_txn.batch_mutate(mutations_step1).await?;
+        self.f_txn.batch_mutate(mutations_step2).await?;
+
         Ok(new_blocks)
     }
 
@@ -802,7 +876,7 @@ impl Txn {
 
         for (k, new_block) in new_blocks {
             mutations_txn.push(Mutation::Put(self.key_builder().hashed_block(&k).into(), new_block.deref().clone()));
-            mutations_txn.push(Mutation::Put(self.key_builder().hashed_block_exists(&k).into(), vec![]));
+            //mutations_txn.push(Mutation::Put(self.key_builder().hashed_block_exists(&k).into(), vec![]));
         }
 
         if mutations_txn.len() > 0 {
@@ -864,12 +938,12 @@ impl Txn {
             new_blocks.insert(hash.clone(), Arc::new(chunk.to_vec()));
             new_block_hashes.insert(BlockAddress{ino, index: bs.mid_data.block_index + index as u64}, hash);
         }
-        watch.sync("h");
+        watch.sync("hash");
 
         for (hash, new_block) in &new_blocks {
             self.caches.block.insert(hash.clone(), new_block.clone()).await;
         }
-        watch.sync("ca");
+        watch.sync("add_cache");
 
         let mut parallel_executor = AsyncParallelPipeStage::new(self.fs_config.parallel_jobs);
 
@@ -883,8 +957,8 @@ impl Txn {
                 }
             }
         }
-        let new_block_hashes_len = new_block_hashes.len();
 
+        let new_block_hashes_len = new_block_hashes.len();
         let mut mm = new_block_hashes.into_iter()
             .map(|(k,v)| (v,k)).collect::<MultiMap<_,_>>();
 
@@ -900,7 +974,7 @@ impl Txn {
             let r = self.weak.upgrade().unwrap();
             let r2 = r.clone();
 
-            let fut = Self::hb_filter_existent_blocks(r.clone(), chunk)
+            let fut = Self::hb_register_usages_and_filter_existent_blocks(r.clone(), chunk)
             .and_then(move |remaining_new_blocks|{
                 Self::hb_upload_new_blocks(r, remaining_new_blocks)
             }).and_then(move |_|{

@@ -29,12 +29,20 @@ pub enum KeyKind {
     DirectoryChild, // { parent: u64, name: &'static str } => { ino: u64 }
     ParentLink, // { ino: u64, parent_ino: u64 } => None
     HashedBlock, // { hash: &[u8] },
-    BlockHash, // { ino: u64, block: u64 } => { hash: &[u8] }
+    InoBlockHashMapping, // { ino: u64, block: u64 } => { hash: &[u8] }
     HashedBlockExists, // { hash: &[u8] } => None
     PendingDelete,
     //HashedBlockUsedBy { hash: &'a[u8], ino: u64, block: u64 },
-
+    NamedHashedBlock, // { hash: &[u8], meta, uuid },
 }
+
+#[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
+pub enum HashedBlockMeta {
+    ANamedBlock,
+    BNamedUsages,
+    CCountedNamedUsages,
+}
+
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
 pub enum PendingDeleteMeta {
@@ -81,6 +89,10 @@ lazy_static!{
 
     static ref PENDING_DELETE_META_KEY_IDS: BiHashMap<u8, PendingDeleteMeta> = {
         PendingDeleteMeta::iter().enumerate().map(|(a,b)|(a as u8,b)).collect()
+    };
+
+    static ref HASHED_BLOCK_META_KEY_IDS: BiHashMap<u8, HashedBlockMeta> = {
+        HashedBlockMeta::iter().enumerate().map(|(a,b)|(a as u8,b)).collect()
     };
 }
 
@@ -207,6 +219,21 @@ impl<'ol> KeyParser<'ol> {
         })
     }
 
+    pub fn parse_hash_block_key_x<'fl>(mut self) -> TiFsResult<KeyParserHashBlock<'ol>> {
+        if self.kind != KeyKind::HashedBlock {
+            return Err(FsError::UnknownError(format!("expected a HashedBlock key. got: {:?}", self.kind)))
+        }
+        let (me, hash) = self.parse_hash()?;
+        let kind_id = *self.i.next().unwrap_or(&0xFF);
+        let kind = *HASHED_BLOCK_META_KEY_IDS.get_by_left(&kind_id).ok_or(
+            FsError::UnknownError(format!("key with unknown hash block kind: {}", kind_id)))?;
+        Ok(KeyParserHashBlock {
+            pre: self,
+            hash,
+            meta: kind,
+        })
+    }
+
     fn parse_hash(self) -> TiFsResult<(Self, TiFsHash)> {
         let hash_len = self.hash_len;
         let hash = self.i.as_slice();
@@ -217,7 +244,7 @@ impl<'ol> KeyParser<'ol> {
         Ok((self, hash[0..hash_len].to_vec()))
     }
 
-    pub fn parse_key_hashed_block(self) -> TiFsResult<TiFsHash> {
+    pub fn __parse_key_hashed_block(self) -> TiFsResult<TiFsHash> {
         Ok(match self.kind {
             KeyKind::HashedBlock => self.parse_hash()?.1,
             KeyKind::HashedBlockExists => self.parse_hash()?.1,
@@ -230,11 +257,22 @@ impl<'ol> KeyParser<'ol> {
     pub fn parse_key_block_address(self) -> TiFsResult<BlockAddress> {
         Ok(match self.kind {
             KeyKind::Block => BlockAddress::deserialize_from(self.i)?,
-            KeyKind::BlockHash => BlockAddress::deserialize_from(self.i)?,
+            KeyKind::InoBlockHashMapping => BlockAddress::deserialize_from(self.i)?,
             other => {
                 return Err(FsError::UnknownError(format!("parse_key_block_address(): unexpected key_type: {:?}", other)));
             }
         })
+    }
+
+    pub fn parse_uuid(mut self) -> TiFsResult<(Self, Uuid)> {
+        const UUID_LEN: usize = 16;
+        let chunk = self.i.as_slice().array_chunks::<UUID_LEN>().next();
+        let Some(chunk) = chunk else {
+            return Err(FsError::UnknownError(
+                format!("parse_lock_key(): key length too small")));
+        };
+        self.i.advance_by(UUID_LEN);
+        Ok((self, Uuid::from_bytes_ref(chunk).clone()))
     }
 
     pub fn parse_lock_key(self, key_to_lock: &Vec<u8>) -> TiFsResult<Uuid> {
@@ -248,12 +286,7 @@ impl<'ol> KeyParser<'ol> {
                 format!("parse_lock_key(): unexpected key_to_lock_act: {:?}", key_to_lock_act)));
         }
         self.i.advance_by(key_to_lock.len()).unwrap();
-        let chunk = self.i.as_slice().array_chunks::<16>().next();
-        let Some(chunk) = chunk else {
-            return Err(FsError::UnknownError(
-                format!("parse_lock_key(): key length too small")));
-        };
-        Ok(Uuid::from_bytes_ref(chunk).clone())
+        Ok(self.parse_uuid()?.1)
     }
 
     pub fn parse_directory_child(mut self) -> TiFsResult<(StorageIno, Vec<u8>)> {
@@ -276,6 +309,12 @@ pub struct KeyParserIno<'ol> {
 pub struct KeyParserPendingDelete<'ol> {
     pub pre: KeyParser<'ol>,
     pub meta: PendingDeleteMeta,
+}
+
+pub struct KeyParserHashBlock<'ol> {
+    pub pre: KeyParser<'ol>,
+    pub hash: TiFsHash,
+    pub meta: HashedBlockMeta,
 }
 
 #[derive(Clone)]
@@ -408,15 +447,46 @@ impl ScopedKeyBuilder {
     }
 
     pub fn block_hash(self, addr: BlockAddress) -> KeyBuffer {
-        let mut me = self.write_key_kind(KeyKind::BlockHash);
+        let mut me = self.write_key_kind(KeyKind::InoBlockHashMapping);
         addr.serialize_to(&mut me.buf);
         me.buf
     }
 
-    pub fn hashed_block<'fl>(self, hash: &'fl[u8]) -> KeyBuffer {
+    pub fn named_hashed_block_x<'fl>(
+        self,
+        hash: &'fl[u8],
+        meta: HashedBlockMeta,
+        name: Option<Uuid>
+    ) -> KeyBuffer {
         let mut me = self.write_key_kind(KeyKind::HashedBlock);
         me.buf.extend_from_slice(hash);
+        me.buf.push(*HASHED_BLOCK_META_KEY_IDS.get_by_right(&meta).unwrap());
+        if let Some(name) = name {
+            me.buf.extend_from_slice(name.as_bytes());
+        }
         me.buf
+    }
+
+    pub fn sub_key_range(self) -> BoundRange {
+        let mut end = self.clone();
+        *end.buf.last_mut().unwrap() += 1;
+        BoundRange {
+            from: Bound::Included(Key::from(self.buf)),
+            to: Bound::Excluded(Key::from(end.buf)),
+        }
+    }
+
+    pub fn hashed_block_range<'fl>(self, hash: &'fl[u8]) -> BoundRange {
+        let mut me = self.write_key_kind(KeyKind::HashedBlock);
+        me.buf.extend_from_slice(hash);
+        me.buf.push(*HASHED_BLOCK_META_KEY_IDS.get_by_right(&HashedBlockMeta::ANamedBlock).unwrap());
+        me.sub_key_range()
+    }
+
+    pub fn hashed_block_all_range<'fl>(self, hash: &'fl[u8]) -> BoundRange {
+        let mut me = self.write_key_kind(KeyKind::HashedBlock);
+        me.buf.extend_from_slice(hash);
+        me.sub_key_range()
     }
 
     pub fn hashed_block_exists(self, hash: &[u8]) -> KeyBuffer {
@@ -611,7 +681,7 @@ mod tests {
         let kb = ScopedKeyBuilder::new(TEST_PREFIX).block_hash(addr.clone());
         let mut i = kb.iter();
         let kp = KeyParser::start(&mut i, TEST_PREFIX, 32).unwrap();
-        assert_eq!(kp.kind, KeyKind::BlockHash);
+        assert_eq!(kp.kind, KeyKind::InoBlockHashMapping);
         let read_addr = kp.parse_key_block_address().unwrap();
         assert_eq!(addr, read_addr);
     }
