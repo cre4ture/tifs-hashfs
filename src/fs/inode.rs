@@ -46,7 +46,6 @@ pub struct StorageDirItem {
     pub typ: StorageDirItemKind,
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[derive(Serialize, Deserialize)]
 pub struct StorageFilePermission(pub u16);

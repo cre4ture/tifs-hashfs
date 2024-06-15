@@ -22,3 +22,5 @@ pub mod fs_config;
 pub mod tikv_fs_trait_impl;
 pub mod szymanskis_critical_section;
 pub mod flexible_transaction;
+pub mod open_modes;
+pub mod pending_deletes;

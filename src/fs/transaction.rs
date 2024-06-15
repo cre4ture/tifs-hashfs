@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
 use std::ops::{Deref, Range, RangeInclusive};
 use std::sync::{Arc, Weak};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -33,9 +33,10 @@ use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::index::serialize_json;
 use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageFileAttr, StorageFilePermission, TiFsHash};
-use super::key::{read_big_endian, KeyParser, ScopedKeyBuilder, ROOT_INODE};
+use super::key::{read_big_endian, KeyKind, KeyParser, PendingDeleteMeta, ScopedKeyBuilder, ROOT_INODE};
 use super::meta::Meta;
 use super::mode::as_file_perm;
+use super::pending_deletes::PendingDeletes;
 use super::szymanskis_critical_section::CriticalSectionKeyLock;
 use super::parsers;
 use super::reply::StatFs;
@@ -368,15 +369,34 @@ impl Txn {
     }
 
     pub async fn set_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, item: &StorageDirItem) -> Result<()> {
+        let lock_key = self.key_builder().inode_link_count(item.ino);
+        let _critical_section = CriticalSectionKeyLock::new(self.clone(), lock_key).await?;
         let key = Key::from(self.key_builder().directory_child(parent, &name));
+        let key_rev = Key::from(self.key_builder().parent_link(item.ino, parent, &name));
         trace!("set dir item by key: {:?}, name: {:?}, item: {:?}", key, name, item);
         let value = serialize_json(&item)?;
-        Ok(self.f_txn.put(key, value).await?)
+        let mut put_pairs = Vec::with_capacity(2);
+        put_pairs.push(KvPair(key, value));
+        put_pairs.push(KvPair(key_rev, vec![]));
+        Ok(self.f_txn.batch_put(put_pairs).await?)
     }
 
-    pub async fn remove_directory_child(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {
+    pub async fn remove_directory_child(self: TxnArc, parent: StorageIno, name: ByteString, ino: StorageIno) -> Result<()> {
+        let lock_key = self.key_builder().inode_link_count(ino);
+        let _critical_section = CriticalSectionKeyLock::new(self.clone(), lock_key).await?;
         let key = Key::from(self.key_builder().directory_child(parent, &name));
-        Ok(self.f_txn.delete(key).await?)
+        let key_rev = Key::from(self.key_builder().parent_link(ino, parent, &name));
+        let mut mutations = Vec::with_capacity(2);
+        mutations.push(Mutation::Delete(key));
+        mutations.push(Mutation::Delete(key_rev));
+        self.f_txn.batch_mutate(mutations).await?;
+
+        let key_usages = self.key_builder().parent_link_scan(ino);
+        let usage_count = self.f_txn.scan_keys(key_usages, MAX_TIKV_SCAN_LIMIT).await?.len();
+        if usage_count == 0 {
+            self.remove_inode(ino).await?;
+        }
+        Ok(())
     }
 
     pub async fn read_inode_uncached(self: TxnArc, ino: StorageIno) -> Result<Arc<InoDescription>> {
@@ -904,6 +924,54 @@ impl Txn {
         Ok(was_modified)
     }
 
+    pub async fn read_pending_deletes(self: TxnArc) -> Result<PendingDeletes> {
+        let range = self.key_builder().pending_delete_scan_list();
+        let pairs = self.f_txn.scan(range, MAX_TIKV_SCAN_LIMIT).await?;
+        let mut iteration_number = None;
+        let mut last_update = None;
+        let mut pending = Vec::new();
+        for KvPair(key, value) in pairs {
+            let key_buffer = Vec::from(key);
+            let mut i = key_buffer.iter();
+            let base_key = self.key_parser(&mut i)?.parse_pending_deletes_x()?;
+            match base_key.meta {
+                PendingDeleteMeta::AIterationNumber => {
+                    let mut vi = value.iter();
+                    iteration_number = Some(read_big_endian::<8, u64>(&mut vi)?);
+                }
+                PendingDeleteMeta::BLastUpdate => {
+                    let mut vi = value.iter();
+                    last_update = Some(read_big_endian::<8, u64>(&mut vi)?); // unix timestamp (s)
+                }
+                PendingDeleteMeta::CPendingDeletes => {
+                    pending.push(value); // hash
+                }
+                other => {
+                    return Err(FsError::UnknownError(format!("unexpected meta key: {other:?}")));
+                }
+            }
+        }
+        Ok(PendingDeletes {
+            iteration_number: iteration_number.ok_or(
+                FsError::UnknownError(format!("missing field: iteration_number")))?,
+            last_update: last_update.ok_or(
+                FsError::UnknownError(format!("missing field: last_update")))?,
+            pending
+        })
+    }
+
+    pub async fn publish_active_writer_state(self: TxnArc, iteration_number: u64, writer_id: Uuid) -> Result<()> {
+        let key = self.key_builder().pending_delete_active_writer(iteration_number, writer_id);
+        let unix_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.f_txn.put(key, unix_timestamp.to_be_bytes().to_vec()).await
+    }
+
+    pub async fn read_pending_deletes_and_publish_writer_state(self: TxnArc, writer_id: Uuid) -> Result<PendingDeletes> {
+        let output = self.clone().read_pending_deletes().await?;
+        self.publish_active_writer_state(output.iteration_number, writer_id).await?;
+        Ok(output)
+    }
+
     pub async fn write(self: TxnArc, fh: Arc<FileHandler>, start: u64, data: Bytes) -> Result<usize> {
         let mut watch = AutoStopWatch::start("write_data");
         let ino = fh.ino();
@@ -1017,12 +1085,16 @@ impl Txn {
         Ok(Arc::new(inode))
     }
 
-    pub async fn unlink(self: TxnArc, parent: StorageIno, name: ByteString) -> Result<()> {
+    pub async fn unlink(
+            self: TxnArc,
+            parent: StorageIno,
+            name: ByteString
+    ) -> Result<()> {
         let Some(dir_entry) = self.clone().get_directory_item(parent, name.clone()).await? else {
             return Err(FsError::FileNotFound { file: name.to_string() });
         };
 
-        self.clone().remove_directory_child(parent, name.clone()).await?;
+        self.clone().remove_directory_child(parent, name.clone(), dir_entry.ino).await?;
 
         {
             let key = self.key_builder().inode_link_count(dir_entry.ino);

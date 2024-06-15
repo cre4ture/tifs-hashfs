@@ -8,7 +8,7 @@ use super::serialize::{deserialize, serialize, ENCODING};
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct MetaStatic{
     pub block_size: u64,
-    pub hashed_blocks: bool,
+    pub hashed_blocks: bool, // TODO: convert to Option<AlgoName>
     pub hash_algorithm: String,
 }
 
@@ -17,6 +17,23 @@ pub struct Meta {
     pub inode_next: u64, // TODO: get rid of global counter
     pub last_stat: Option<StatFs>,
 }
+
+/*
+delete strategy: 2 step sync:
+1. step: check without lock
+2. validate with lock
+Means:
+- manage a delete pending list
+- after updating delete pending list, wait until all running processes have finished + some buffer?
+- enter critical section, check again if block is not used, delete if still not used
+- new processes check delete pending list, enter critical section if conflict, add use of block in critical section
+
+- manage a iteration counter for the pending delete list.
+- every writer periodically checks this pending delete list for changes and announces its own current state.
+- this way, the deleter can check if any writer exists that wasn't yet updated.
+- add a small? time delay for this check
+- ensure that the time between read and announcement of the writers state if relatively short.
+*/
 
 impl Meta {
     pub const fn new() -> Self {

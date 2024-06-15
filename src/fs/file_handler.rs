@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use range_collections::{RangeSet, RangeSet2};
 use tokio::sync::RwLock;
 
-use super::{error::TiFsResult, fs_config::TiFsConfig, inode::StorageIno, reply::InoKind, tikv_fs::InoUse};
+use super::{error::TiFsResult, fs_config::TiFsConfig, inode::StorageIno, open_modes::OpenMode, reply::InoKind, tikv_fs::InoUse};
 use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 #[derive(Debug)]
@@ -33,7 +33,7 @@ impl ReadAhead {
 
 pub struct FileHandler {
     pub ino_use: Arc<InoUse>,
-    // TODO: add open flags
+    pub open_mode: OpenMode,
     pub mut_data: RwLock<FileHandlerMutData>,
     pub write_cache: RwLock<AsyncParallelPipeStage<BoxFuture<'static, TiFsResult<usize>>>>,
     pub read_ahead: RwLock<AsyncParallelPipeStage<BoxFuture<'static, TiFsResult<()>>>>,
@@ -41,10 +41,14 @@ pub struct FileHandler {
 }
 
 impl FileHandler {
-    pub fn new(ino_use: Arc<InoUse>,
-               fs_config: TiFsConfig) -> Self {
+    pub fn new(
+        ino_use: Arc<InoUse>,
+        open_mode: OpenMode,
+        fs_config: TiFsConfig
+    ) -> Self {
         Self {
             ino_use,
+            open_mode,
             mut_data: RwLock::new(FileHandlerMutData {
                cursor: HashMap::new(),
             }),

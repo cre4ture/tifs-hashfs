@@ -91,6 +91,9 @@ pub enum FsError {
 
     #[error("try lock failed")]
     TryLockFailed,
+
+    #[error("open mode doesn't allow write")]
+    WriteNotAllowed,
 }
 
 pub type Result<T> = std::result::Result<T, FsError>;

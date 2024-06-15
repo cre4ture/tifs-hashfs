@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, key::{PARENT_OF_ROOT_INODE, ROOT_INODE}, reply::InoKind};
 
-use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::StorageDirItemKind, mode::{as_file_kind, as_file_perm}, reply::{get_time, Attr, Create, Data, Dir, Entry, Lock, LogicalIno, Lseek, Open, StatFs, Write, Xattr}, tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable}};
+use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::StorageDirItemKind, mode::{as_file_kind, as_file_perm}, open_modes::OpenMode, reply::{get_time, Attr, Create, Data, Dir, Entry, Lock, LogicalIno, Lseek, Open, StatFs, Write, Xattr}, tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable}};
 
 
 
@@ -154,6 +154,16 @@ impl AsyncFileSystem for TiFs {
 
     #[tracing::instrument]
     async fn open(&self, ino: u64, flags: i32) -> Result<Open> {
+
+        let mask = 0b11;
+        let mode = match flags & mask {
+            libc::O_RDONLY => OpenMode::ReadOnly,
+            libc::O_WRONLY => OpenMode::WriteOnly,
+            libc::O_RDWR => OpenMode::ReadWrite,
+            _ => OpenMode::ReadWrite, // assume worst case
+        };
+
+
         // TODO: deal with flags
         let l_ino = LogicalIno::from_raw(ino);
         let mut ino_use = self.with_mut_data(|d| d.get_ino_use(ino)).await?;
@@ -178,7 +188,7 @@ impl AsyncFileSystem for TiFs {
             return Err(FsError::UnknownError("failed to get ino_use!".into()));
         };
 
-        let file_handler = FileHandler::new(ino_use, self.fs_config.clone());
+        let file_handler = FileHandler::new(ino_use, mode, self.fs_config.clone());
         let fh = self.with_mut_data(|d| {
             let new_fh = d.get_free_fh();
             d.file_handlers.insert(new_fh, Arc::new(file_handler));
@@ -246,9 +256,13 @@ impl AsyncFileSystem for TiFs {
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<Write> {
+        let file_handler = self.get_file_handler_checked(fh).await?;
+        if !file_handler.open_mode.allows_write() {
+            return Err(FsError::WriteNotAllowed);
+        }
+
         let l_ino = LogicalIno::from_raw(ino);
         let data: Bytes = data.into();
-        let file_handler = self.get_file_handler_checked(fh).await?;
         let file_handler_data = file_handler.mut_data.read().await;
         let start = file_handler_data.cursor.get(&l_ino.kind).cloned().unwrap_or(0) as i64 + offset;
         let size = data.len();
@@ -261,9 +275,13 @@ impl AsyncFileSystem for TiFs {
         let fh_clone = file_handler.clone();
         let arc = self.weak.upgrade().unwrap();
 
+        let pending_deletes = arc.clone().spin_no_delay_arc(format!("update pending deletes"), |me, txn|{
+            txn.read_pending_deletes_and_publish_writer_state(arc.instance_id).boxed()
+        }).await?;
+
         let fut =
             arc.clone().spin_no_delay_arc(format!("write, ino:{ino}, fh:{fh}, offset:{offset}, data.len:{}", size),
-                move |_me, txn| Box::pin(txn.write(fh_clone.clone(), start as u64, data.clone())));
+                move |_me, txn| txn.write(fh_clone.clone(), start as u64, data.clone()).boxed());
 
         write_cache.push(fut.boxed()).await;
         let results = write_cache.get_results_so_far();

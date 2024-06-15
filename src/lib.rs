@@ -10,6 +10,7 @@
 
 pub mod fs;
 pub mod utils;
+pub mod local_storage;
 
 use std::{path::PathBuf, time::Duration};
 

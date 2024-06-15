@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::ops::{Bound, Range};
 
 use bimap::BiHashMap;
 use lazy_static::lazy_static;
@@ -31,7 +31,18 @@ pub enum KeyKind {
     HashedBlock, // { hash: &[u8] },
     BlockHash, // { ino: u64, block: u64 } => { hash: &[u8] }
     HashedBlockExists, // { hash: &[u8] } => None
+    PendingDelete,
     //HashedBlockUsedBy { hash: &'a[u8], ino: u64, block: u64 },
+
+}
+
+#[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
+pub enum PendingDeleteMeta {
+    AIterationNumber, // u64
+    BLastUpdate, // u64, unix timestamp
+    CPendingDeletes, // list of hashes
+    DActiveWriters, // list of uuids with last fetched iteration number
+    EEnd,
 }
 
 pub mod key_structs {
@@ -67,6 +78,10 @@ lazy_static!{
     static ref INO_META_KEY_IDS: BiHashMap<u8, InoMetadata> = {
         InoMetadata::iter().enumerate().map(|(a,b)|(a as u8,b)).collect()
     };
+
+    static ref PENDING_DELETE_META_KEY_IDS: BiHashMap<u8, PendingDeleteMeta> = {
+        PendingDeleteMeta::iter().enumerate().map(|(a,b)|(a as u8,b)).collect()
+    };
 }
 
 pub type KeyBuffer = Vec<u8>;
@@ -86,8 +101,8 @@ pub fn read_big_endian<const N: usize, T: num_traits::FromBytes<Bytes = [u8; N]>
     Ok(r)
 }
 
-pub fn write_big_endian<T>(value: u64, buf: &mut KeyBuffer) {
-    buf.extend_from_slice(&value.to_be_bytes());
+pub fn write_big_endian<T: num_traits::ToBytes>(value: T, buf: &mut KeyBuffer) {
+    buf.extend_from_slice(value.to_be_bytes().as_ref());
 }
 
 pub trait KeyDeSer {
@@ -132,7 +147,7 @@ impl KeyDeSer for BlockAddress {
 pub struct KeyParser<'ol> {
     hash_len: usize,
     i: &'ol mut Iter<'ol, u8>,
-    kind: KeyKind,
+    pub kind: KeyKind,
 }
 
 impl<'ol> KeyParser<'ol> {
@@ -163,6 +178,19 @@ impl<'ol> KeyParser<'ol> {
         Ok((output, self))
     }
     */
+
+    pub fn parse_pending_deletes_x<'fl>(mut self) -> TiFsResult<KeyParserPendingDelete<'ol>> {
+        if self.kind != KeyKind::PendingDelete {
+            return Err(FsError::UnknownError(format!("expected a pending delete key. got: {:?}", self.kind)))
+        }
+        let kind_id = *self.i.next().unwrap_or(&0xFF);
+        let kind = *PENDING_DELETE_META_KEY_IDS.get_by_left(&kind_id).ok_or(
+            FsError::UnknownError(format!("key with unknown pending deletes kind: {}", kind_id)))?;
+        Ok(KeyParserPendingDelete {
+            pre: self,
+            meta: kind,
+        })
+    }
 
     pub fn parse_ino<'fl>(mut self) -> TiFsResult<KeyParserIno<'ol>> {
         if self.kind != KeyKind::InoMetadata {
@@ -245,6 +273,11 @@ pub struct KeyParserIno<'ol> {
     pub meta: InoMetadata,
 }
 
+pub struct KeyParserPendingDelete<'ol> {
+    pub pre: KeyParser<'ol>,
+    pub meta: PendingDeleteMeta,
+}
+
 #[derive(Clone)]
 pub struct ScopedKeyBuilder {
     buf: KeyBuffer,
@@ -299,6 +332,35 @@ impl ScopedKeyBuilder {
     // final
     pub fn meta(self) -> KeyBuffer {
         self.write_key_kind(KeyKind::FsMetadata).buf
+    }
+
+    pub fn pending_delete_x(self, kind: PendingDeleteMeta) -> Self {
+        let mut me = self.write_key_kind(KeyKind::PendingDelete);
+        me.buf.push(*PENDING_DELETE_META_KEY_IDS.get_by_right(&kind).unwrap());
+        me
+    }
+
+    pub fn pending_delete_scan_list(self) -> BoundRange {
+        let me = self.write_key_kind(KeyKind::PendingDelete);
+        let start = me.clone().pending_delete_x(PendingDeleteMeta::AIterationNumber);
+        let end = me.pending_delete_x(PendingDeleteMeta::DActiveWriters);
+        BoundRange {
+            from: Bound::Included(Key::from(start.buf)),
+            to: Bound::Excluded(Key::from(end.buf)),
+        }
+    }
+
+    pub fn pending_delete_block_hash(self, hash: TiFsHash) -> KeyBuffer {
+        let mut me = self.pending_delete_x(PendingDeleteMeta::CPendingDeletes);
+        me.buf.extend_from_slice(&hash);
+        me.buf
+    }
+
+    pub fn pending_delete_active_writer(self, iteration_number: u64, writer_id: Uuid) -> KeyBuffer {
+        let mut me = self.pending_delete_x(PendingDeleteMeta::DActiveWriters);
+        write_big_endian(iteration_number, &mut me.buf);
+        me.buf.extend_from_slice(writer_id.as_bytes());
+        me.buf
     }
 
     // ignore, private
@@ -372,6 +434,25 @@ impl ScopedKeyBuilder {
         write_big_endian::<u64>(parent.0, &mut me.buf);
         me.buf.extend_from_slice(name.as_bytes());
         me.buf
+    }
+
+    pub fn parent_link(self, ino: StorageIno, parent: StorageIno, name: &str) -> Vec<u8> {
+        let mut me = self.write_key_kind(KeyKind::ParentLink);
+        ino.serialize_to(&mut me.buf);
+        parent.serialize_to(&mut me.buf);
+        me.buf.extend_from_slice(name.as_bytes());
+        me.buf
+    }
+
+    pub fn parent_link_scan(self, ino: StorageIno) -> BoundRange {
+        let mut me1 = self.write_key_kind(KeyKind::ParentLink);
+        let mut me2 = me1.clone();
+        ino.serialize_to(&mut me1.buf);
+        StorageIno(ino.0+1).serialize_to(&mut me2.buf);
+        BoundRange {
+            from: Bound::Included(Key::from(me1.buf)),
+            to: Bound::Excluded(Key::from(me2.buf)),
+        }
     }
 
     pub fn directory_child_range(self, dir_ino: StorageIno) -> BoundRange {
