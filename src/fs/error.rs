@@ -131,7 +131,8 @@ impl From<tikv_client::Error> for FsError {
             MultipleKeyErrors(errs) => Self::KeyError(format!("{:?}", errs)),
             // Grpc(ge) if let grpcio::error::Error::RpcFailure(status) = ge => {}
             _ => {
-                println!("Unknown Error 2: {:?}, backtrace:\n{}", err, Backtrace::force_capture());
+                //println!("Unknown Error 2: {:?}, backtrace:\n{}", err, Backtrace::force_capture());
+                //tracing::debug!("Unknown Error 2: {err:?}");
                 Self::UnknownError(err.to_string())
             }
         }
