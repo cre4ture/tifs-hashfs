@@ -37,6 +37,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         block_on(self.0.destroy())
     }
 
+    #[tracing::instrument(skip(self))]
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let async_impl = self.0.clone();
         let name = name.to_string_lossy().to_string().into();
@@ -45,6 +46,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn forget(&mut self, _req: &Request, ino: u64, nlookup: u64) {
         let async_impl = self.0.clone();
 
@@ -54,6 +56,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn getattr(&mut self, req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let async_impl = self.0.clone();
         spawn_reply(
@@ -63,6 +66,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         );
     }
 
+    #[tracing::instrument(skip(self))]
     fn setattr(
         &mut self,
         req: &Request,
@@ -92,6 +96,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn readlink(&mut self, req: &Request, ino: u64, reply: ReplyData) {
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
@@ -99,6 +104,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn mknod(
         &mut self,
         req: &Request,
@@ -121,6 +127,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn mkdir(
         &mut self,
         req: &Request,
@@ -140,6 +147,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let async_impl = self.0.clone();
         let name = name.to_string_lossy().to_string().into();
@@ -148,6 +156,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let async_impl = self.0.clone();
         let name = name.to_string_lossy().to_string().into();
@@ -156,6 +165,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn symlink(
         &mut self,
         req: &Request,
@@ -175,6 +185,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn rename(
         &mut self,
         req: &Request,
@@ -195,6 +206,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn link(
         &mut self,
         req: &Request,
@@ -217,6 +229,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn read(
         &mut self,
         req: &Request,
@@ -243,6 +256,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn write(
         &mut self,
         req: &Request,
@@ -264,6 +278,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn flush(&mut self, req: &Request, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
@@ -271,6 +286,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn release(
         &mut self,
         req: &Request,
@@ -287,6 +303,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn fsync(&mut self, req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
@@ -294,6 +311,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn opendir(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
@@ -301,6 +319,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn readdir(&mut self, req: &Request, ino: u64, fh: u64, offset: i64, reply: ReplyDirectory) {
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
@@ -308,6 +327,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn readdirplus(
         &mut self,
         req: &Request,
@@ -322,6 +342,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn fsyncdir(&mut self, req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
@@ -329,6 +350,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn statfs(&mut self, req: &Request, ino: u64, reply: ReplyStatfs) {
         let async_impl = self.0.clone();
         spawn_reply(
@@ -338,6 +360,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         );
     }
 
+    #[tracing::instrument(skip(self))]
     fn setxattr(
         &mut self,
         req: &Request,
@@ -356,6 +379,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn getxattr(&mut self, req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
         let async_impl = self.0.clone();
         let name = name.to_string_lossy().to_string().into();
@@ -364,6 +388,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn listxattr(&mut self, req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
@@ -371,6 +396,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn removexattr(&mut self, req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         let async_impl = self.0.clone();
         let name = name.to_string_lossy().to_string().into();
@@ -378,6 +404,8 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
             async_impl.removexattr(ino, name).await
         });
     }
+
+    #[tracing::instrument(skip(self))]
     fn access(&mut self, req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
@@ -385,6 +413,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn create(
         &mut self,
         req: &Request,
@@ -407,6 +436,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn getlk(
         &mut self,
         req: &Request,
@@ -427,6 +457,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn setlk(
         &mut self,
         req: &Request,
@@ -448,6 +479,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn bmap(&mut self, req: &Request, ino: u64, blocksize: u32, idx: u64, reply: ReplyBmap) {
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
@@ -455,6 +487,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn fallocate(
         &mut self,
         req: &Request,
@@ -471,6 +504,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn lseek(
         &mut self,
         req: &Request,
@@ -486,6 +520,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
+    #[tracing::instrument(skip(self))]
     fn copy_file_range(
         &mut self,
         req: &Request,
