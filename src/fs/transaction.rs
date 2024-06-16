@@ -157,7 +157,7 @@ impl Txn {
                 region_backoff: DEFAULT_REGION_BACKOFF,
                 lock_backoff: OPTIMISTIC_BACKOFF,
             });
-            Some(client.give_one().begin_with_options(options).await?)
+            Some(client.give_one_transaction(&options).await?)
         }.map(|x|RwLock::new(x));
         Ok(TxnArc::new_cyclic(|weak| { Self {
                 weak: weak.clone(),

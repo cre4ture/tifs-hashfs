@@ -155,15 +155,14 @@ impl FlexibleTransaction {
     }
 
     async fn begin_optimistic_small(
-        client: Arc<TransactionClientMux>,
+        client_mux: Arc<TransactionClientMux>,
     ) -> Result<Transaction> {
         let options = TransactionOptions::new_optimistic().use_async_commit();
         let options = options.retry_options(RetryOptions {
             region_backoff: DEFAULT_REGION_BACKOFF,
             lock_backoff: OPTIMISTIC_BACKOFF,
         });
-        let txn = client.give_one().begin_with_options(options).await?;
-        Ok(txn)
+        Ok(client_mux.give_one_transaction(&options).await?)
     }
 
     pub async fn mini_txn(&self) -> TiFsResult<Transaction> {
