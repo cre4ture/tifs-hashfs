@@ -26,7 +26,52 @@ pub struct SpinningTxn {
     pub backoff: Backoff,
 }
 
+impl Default for SpinningTxn {
+    fn default() -> Self {
+        Self {
+            backoff: Backoff::decorrelated_jitter_backoff(10, 500, 100),
+        }
+    }
+}
+
 impl SpinningTxn {
+/*
+    pub async fn run_txn_default<Fun, Fut, R>(
+        f_txn: &FlexibleTransaction,
+        f: Fun,
+    ) -> TiFsResult<R>
+    where
+        for<'tl> Fut: 'tl + Future<Output = TiKvResult<R>>,
+        for<'tl> Fun: Fn(Arc<Transaction>) -> Fut,
+        for<'rl> R: 'rl + std::fmt::Debug,
+    {
+        let mut spin = SpinningTxn::default();
+        spin.run_txn(f_txn, f).await
+    }
+*/
+/*
+    pub async fn run_txn<Fun, Fut, R>(
+        &mut self,
+        f_txn: &FlexibleTransaction,
+        f: Fun,
+    ) -> TiFsResult<R>
+    where
+    for <'tl> R: 'tl + std::fmt::Debug,
+    for <'tl> Fut: 'tl + Future<Output = TiKvResult<R>>,
+    for <'tl> Fun: Fn(&'tl Transaction) -> Fut,
+    {
+        let mut spin = SpinningTxn::default();
+        loop {
+            let mini = f_txn.mini_txn().await?;
+            match spin.end_iter(f(&mini).await, mini).await {
+                SpinningIterResult::Done(r) => break Ok(r),
+                SpinningIterResult::TryAgain => {},
+                SpinningIterResult::Failed(err) => return Err(err.into()),
+            }
+        }
+    }
+    */
+
     pub async fn end_iter<R: std::fmt::Debug>(&mut self, result: TiKvResult<R>, mut mini: Transaction
     ) -> SpinningIterResult<R> {
         if let Ok(val) = result {
@@ -46,6 +91,40 @@ impl SpinningTxn {
                 tracing::error!("failed to rollback mini transaction. Err: {error:?}");
             }
             return SpinningIterResult::Failed(result.unwrap_err());
+        }
+    }
+
+    pub async fn end_iter_b<R>(&mut self, result: TiKvResult<R>, mut mini: Transaction
+    ) -> Option<TiFsResult<R>> {
+        match result {
+            Ok(val) => {
+                match mini.commit().await {
+                    Ok(_t) => return Some(Ok(val)),
+                    Err(error) => {
+                        if let Some(delay) = self.backoff.next_delay_duration() {
+                            sleep(delay).await;
+                            tracing::info!("retry rolled back transaction");
+                            return None;
+                        } else {
+                            tracing::warn!("transaction failed!");
+                            return Some(Err(error.into()));
+                        }
+                    }
+                }
+            }
+            Err(result_err) => {
+                if let Err(error) = mini.rollback().await {
+                    tracing::error!("failed to rollback mini transaction. Err: {error:?}");
+                }
+                if let Some(delay) = self.backoff.next_delay_duration() {
+                    sleep(delay).await;
+                    tracing::info!("retry rolled back transaction");
+                    return None;
+                } else {
+                    tracing::warn!("transaction failed!");
+                    return Some(Err(result_err.into()));
+                }
+            }
         }
     }
 }
@@ -107,8 +186,14 @@ impl FlexibleTransaction {
             Ok(txn.write().await.get(key).await?)
         } else {
             if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                Self::finish_txn(mini.get(key).await, mini).await
+                let key: Key = key.into();
+                let mut spin = SpinningTxn::default();
+                loop {
+                    let mut mini = self.mini_txn().await?;
+                    if let Some(r) = spin.end_iter_b(
+                        mini.get(key.clone())
+                        .await, mini).await { break Ok(r?); }
+                }
             } else {
                 Ok(self.raw.get(key).await?)
             }
@@ -124,11 +209,14 @@ impl FlexibleTransaction {
                 .map(|iter|iter.collect::<Vec<_>>())?)
         } else {
             if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                Self::finish_txn(mini.batch_get(keys).await
-                    .map(|iter|iter.collect::<Vec<_>>())
-                    , mini
-                ).await
+                let keys = keys.into_iter().map(|k|Key::from(k.into())).collect::<Vec<_>>();
+                let mut spin = SpinningTxn::default();
+                loop {
+                    let mut mini = self.mini_txn().await?;
+                    if let Some(r) = spin.end_iter_b(
+                        mini.batch_get(keys.clone())
+                        .await, mini).await { break Ok(r?.into_iter().collect::<Vec<_>>()); }
+                }
             } else {
                 Ok(self.raw.batch_get(keys).await?)
             }
@@ -140,8 +228,15 @@ impl FlexibleTransaction {
             Ok(txn.write().await.put(key, value).await?)
         } else {
             if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                Self::finish_txn(mini.put(key, value).await, mini).await
+                let key: Key = key.into();
+                let value: Value = value.into();
+                let mut spin = SpinningTxn::default();
+                loop {
+                    let mut mini = self.mini_txn().await?;
+                    if let Some(r) = spin.end_iter_b(
+                        mini.put(key.clone(), value.clone())
+                        .await, mini).await { break Ok(r?); }
+                }
             } else {
                 Ok(self.raw.put(key, value).await?)
             }
@@ -155,8 +250,13 @@ impl FlexibleTransaction {
         } else {
             if self.fs_config.small_transactions {
                 let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
-                let mut mini = self.mini_txn().await?;
-                Self::finish_txn(mini.batch_mutate(mutations).await, mini).await
+                let mut spin = SpinningTxn::default();
+                loop {
+                    let mut mini = self.mini_txn().await?;
+                    if let Some(r) = spin.end_iter_b(
+                        mini.batch_mutate(mutations.clone())
+                        .await, mini).await { break Ok(r?); }
+                }
             } else {
                 Ok(self.raw.batch_put(pairs).await?)
             }
@@ -168,8 +268,14 @@ impl FlexibleTransaction {
             Ok(txn.write().await.delete(key).await?)
         } else {
             if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                Self::finish_txn(mini.delete(key).await, mini).await
+                let key: Key = key.into();
+                let mut spin = SpinningTxn::default();
+                loop {
+                    let mut mini = self.mini_txn().await?;
+                    if let Some(r) = spin.end_iter_b(
+                        mini.delete(key.clone())
+                        .await, mini).await { break Ok(r?); }
+                }
             } else {
                 Ok(self.raw.delete(key).await?)
             }
@@ -181,8 +287,14 @@ impl FlexibleTransaction {
             Ok(txn.write().await.batch_mutate(mutations).await?)
         } else {
             if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                Self::finish_txn(mini.batch_mutate(mutations).await, mini).await
+                let mutations: Vec<Mutation> = mutations.into_iter().collect();
+                let mut spin = SpinningTxn::default();
+                loop {
+                    let mut mini = self.mini_txn().await?;
+                    if let Some(r) = spin.end_iter_b(
+                        mini.batch_mutate(mutations.clone())
+                        .await, mini).await { break Ok(r?); }
+                }
             } else {
                 let mut deletes = Vec::new();
                 let mut put_pairs = Vec::new();
@@ -215,9 +327,14 @@ impl FlexibleTransaction {
                 .map(|iter|iter.collect::<Vec<KvPair>>())?)
         } else {
             if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                Ok(Self::finish_txn(mini.scan(range, limit).await, mini).await?
-                    .collect::<Vec<KvPair>>())
+                let range: BoundRange = range.into();
+                let mut spin = SpinningTxn::default();
+                loop {
+                    let mut mini = self.mini_txn().await?;
+                    if let Some(r) = spin.end_iter_b(
+                        mini.scan(range.clone(), limit)
+                        .await, mini).await { break Ok(r?.collect::<Vec<KvPair>>()); }
+                }
             } else {
                 Ok(self.raw.scan(range, limit).await?)
             }
@@ -234,9 +351,14 @@ impl FlexibleTransaction {
                 .map(|iter|iter.collect::<Vec<_>>())?)
         } else {
             if self.fs_config.small_transactions {
-                let mut mini = self.mini_txn().await?;
-                Ok(Self::finish_txn(mini.scan_keys(range, limit).await, mini).await?
-                    .collect::<Vec<Key>>())
+                let range: BoundRange = range.into();
+                let mut spin = SpinningTxn::default();
+                loop {
+                    let mut mini = self.mini_txn().await?;
+                    if let Some(r) = spin.end_iter_b(
+                        mini.scan_keys(range.clone(), limit)
+                        .await, mini).await { break Ok(r?.collect::<Vec<Key>>()); }
+                }
             } else {
                 Ok(self.raw.scan_keys(range, limit).await?)
             }
