@@ -19,7 +19,7 @@ use tikv_client::Result as TiKvResult;
 pub enum SpinningIterResult<R> {
     Done(R),
     TryAgain,
-    Failed(tikv_client::Error),
+    Failed(FsError),
 }
 
 pub struct SpinningTxn {
@@ -29,7 +29,7 @@ pub struct SpinningTxn {
 impl Default for SpinningTxn {
     fn default() -> Self {
         Self {
-            backoff: Backoff::decorrelated_jitter_backoff(10, 500, 100),
+            backoff: Backoff::decorrelated_jitter_backoff(10, 1000, 200),
         }
     }
 }
@@ -72,25 +72,15 @@ impl SpinningTxn {
     }
     */
 
-    pub async fn end_iter<R: std::fmt::Debug>(&mut self, result: TiKvResult<R>, mut mini: Transaction
+    pub async fn end_iter<R: std::fmt::Debug>(
+        &mut self,
+        result: TiKvResult<R>,
+        mini: Transaction
     ) -> SpinningIterResult<R> {
-        if let Ok(val) = result {
-            match mini.commit().await {
-                Ok(_t) => return SpinningIterResult::Done(val),
-                Err(error) => {
-                    if let Some(delay) = self.backoff.next_delay_duration() {
-                        sleep(delay).await;
-                        return SpinningIterResult::TryAgain;
-                    } else {
-                        return SpinningIterResult::Failed(error);
-                    }
-                }
-            }
-        } else {
-            if let Err(error) = mini.rollback().await {
-                tracing::error!("failed to rollback mini transaction. Err: {error:?}");
-            }
-            return SpinningIterResult::Failed(result.unwrap_err());
+        match self.end_iter_b(result, mini).await {
+            None => return SpinningIterResult::TryAgain,
+            Some(Ok(value)) => return SpinningIterResult::Done(value),
+            Some(Err(err)) => return SpinningIterResult::Failed(err),
         }
     }
 
@@ -103,7 +93,7 @@ impl SpinningTxn {
                     Err(error) => {
                         if let Some(delay) = self.backoff.next_delay_duration() {
                             sleep(delay).await;
-                            tracing::info!("retry rolled back transaction");
+                            tracing::info!("retry commit failed transaction");
                             return None;
                         } else {
                             tracing::warn!("transaction failed!");
@@ -167,7 +157,10 @@ impl FlexibleTransaction {
 
     pub async fn mini_txn(&self) -> TiFsResult<Transaction> {
         let transaction = Self::begin_optimistic_small(
-            self.txn_client_mux.clone()).await?;
+            self.txn_client_mux.clone()).await.map_err(|err|{
+                tracing::warn!("mini_txn failed. Err: {err:?}");
+                err
+            })?;
         Ok(transaction)
     }
 

@@ -37,6 +37,7 @@ impl TransactionClientMux {
             let (client, id) = self.give_one().await?;
             let result = client.begin_with_options(options.clone()).await;
             if result.is_err() {
+                tracing::warn!("give_one_transaction - begin with options failed. Retry ...");
                 self.replace_one_due_to_error(id).await?;
             } else {
                 return Ok(result.unwrap());
@@ -75,15 +76,19 @@ impl TransactionClientMux {
 
         let we_were_first = prev.take().is_some();
         if we_were_first {
-            let mut backoff = Backoff::decorrelated_jitter_backoff(100, 1000, 100);
+            let mut backoff = Backoff::decorrelated_jitter_backoff(100, 1000, 200);
             let client = loop {
                 let new_client = self.make_one().await;
                 match new_client {
-                    Ok(client) => break client,
+                    Ok(client) => {
+                        tracing::info!("re-creation of TransactionClient succeeded.");
+                        break client;
+                    }
                     Err(err) => {
                         if let Some(delay) = backoff.next_delay_duration() {
                             sleep(delay).await;
                         } else {
+                            tracing::error!("re-creation of TransactionClient failed after retries. Err: {err:?}");
                             return Err(err);
                         }
                     }

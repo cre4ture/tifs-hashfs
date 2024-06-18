@@ -642,9 +642,7 @@ impl Txn {
 
     pub async fn hb_clear_data_single_block(self: TxnArc, addr: BlockAddress) -> TiFsResult<()> {
         let key = self.key_builder().block_hash(addr);
-        let mut spin = SpinningTxn {
-            backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10),
-        };
+        let mut spin = SpinningTxn::default();
         let prev_hash = loop {
             let mut mini = self.f_txn.mini_txn().await?;
             let result = Self::hb_replace_block_hash_for_address(&mut mini, &key, None).await;
@@ -655,9 +653,7 @@ impl Txn {
             }
         };
 
-        let mut spin = SpinningTxn {
-            backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10),
-        };
+        let mut spin = SpinningTxn::default();
         if let Some(prev_h) = prev_hash {
             loop {
                 let mut mini = self.f_txn.mini_txn().await?;
@@ -979,9 +975,7 @@ impl Txn {
         let mut decrement_cnts = HashMap::<TiFsHash, u64>::new();
         for addr in addresses {
             let key = self.key_builder().block_hash(addr);
-            let mut spin = SpinningTxn {
-                backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10),
-            };
+            let mut spin = SpinningTxn::default();
             let prev_hash = loop {
                 let mut mini: Transaction = self.f_txn.mini_txn().await?;
                 let result = Self::hb_replace_block_hash_for_address(&mut mini, &key, Some(&hash)).await;
@@ -989,7 +983,7 @@ impl Txn {
                     SpinningIterResult::Done(prev_hash) => break prev_hash,
                     SpinningIterResult::TryAgain => {},
                     SpinningIterResult::Failed(err) => {
-                        tracing::error!("failed to exchange hash for block-address");
+                        tracing::error!("failed to exchange hash for block-address.Err: {err:?}");
                         return Err(err.into());
                     }
                 }
@@ -1002,9 +996,7 @@ impl Txn {
         }
 
         for (prev_hash, dec_cnt) in decrement_cnts {
-            let mut spin = SpinningTxn {
-                backoff: Backoff::decorrelated_jitter_backoff(10, 500, 10),
-            };
+            let mut spin = SpinningTxn::default();
             loop {
                 let mut mini: Transaction = self.f_txn.mini_txn().await?;
                 let result = self.hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
