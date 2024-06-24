@@ -6,7 +6,7 @@ use fuser::TimeOrNow;
 use num_bigint::BigUint;
 use uuid::Uuid;
 
-use super::{inode::ParentStorageIno, meta::MetaStatic};
+use super::{inode::{ParentStorageIno, StorageDirItem}, meta::MetaStatic};
 use super::inode::{AccessTime, DirectoryItem, InoDescription, InoSize, StorageDirItemKind, StorageFileAttr, StorageFilePermission, StorageIno, TiFsHash};
 
 #[derive(Debug)]
@@ -19,8 +19,24 @@ pub enum HashFsError {
     FileAlreadyExists,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, derive_more::Add, derive_more::Sub, derive_more::Display)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+     Hash, derive_more::Add, derive_more::Sub, derive_more::Display
+    )]
 pub struct BlockIndex(pub u64);
+
+impl std::iter::Step for BlockIndex {
+    fn steps_between(start: &Self, end: &Self) -> Option<usize> {
+        u64::steps_between(start, end)
+    }
+
+    fn forward_checked(start: Self, count: usize) -> Option<Self> {
+        u64::forward_checked(start, count)
+    }
+
+    fn backward_checked(start: Self, count: usize) -> Option<Self> {
+        u64::backward_checked(start, count)
+    }
+}
 
 pub type HashFsResult<V> = Result<V, HashFsError>;
 
@@ -93,7 +109,7 @@ pub trait HashFsInterface: Send + Sync  {
         uid: u32,
         rdev: u32,
         inline_data: Option<Vec<u8>>,
-    ) -> HashFsResult<GotOrMade<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)>>;
+    ) -> HashFsResult<GotOrMade<StorageDirItem>>;
     async fn directory_add_new_symlink(
         &self,
         gid: u32,

@@ -94,6 +94,9 @@ pub enum FsError {
 
     #[error("open mode doesn't allow write")]
     WriteNotAllowed,
+
+    #[error("close failed due to wrong ino or use_id")]
+    CloseFailedDueToWrongInoOrUseId,
 }
 
 pub type Result<T> = std::result::Result<T, FsError>;

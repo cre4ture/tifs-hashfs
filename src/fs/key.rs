@@ -559,13 +559,13 @@ impl ScopedKeyBuilder {
     }
 
 
-    pub fn block_range(self, ino: StorageIno, block_range: Range<u64>) -> Range<Key> {
+    pub fn block_range(self, ino: StorageIno, block_range: Range<BlockIndex>) -> Range<Key> {
         debug_assert_ne!(0, ino.0);
         self.clone().block(BlockAddress { ino, index: block_range.start }).into()
             ..self.block(BlockAddress { ino, index: block_range.end}).into()
     }
 
-    pub fn block_hash_range(self, ino: StorageIno, block_range: Range<u64>) -> Range<Key> {
+    pub fn block_hash_range(self, ino: StorageIno, block_range: Range<BlockIndex>) -> Range<Key> {
         debug_assert_ne!(0, ino.0);
         self.clone().block_hash(BlockAddress { ino, index: block_range.start, })
             .into()..self.block_hash(BlockAddress { ino, index: block_range.end }).into()

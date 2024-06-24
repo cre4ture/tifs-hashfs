@@ -108,7 +108,6 @@ impl TikvBasedHashFs {
         name: ByteString,
         allowed_types: HashSet<StorageDirItemKind>,
     ) -> HashFsResult<()> {
-
         let mut mini = self.f_txn.spinningMiniTxn().await?;
         let unlinked_item: StorageDirItem = loop {
             let mut started = mini.start().await?;
@@ -117,12 +116,11 @@ impl TikvBasedHashFs {
             if let Some(r) = started.finish(
                 r1).await { break r?; }
         };
-        drop(unlinked_item);
         drop(mini);
 
         let mut mini = self.f_txn.spinningMiniTxn().await?;
         let r: DeletionCheckResult = loop {
-            let started = mini.start().await?;
+            let mut started = mini.start().await?;
             let r1 = started
                 .inode_check_for_delete_and_delete_atomically_description(unlinked_item.ino).await;
             if let Some(r) = started.finish(r1
@@ -152,7 +150,7 @@ impl TikvBasedHashFs {
     pub async fn hb_get_block_hash_list_by_block_range(
         &self,
         ino: StorageIno,
-        block_range: Range<u64>,
+        block_range: Range<BlockIndex>,
     ) -> TiFsResult<BTreeMap<BlockIndex, TiFsHash>> {
         let range = self.key_builder().block_hash_range(ino, block_range.clone());
         let iter = self.f_txn.scan(
@@ -166,7 +164,7 @@ impl TikvBasedHashFs {
             let mut i = key_vec.iter();
             let key = self.key_parser(&mut i)?.parse_key_block_address()?;
             if hash.len() != self.fs_config.hash_len {
-                tracing::error!("hash lengths mismatch!");
+                tracing::error!("hash length mismatch!");
                 continue;
             };
             if key.ino != ino {
@@ -181,20 +179,27 @@ impl TikvBasedHashFs {
 
 
     #[tracing::instrument(skip(self))]
-    pub async fn hb_get_block_hash_list_by_block_range_chunked(&self, ino: StorageIno, block_range: Range<u64>
+    pub async fn hb_get_block_hash_list_by_block_range_chunked(
+        &self, ino: StorageIno, block_range: Range<BlockIndex>
     ) -> TiFsResult<HashMap<BlockIndex, TiFsHash>> {
         let mut i = block_range.start;
         let mut result = HashMap::with_capacity(block_range.clone().count());
         while i < block_range.end {
             let chunk_start = i;
-            let chunk_end = (chunk_start+MAX_TIKV_SCAN_LIMIT as u64).min(block_range.end);
+            let chunk_end = BlockIndex(chunk_start.0+MAX_TIKV_SCAN_LIMIT as u64)
+                                        .min(block_range.end);
             i = chunk_end;
 
-            let chunk = self.clone().hb_get_block_hash_list_by_block_range(ino, chunk_start..chunk_end).await?;
+            let chunk = self.clone().hb_get_block_hash_list_by_block_range(
+                ino, chunk_start..chunk_end).await?;
             result.extend(chunk.into_iter());
         }
         tracing::trace!("result: len:{}", result.len());
         Ok(result)
+    }
+
+    pub async fn hb_clear_data_single_block_arc(self: Arc<Self>, addr: BlockAddress) -> TiFsResult<()> {
+        self.hb_clear_data_single_block(addr).await
     }
 
     pub async fn hb_clear_data_single_block(&self, addr: BlockAddress) -> TiFsResult<()> {
@@ -233,7 +238,8 @@ impl TikvBasedHashFs {
             self.fs_config.parallel_jobs_delete);
         for block in (0..block_cnt).map(BlockIndex) {
             let addr = BlockAddress { ino, index: block };
-            parallel_executor.push(self.clone().hb_clear_data_single_block(addr)).await;
+            let me = self.weak.upgrade().unwrap();
+            parallel_executor.push(me.clone().hb_clear_data_single_block_arc(addr)).await;
         }
         parallel_executor.wait_finish_all().await;
         for r in parallel_executor.get_results_so_far() {
@@ -243,36 +249,23 @@ impl TikvBasedHashFs {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn read_hashes_of_file(&self, ino: StorageIno, block_range: Range<u64>) -> TiFsResult<Vec<u8>> {
-        let hashes = self.clone().hb_get_block_hash_list_by_block_range_chunked(ino, block_range.clone()).await?;
+    pub async fn read_hashes_of_file(&self, ino: StorageIno, block_range: Range<BlockIndex>
+    ) -> HashFsResult<Vec<u8>> {
+        let hashes = self.clone().hb_get_block_hash_list_by_block_range_chunked(
+            ino, block_range.clone()).await?;
         let mut result = Vec::with_capacity((block_range.clone().count() * self.fs_config.hash_len) as usize);
         let zero_hash = self.fs_config.calculate_hash(&[]);
         for block_id in block_range {
-            let block_hash = hashes.get(&BlockAddress { ino, index: block_id }).unwrap_or(&zero_hash);
+            let block_hash = hashes.get(&block_id).unwrap_or(&zero_hash);
             if block_hash.len() != self.fs_config.hash_len {
                 return Err(HashFsError::FsHasInvalidData(
-                    format!("hash has invalid length. Expected: {}, actual: {}",
-                                self.fs_config.hash_len, block_hash.len())));
+                    Some(format!("hash has invalid length. Expected: {}, actual: {}",
+                                self.fs_config.hash_len, block_hash.len()))));
             }
             result.extend_from_slice(&block_hash);
         }
         tracing::trace!("res-len-end: {}", result.len());
         Ok(result)
-    }
-
-    async fn checked_write_of_file_hash(&self, mini: &mut Transaction, ino: &StorageIno, change_iteration: u64, new_full_hash: TiFsHash) {
-        let ino_size_arc: Arc<InoSize> = mini.fetch(ino).await?;
-        // was data changed in the meantime?
-        if ino_size_arc.change_iteration == change_iteration {
-            let mut ino_data_mut = ino_size_arc.deref().clone();
-            ino_data_mut.data_hash = Some(new_full_hash);
-            ino_size_arc = Arc::new(ino_data_mut);
-            mini.put(ino, ino_size_arc.clone()).await?;
-        }
-    }
-
-    pub async fn check_if_dir_entry_exists(&self, parent: StorageIno, name: &ByteString) -> TiFsResult<bool> {
-        Ok(self.get_directory_item(&self.f_txn, parent, name.clone()).await?.is_some())
     }
 
     pub fn check_file_name(name: &str) -> TiFsResult<()> {
@@ -292,18 +285,10 @@ impl TikvBasedHashFs {
         perm: StorageFilePermission,
         gid: u32,
         uid: u32,
-    ) -> HashFsResult<GotOrMade<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)>> {
-        Ok(self.clone().directory_add_child_checked_new_inode(parent, name, StorageDirItemKind::Directory,
-            perm, gid, uid, 0, None).await?);
-    }
-
-    pub async fn open_txn(&self, mini: &Transaction, ino: StorageDirItem, use_id: Uuid
-    ) -> HashFsResult<()> {
-        // check for existence
-        let ino_desc: Arc<InoDescription> = mini.fetch(&ino).await?;
-        // publish opened state
-        let key = Key::from(self.key_builder().opened_inode(ino_desc.ino, use_id));
-        self.f_txn.put(key, &[]).await
+    ) -> HashFsResult<GotOrMade<StorageDirItem>> {
+        Ok(self.clone().directory_add_child_checked_new_inode(
+            parent, name, StorageDirItemKind::Directory,
+            perm, gid, uid, 0, None).await?)
     }
 
     pub async fn meta_mutable_reserve_new_ino(&self) -> TiFsResult<StorageIno> {
@@ -567,24 +552,25 @@ impl HashFsInterface for TikvBasedHashFs {
 
     async fn inode_open(&self, ino: StorageIno) -> HashFsResult<Uuid> {
         let use_id = Uuid::new_v4();
-        let spin = SpinningTxn::default();
-        let r = loop {
-            let mini = self.f_txn.spinningMiniTxn().await?;
-            if let Some(r) = spin.end_iter_b(
-                self.open_txn(&mini, ino, use_id)
-                .await, mini).await { break Ok(r?); }
-        };
-        let _inode = self.read_inode(ino).await?;
-        tracing::debug!("open-ino: {ino}, use_id: {use_id}");
-
-        Ok(())
+        // publish opened state
+        let mut spin = self.f_txn.spinningMiniTxn().await?;
+        loop {
+            let mut mini = spin.start().await?;
+            let r1 = mini.inode_open(ino, use_id).await;
+            if let Some(r) = mini.finish(r1).await { break r?; }
+        }
+        Ok(use_id)
     }
 
-    async fn inode_close(self: Arc<Self>, ino: StorageIno, use_id: Uuid) -> TiFsResult<()> {
+    async fn inode_close(&self, ino: StorageIno, use_id: Uuid) -> TiFsResult<()> {
         // de-publish opened state
-        let key = Key::from(self.key_builder().opened_inode(ino, use_id));
-        self.f_txn.delete(key).await?;
-        tracing::debug!("close-ino: {ino}, use_id: {use_id}");
+        let use_id = Uuid::new_v4();
+        let mut spin = self.f_txn.spinningMiniTxn().await?;
+        loop {
+            let mut mini = spin.start().await?;
+            let r1 = mini.inode_close(ino, use_id).await;
+            if let Some(r) = mini.finish(r1).await { break r?; }
+        }
         Ok(())
     }
 
@@ -686,12 +672,16 @@ impl HashFsInterface for TikvBasedHashFs {
             let new_full_hash = self.fs_config.calculate_hash(&hash_data);
             tracing::trace!("freshly_calculated_hash: {new_full_hash:x?}");
 
-            let mut spin = SpinningTxn::default();
-            loop {
-                let mut mini = self.mini_txn().await?;
-                if let Some(r) = spin.end_iter_b(
-                    self.checked_write_of_file_hash(mini, &ino, change_iteration, new_full_hash).await
-                    .await, mini).await { break Ok(r?); }
+            let mut spin = MiniTransaction::new(&self.f_txn).await?;
+            let result = loop {
+                let mut mini = spin.start().await?;
+                let r1 = mini.checked_write_of_file_hash(
+                    &ino, change_iteration, new_full_hash).await;
+                if let Some(r) = mini.finish(r1).await { break r?; }
+            };
+
+            if let Some(new_ino_size) = result {
+                ino_size_arc = new_ino_size;
             }
         }
 

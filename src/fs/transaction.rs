@@ -30,7 +30,7 @@ use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::hash_fs_interface::{BlockIndex, GotOrMade, HashFsInterface, HashFsResult};
 use super::hash_fs_tikv_implementation::TikvBasedHashFs;
-use super::inode::{AccessTime, InoDescription, InoSize, ParentStorageIno, StorageFileAttr, StorageFilePermission, TiFsHash};
+use super::inode::{AccessTime, InoDescription, InoSize, ParentStorageIno, StorageDirItem, StorageFileAttr, StorageFilePermission, TiFsHash};
 use super::key::HashedBlockMeta;
 use super::meta::MetaMutable;
 use super::parsers;
@@ -221,7 +221,7 @@ impl Txn {
         uid: u32,
         rdev: u32,
         inline_data: Option<Vec<u8>>,
-    ) -> HashFsResult<GotOrMade<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)>> {
+    ) -> HashFsResult<GotOrMade<StorageDirItem>> {
         self.f_txn.directory_add_child_checked_new_inode(
             parent, name, typ, perm, gid, uid, rdev, inline_data).await
     }
@@ -660,7 +660,7 @@ impl Txn {
         perm: StorageFilePermission,
         gid: u32,
         uid: u32,
-    ) -> TiFsResult<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)> {
+    ) -> TiFsResult<StorageDirItem> {
         let result = self.clone().directory_add_child_checked_new_inode(
                 parent, name.clone(), StorageDirItemKind::Directory,
                 perm, gid, uid, 0, None).await?;

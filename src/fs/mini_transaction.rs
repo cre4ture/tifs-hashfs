@@ -6,10 +6,11 @@ use num_traits::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use tikv_client::{transaction::Mutation, Key, KvPair, Transaction};
 use tokio::time::sleep;
+use uuid::Uuid;
 
 use crate::fs::{inode::ParentStorageIno, meta::MetaMutable, utils::txn_data_cache::TxnFetch};
 
-use super::{dir::StorageDirectory, error::{FsError, TiFsResult}, hash_fs_interface::GotOrMade, inode::{DirectoryItem, TiFsHash}, key::{BlockAddress, HashedBlockMeta}, transaction::MAX_TIKV_SCAN_LIMIT, utils::txn_data_cache::{TxnDeleteMut, TxnFetchMut, TxnPutMut}};
+use super::{dir::StorageDirectory, error::{FsError, TiFsResult}, hash_fs_interface::GotOrMade, inode::{DirectoryItem, TiFsHash}, key::{BlockAddress, HashedBlockMeta, OPENED_INODE_PARENT_INODE}, transaction::MAX_TIKV_SCAN_LIMIT, utils::txn_data_cache::{TxnDeleteMut, TxnFetchMut, TxnPutMut}};
 use super::index::{deserialize_json, serialize_json};
 use super::fs_config::TiFsConfig;
 use super::flexible_transaction::{FlexibleTransaction, SpinningTxn, TransactionError, TransactionResult};
@@ -23,19 +24,19 @@ pub enum DeletionCheckResult {
     DeletedInoDesc,
 }
 
-pub struct MiniTransaction<'ol> {
-    txn: &'ol FlexibleTransaction,
-    fs_config: &'ol TiFsConfig,
+pub struct MiniTransaction<'ft_l> {
+    txn: &'ft_l FlexibleTransaction,
+    fs_config: &'ft_l TiFsConfig,
     spin: SpinningTxn,
 }
 
-pub struct StartedMiniTransaction<'ol, 'pl> {
-    parent: &'ol mut MiniTransaction<'pl>,
+pub struct StartedMiniTransaction<'mmt_l, 'ft_l> {
+    parent: &'mmt_l mut MiniTransaction<'ft_l>,
     pub mini: Transaction,
 }
 
-impl<'ol> MiniTransaction<'ol> {
-    pub async fn new(txn: &'ol FlexibleTransaction) -> TiFsResult<Self> {
+impl<'ft_l> MiniTransaction<'ft_l> {
+    pub async fn new(txn: &'ft_l FlexibleTransaction) -> TiFsResult<Self> {
         Ok(Self{
             txn,
             fs_config: txn.fs_config(),
@@ -47,8 +48,12 @@ impl<'ol> MiniTransaction<'ol> {
         &self.fs_config
     }
 
-    pub async fn start<'mtl>(&'ol mut self) -> TiFsResult<StartedMiniTransaction<'mtl, 'ol>>
-    where 'ol: 'mtl
+    pub async fn start_test<'fl, 'mol>(&'mol mut self) -> &'fl i32 {
+        tracing::trace!("hello!");
+        &1
+    }
+
+    pub async fn start<'mol>(&'mol mut self) -> TiFsResult<StartedMiniTransaction<'mol, 'ft_l>>
     {
         let mini_res = loop {
             let r = self.txn.mini_txn_raw().await;
@@ -63,7 +68,7 @@ impl<'ol> MiniTransaction<'ol> {
                 }
             }
         };
-        Ok(StartedMiniTransaction::<'mtl, 'ol>{
+        Ok(StartedMiniTransaction::<'mol, 'ft_l>{
             parent: self,
             mini: mini_res
         })
@@ -213,7 +218,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         parent: ParentStorageIno,
         name: ByteString,
         ino: StorageIno
-    ) -> TransactionResult<GotOrMade<StorageDirItem>> {
+    ) -> TiFsResult<GotOrMade<StorageDirItem>> {
 
         let existing = self.directory_get_child(parent, name.clone()).await?;
         if let Some(existing) = existing {
@@ -348,6 +353,65 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         }
     }
 
+    pub async fn inode_open(
+        &mut self,
+        ino: StorageIno,
+        use_id: Uuid,
+    ) -> TiFsResult<()> {
+        // check for existence
+        let ino_desc: Arc<InoDescription> = self.fetch(&ino).await?;
+        // publish opened state
+        let used_id_str = use_id.to_string();
+        let result = self.directory_add_child_checked_existing_inode(
+            OPENED_INODE_PARENT_INODE,
+            ByteString::from(used_id_str.clone()),
+            ino_desc.ino
+        ).await?;
+        if result.existed_before() {
+            return Err(FsError::FileExist { file: used_id_str });
+        }
+        Ok(())
+    }
+
+    pub async fn inode_close(
+        &mut self,
+        ino: StorageIno,
+        use_id: Uuid,
+    ) -> TiFsResult<()> {
+        // remove published opened state
+        let used_id_str = use_id.to_string();
+        let result = self.directory_remove_child(
+            OPENED_INODE_PARENT_INODE,
+            ByteString::from(used_id_str.clone()),
+            &HashSet::from([
+                StorageDirItemKind::Directory,
+                StorageDirItemKind::File,
+                StorageDirItemKind::Symlink
+            ]),
+        ).await?;
+        if result.ino != ino {
+            // return err -> force rollback (un-delete)
+            return Err(FsError::CloseFailedDueToWrongInoOrUseId);
+        }
+        Ok(())
+    }
+
+    pub async fn checked_write_of_file_hash(
+        &mut self, ino: &StorageIno, change_iteration: u64, new_full_hash: TiFsHash
+    ) -> TiFsResult<Option<Arc<InoSize>>> {
+        let mut ino_size_arc: Arc<InoSize> = self.fetch(ino).await?;
+        // was data changed in the meantime?
+        if ino_size_arc.change_iteration == change_iteration {
+            let mut ino_data_mut = ino_size_arc.deref().clone();
+            ino_data_mut.data_hash = Some(new_full_hash);
+            ino_size_arc = Arc::new(ino_data_mut);
+            self.put(ino, ino_size_arc.clone()).await?;
+            Ok(Some(ino_size_arc))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn inode_allocate_size(
         &self,
         ino: StorageIno,
@@ -399,7 +463,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
 
         let ino_size_arc: Arc<InoSize> = self.fetch(&addr.ino).await?;
         let mut ino_size = ino_size_arc.deref().clone();
-        let target_size = addr.index * self.fs_config().block_size + new_blocks_actual_size;
+        let target_size = addr.index.0 * self.fs_config().block_size + new_blocks_actual_size;
         if target_size > ino_size.size() {
             ino_size.set_size(target_size, self.fs_config().block_size)
         }
