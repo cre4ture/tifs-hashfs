@@ -19,7 +19,7 @@ pub enum HashFsError {
     FileAlreadyExists,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
      Hash, derive_more::Add, derive_more::Sub, derive_more::Display
     )]
 pub struct BlockIndex(pub u64);
@@ -101,7 +101,7 @@ pub trait HashFsInterface: Send + Sync  {
     ) -> HashFsResult<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)>;
     async fn directory_add_child_checked_new_inode(
         &self,
-        parent: StorageIno,
+        parent: ParentStorageIno,
         name: ByteString,
         typ: StorageDirItemKind,
         perm: StorageFilePermission,
@@ -114,7 +114,7 @@ pub trait HashFsInterface: Send + Sync  {
         &self,
         gid: u32,
         uid: u32,
-        parent: u64,
+        parent: ParentStorageIno,
         name: ByteString,
         link: ByteString,
     ) -> HashFsResult<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)>;
@@ -125,7 +125,7 @@ pub trait HashFsInterface: Send + Sync  {
     async fn inode_set_all_attributes(
         &self,
         ino: StorageIno,
-        mode: Option<u32>,
+        mode: Option<StorageFilePermission>,
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,

@@ -98,7 +98,7 @@ pub const LOGICAL_INO_FACTOR: u64 = 8;
 impl LogicalIno {
     pub const fn from_raw(ino: u64) -> Self {
         let (base_ino, kind_id) = {
-            let r = ino - ROOT_INODE.0;
+            let r = ino - ROOT_INODE.0.0;
             let kind_id =  r % LOGICAL_INO_FACTOR;
             let base_ino = r / LOGICAL_INO_FACTOR;
             (1 + base_ino, kind_id)
@@ -119,7 +119,7 @@ impl LogicalIno {
 
     pub const fn to_raw(&self) -> u64 {
         let kind_id = self.kind.kind_id();
-        let ino = ROOT_INODE.0 + ((self.storage_ino.0 - 1) * LOGICAL_INO_FACTOR) + kind_id;
+        let ino = ROOT_INODE.0.0 + ((self.storage_ino.0 - 1) * LOGICAL_INO_FACTOR) + kind_id;
         ino
     }
 

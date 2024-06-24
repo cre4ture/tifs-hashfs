@@ -516,22 +516,18 @@ impl ScopedKeyBuilder {
         me.buf
     }
 
-    pub fn root(self) -> KeyBuffer {
-        self.inode_description(ROOT_INODE)
-    }
-
     pub fn directory_child(self, parent: StorageIno, name: &[u8]) -> KeyBuffer {
         let mut me = self.write_key_kind(KeyKind::DirectoryChild);
         write_big_endian::<u64>(parent.0, &mut me.buf);
-        me.buf.extend_from_slice(name.as_bytes());
+        me.buf.extend_from_slice(name);
         me.buf
     }
 
-    pub fn parent_link(self, ino: StorageIno, parent: StorageIno, name: &[u8]) -> Vec<u8> {
+    pub fn parent_link(self, ino: StorageIno, parent: ParentStorageIno, name: &[u8]) -> Vec<u8> {
         let mut me = self.write_key_kind(KeyKind::ParentLink);
         ino.serialize_to(&mut me.buf);
-        parent.serialize_to(&mut me.buf);
-        me.buf.extend_from_slice(name.as_bytes());
+        parent.0.serialize_to(&mut me.buf);
+        me.buf.extend_from_slice(name);
         me.buf
     }
 

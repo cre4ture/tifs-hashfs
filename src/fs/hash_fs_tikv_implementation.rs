@@ -8,12 +8,10 @@ use bytestring::ByteString;
 use fuser::TimeOrNow;
 use num_bigint::BigUint;
 use strum::IntoEnumIterator;
-use tikv_client::{Key, KvPair, Transaction};
+use tikv_client::{Key, KvPair};
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use uuid::Uuid;
 
-use crate::fs::flexible_transaction::SpinningTxn;
-use crate::fs::index::serialize_json;
 use crate::fs::inode::TiFsHash;
 use crate::fs::key::{BlockAddress, PARENT_OF_ROOT_INODE};
 use crate::fs::transaction::MAX_TIKV_SCAN_LIMIT;
@@ -280,38 +278,25 @@ impl TikvBasedHashFs {
 
     pub async fn get_or_make_dir(
         &self,
-        parent: StorageIno,
+        parent: ParentStorageIno,
         name: ByteString,
         perm: StorageFilePermission,
         gid: u32,
         uid: u32,
     ) -> HashFsResult<GotOrMade<StorageDirItem>> {
-        Ok(self.clone().directory_add_child_checked_new_inode(
+        Ok(self.directory_add_child_checked_new_inode(
             parent, name, StorageDirItemKind::Directory,
             perm, gid, uid, 0, None).await?)
     }
 
     pub async fn meta_mutable_reserve_new_ino(&self) -> TiFsResult<StorageIno> {
-        let spin = self.f_txn.spinningMiniTxn().await?;
+        let mut spin = self.f_txn.spinningMiniTxn().await?;
         loop {
-            let mini = spin.start().await?;
-            if let Some(r) = spin.end_iter_b(
-                spin.meta_reserve_new_ino().await,
-                mini).await { break Ok(r?); }
+            let mut started = spin.start().await?;
+            let r1 = started.meta_mutable_reserve_new_ino().await;
+            if let Some(r) = started.finish(r1).await { break Ok(r?); }
         }
     }
-
-    pub async fn add_directory_child_txn(&self, mini: &Transaction, parent: StorageIno, name: ByteString, item: &StorageDirItem) -> HashFsResult<()> {
-        let key_parent_to_child = Key::from(self.key_builder().directory_child(parent, &name));
-        let key_child_to_parent = Key::from(self.key_builder().parent_link(item.ino, parent, &name));
-        tracing::trace!("set dir item by key: {:?}, name: {:?}, item: {:?}", key_parent_to_child, name, item);
-        let value = serialize_json(&item)?;
-        let mut put_pairs = Vec::with_capacity(2);
-        put_pairs.push(KvPair(key_parent_to_child, value));
-        put_pairs.push(KvPair(key_child_to_parent, vec![]));
-        Ok(self.f_txn.batch_put(put_pairs).await?)
-    }
-
 }
 
 // ================================ INTERFACE ==============================================
@@ -360,7 +345,7 @@ impl HashFsInterface for TikvBasedHashFs {
 
     async fn directory_add_child_checked_new_inode(
         &self,
-        parent: StorageIno,
+        parent: ParentStorageIno,
         name: ByteString,
         typ: StorageDirItemKind,
         perm: StorageFilePermission,
@@ -412,7 +397,7 @@ impl HashFsInterface for TikvBasedHashFs {
         &self,
         gid: u32,
         uid: u32,
-        parent: StorageIno,
+        parent: ParentStorageIno,
         name: ByteString,
         link: ByteString,
     ) -> HashFsResult<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)> {
@@ -464,37 +449,44 @@ impl HashFsInterface for TikvBasedHashFs {
 
     async fn directory_rename_child(
         &self,
-        parent: StorageIno,
+        parent: ParentStorageIno,
         raw_name: ByteString,
-        new_parent: StorageIno,
+        new_parent: ParentStorageIno,
         new_raw_name: ByteString,
     ) -> HashFsResult<()> {
         Self::check_file_name(&raw_name)?;
         Self::check_file_name(&new_raw_name)?;
-        let name = raw_name.clone();
-        let new_name = new_raw_name.clone();
-        let dir_item = self.get_directory_item(parent, name.clone()).await?.ok_or(
-            HashFsError::FileNotFound
-        )?;
-        self.add_hard_link(dir_item.ino, parent, new_name).await?;
-        self.unlink(parent, name).await?;
+        let mut spin = self.f_txn.spinningMiniTxn().await?;
+        loop {
+            let mut started = spin.start().await?;
+            let r1 = started.directory_rename_child(
+                parent, raw_name.clone(), new_parent, new_raw_name.clone()).await;
+            if let Some(result) = started.finish(r1).await { break result?; }
+        }
         Ok(())
     }
 
     async fn directory_child_get_all_attributes(
         &self,
-        parent: StorageIno,
+        parent: ParentStorageIno,
         name: ByteString,
     ) -> HashFsResult<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)> {
-        let entry = self.get_directory_item(parent, name).await?
-            .ok_or(HashFsError::FileNotFound)?;
+        let mut spin = self.f_txn.spinningMiniTxn().await?;
+        let entry_opt = loop {
+            let mut started = spin.start().await?;
+            let r1 = started.directory_get_child(
+                parent, name.clone()).await;
+            if let Some(result) = started.finish(
+                r1).await { break result?; }
+        };
+        let entry = entry_opt.ok_or(HashFsError::FileNotFound)?;
         self.inode_get_all_attributes(entry.ino).await
     }
 
     async fn inode_get_all_attributes(
         &self,
         ino: StorageIno,
-    ) -> TiFsResult<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)> {
+    ) -> HashFsResult<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)> {
         let desc: Arc<InoDescription> = self.f_txn.fetch(&ino).await?;
         let attr: Arc<StorageFileAttr> = self.f_txn.fetch(&ino).await?;
         let size: Arc<InoSize> = self.f_txn.fetch(&ino).await?;
@@ -562,9 +554,8 @@ impl HashFsInterface for TikvBasedHashFs {
         Ok(use_id)
     }
 
-    async fn inode_close(&self, ino: StorageIno, use_id: Uuid) -> TiFsResult<()> {
+    async fn inode_close(&self, ino: StorageIno, use_id: Uuid) -> HashFsResult<()> {
         // de-publish opened state
-        let use_id = Uuid::new_v4();
         let mut spin = self.f_txn.spinningMiniTxn().await?;
         loop {
             let mut mini = spin.start().await?;

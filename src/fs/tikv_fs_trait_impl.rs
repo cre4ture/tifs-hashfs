@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, reply::InoKind};
 
-use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, open_modes::OpenMode};
+use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::ParentStorageIno, open_modes::OpenMode};
 use super::mode::{as_file_kind, as_file_perm};
 use super::tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable};
 use super::reply::{get_time, Attr, Create, Data, Dir, Entry, LogicalIno, Open, StatFs, Write, Xattr};
@@ -471,7 +471,8 @@ impl AsyncFileSystem for TiFs {
             let name = name_clone1.clone();
             let link_data_vec = link_data_vec.clone();
             Box::pin(async move {
-                Ok(txn.f_txn.directory_add_new_symlink(gid, uid, parent, name, link).await?)
+                Ok(txn.f_txn.directory_add_new_symlink(
+                    gid, uid, ParentStorageIno(p_ino.storage_ino()), name, link).await?)
             })
         }).await?;
 

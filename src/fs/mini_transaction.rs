@@ -338,6 +338,26 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         Ok(child_item)
     }
 
+    pub async fn directory_rename_child(
+        &mut self,
+        parent: ParentStorageIno,
+        name: ByteString,
+        new_parent: ParentStorageIno,
+        new_name: ByteString,
+    ) -> TiFsResult<()> {
+        let dir_item = self.directory_get_child(parent, name.clone()).await?.ok_or(
+            FsError::FileNotFound { file: name.clone().into() }
+        )?;
+        self.directory_add_child_checked_existing_inode(
+            new_parent, new_name, dir_item.ino).await?;
+        self.directory_remove_child(
+            parent,
+            name,
+            &HashSet::from([dir_item.typ])
+        ).await?;
+        Ok(())
+    }
+
     pub async fn inode_check_for_delete_and_delete_atomically_description(
         &mut self,
         ino: StorageIno
@@ -413,12 +433,13 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
     }
 
     pub async fn inode_allocate_size(
-        &self,
+        &mut self,
         ino: StorageIno,
         offset: i64,
         length: i64,
     ) -> TiFsResult<()> {
-        let mut ino_size: InoSize = self.fetch(&ino).await?.deref().clone();
+        let mut ino_size = TxnFetchMut::<StorageIno, InoSize>::fetch(
+            self, &ino).await?.deref().clone();
         let target_size = (offset + length) as u64;
         if target_size <= ino_size.size() {
             return Ok(());
@@ -428,20 +449,20 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
             return Err(FsError::WrongFileType);
         }
 
-        ino_size.set_size(target_size, self.block_size);
+        ino_size.set_size(target_size, self.fs_config().block_size);
         ino_size.last_change = SystemTime::now();
         self.put(&ino, Arc::new(ino_size)).await?;
         Ok(())
     }
 
     pub async fn hb_increment_blocks_reference_count(
-        &self,
+        &mut self,
         block_key: Vec<u8>,
         cnt: u64,
     ) -> TiFsResult<BigUint> {
         let prev_counter_value = self.mini.get(block_key.clone()).await?
-        .map(|vec|BigUint::from_bytes_be(&vec))
-        .unwrap_or(BigUint::from_u8(0u8).unwrap());
+            .map(|vec|BigUint::from_bytes_be(&vec))
+            .unwrap_or(BigUint::from_u8(0u8).unwrap());
         let new_counter_value = prev_counter_value.clone() + cnt;
         self.mini.put(block_key.clone(), new_counter_value.to_bytes_be()).await?;
         Ok(prev_counter_value)

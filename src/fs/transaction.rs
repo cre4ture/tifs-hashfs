@@ -33,6 +33,7 @@ use super::hash_fs_tikv_implementation::TikvBasedHashFs;
 use super::inode::{AccessTime, InoDescription, InoSize, ParentStorageIno, StorageDirItem, StorageFileAttr, StorageFilePermission, TiFsHash};
 use super::key::HashedBlockMeta;
 use super::meta::MetaMutable;
+use super::mode::as_file_perm;
 use super::parsers;
 use super::reply::StatFs;
 use super::tikv_fs::TiFsCaches;
@@ -156,8 +157,10 @@ impl Txn {
         Arc::new_cyclic(|weak| Txn {
             weak: weak.clone(),
             _instance_id: instance_id,
-            f_txn: FlexibleTransaction::new_pure_raw(
-                client, raw, fs_config.clone()),
+            f_txn: TikvBasedHashFs::new_arc(
+                fs_config.clone(), FlexibleTransaction::new_pure_raw(
+                client, raw, fs_config.clone())
+            ),
             fs_config: fs_config.clone(),
             block_size: fs_config.block_size,
             max_name_len,
@@ -213,7 +216,7 @@ impl Txn {
 
     pub async fn directory_add_child_checked_new_inode(
         self: TxnArc,
-        parent: StorageIno,
+        parent: ParentStorageIno,
         name: ByteString,
         typ: StorageDirItemKind,
         perm: StorageFilePermission,
@@ -638,8 +641,10 @@ impl Txn {
         bkuptime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> TiFsResult<()> {
+        let mode_conv = mode.map(|m| StorageFilePermission(
+            as_file_perm(m)));
         Ok(self.f_txn.inode_set_all_attributes(
-            ino, mode, uid, gid, size, atime, mtime, ctime,
+            ino, mode_conv, uid, gid, size, atime, mtime, ctime,
             crtime, chgtime, bkuptime, flags).await?)
     }
 
@@ -655,7 +660,7 @@ impl Txn {
 
     pub async fn mkdir(
         self:  TxnArc,
-        parent: StorageIno,
+        parent: ParentStorageIno,
         name: ByteString,
         perm: StorageFilePermission,
         gid: u32,

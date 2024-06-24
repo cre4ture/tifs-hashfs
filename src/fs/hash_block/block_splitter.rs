@@ -31,7 +31,7 @@ impl<'a> BlockSplitterWrite<'a> {
 
     fn get_irregular_start_and_rest(&mut self) {
         let mut block_index = self.start / self.block_size;
-        self.first_data.block_index = block_index;
+        self.first_data.block_index = BlockIndex(block_index);
         self.first_data_start_position = (self.start % self.block_size) as usize;
         let first_block_remaining_space = self.block_size as usize - self.first_data_start_position;
         let first_block_write_length = first_block_remaining_space.min(self.data.len());
@@ -49,19 +49,19 @@ impl<'a> BlockSplitterWrite<'a> {
         let full_blocks = remaining_after_start_block / self.block_size as usize;
         let begin_of_last_irregular_block = full_blocks * self.block_size as usize;
         let (mid, end_block) = &rest.split_at(begin_of_last_irregular_block);
-        self.mid_data.block_index = block_index;
+        self.mid_data.block_index = BlockIndex(block_index);
         self.mid_data.data = mid;
-        self.last_data.block_index = block_index + full_blocks as u64;
+        self.last_data.block_index = BlockIndex(block_index + full_blocks as u64);
         if end_block.len() > 0 {
             self.last_data.data = end_block;
         } else {
             // such that "last_data.block_index + 1" refers to block index after the last valid
-            self.last_data.block_index -= 1;
+            self.last_data.block_index.0 -= 1;
         }
     }
 
     pub fn get_range(&self) -> Range<BlockIndex> {
-        BlockIndex(self.first_data.block_index)..BlockIndex(self.last_data.block_index+1)
+        self.first_data.block_index..BlockIndex(self.last_data.block_index.0+1)
     }
 }
 
@@ -111,6 +111,8 @@ impl BlockSplitterRead {
 
 #[cfg(test)]
 mod test_writer {
+    use crate::fs::hash_fs_interface::BlockIndex;
+
     use super::BlockSplitterWrite;
     use lazy_static::lazy_static;
 
@@ -127,11 +129,11 @@ mod test_writer {
         assert_eq!(bs.start, 0);
         assert_eq!(bs.data, &TEST_DATA[0..30]);
         assert_eq!(bs.first_data_start_position, 0);
-        assert_eq!(bs.first_data.block_index, 0);
+        assert_eq!(bs.first_data.block_index, BlockIndex(0));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..30]);
-        assert_eq!(bs.mid_data.block_index, 1);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(1));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.last_data.block_index, 0);
+        assert_eq!(bs.last_data.block_index, BlockIndex(0));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -142,11 +144,11 @@ mod test_writer {
         assert_eq!(bs.start, 30);
         assert_eq!(bs.data, &TEST_DATA[0..30]);
         assert_eq!(bs.first_data_start_position, 30);
-        assert_eq!(bs.first_data.block_index, 0);
+        assert_eq!(bs.first_data.block_index, BlockIndex(0));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..30]);
-        assert_eq!(bs.mid_data.block_index, 1);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(1));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.last_data.block_index, 0);
+        assert_eq!(bs.last_data.block_index, BlockIndex(0));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -157,11 +159,11 @@ mod test_writer {
         assert_eq!(bs.start, 70);
         assert_eq!(bs.data, &TEST_DATA[0..30]);
         assert_eq!(bs.first_data_start_position, 70);
-        assert_eq!(bs.first_data.block_index, 0);
+        assert_eq!(bs.first_data.block_index, BlockIndex(0));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..30]);
-        assert_eq!(bs.mid_data.block_index, 1);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(1));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.last_data.block_index, 0);
+        assert_eq!(bs.last_data.block_index, BlockIndex(0));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -172,11 +174,11 @@ mod test_writer {
         assert_eq!(bs.start, 0);
         assert_eq!(bs.data, &TEST_DATA[0..100]);
         assert_eq!(bs.first_data_start_position, 0);
-        assert_eq!(bs.first_data.block_index, 0);
+        assert_eq!(bs.first_data.block_index, BlockIndex(0));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.mid_data.block_index, 0);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(0));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..100]);
-        assert_eq!(bs.last_data.block_index, 0);
+        assert_eq!(bs.last_data.block_index, BlockIndex(0));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -185,11 +187,11 @@ mod test_writer {
     fn write_second_block_from_start_partially() {
         let bs = BlockSplitterWrite::new(100, 100, &TEST_DATA[0..30]);
         assert_eq!(bs.first_data_start_position, 0);
-        assert_eq!(bs.first_data.block_index, 1);
+        assert_eq!(bs.first_data.block_index, BlockIndex(1));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..30]);
-        assert_eq!(bs.mid_data.block_index, 2);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(2));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.last_data.block_index, 1);
+        assert_eq!(bs.last_data.block_index, BlockIndex(1));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -197,11 +199,11 @@ mod test_writer {
     fn write_second_block_in_middle_partially() {
         let bs = BlockSplitterWrite::new(100, 130, &TEST_DATA[0..30]);
         assert_eq!(bs.first_data_start_position, 30);
-        assert_eq!(bs.first_data.block_index, 1);
+        assert_eq!(bs.first_data.block_index, BlockIndex(1));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..30]);
-        assert_eq!(bs.mid_data.block_index, 2);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(2));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.last_data.block_index, 1);
+        assert_eq!(bs.last_data.block_index, BlockIndex(1));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -209,11 +211,11 @@ mod test_writer {
     fn write_second_block_at_end_partially() {
         let bs = BlockSplitterWrite::new(100, 170, &TEST_DATA[0..30]);
         assert_eq!(bs.first_data_start_position, 70);
-        assert_eq!(bs.first_data.block_index, 1);
+        assert_eq!(bs.first_data.block_index, BlockIndex(1));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..30]);
-        assert_eq!(bs.mid_data.block_index, 2);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(2));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.last_data.block_index, 1);
+        assert_eq!(bs.last_data.block_index, BlockIndex(1));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -221,11 +223,11 @@ mod test_writer {
     fn write_second_block_fully() {
         let bs = BlockSplitterWrite::new(100, 100, &TEST_DATA[10..110]);
         assert_eq!(bs.first_data_start_position, 0);
-        assert_eq!(bs.first_data.block_index, 1);
+        assert_eq!(bs.first_data.block_index, BlockIndex(1));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.mid_data.block_index, 1);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(1));
         assert_eq!(bs.mid_data.data, &TEST_DATA[10..110]);
-        assert_eq!(bs.last_data.block_index, 1);
+        assert_eq!(bs.last_data.block_index, BlockIndex(1));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -237,11 +239,11 @@ mod test_writer {
         assert_eq!(bs.start, 0);
         assert_eq!(bs.data, &TEST_DATA[0..130]);
         assert_eq!(bs.first_data_start_position, 0);
-        assert_eq!(bs.first_data.block_index, 0);
+        assert_eq!(bs.first_data.block_index, BlockIndex(0));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.mid_data.block_index, 0);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(0));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..100]);
-        assert_eq!(bs.last_data.block_index, 1);
+        assert_eq!(bs.last_data.block_index, BlockIndex(1));
         assert_eq!(bs.last_data.data, &TEST_DATA[100..130]);
     }
 
@@ -249,11 +251,11 @@ mod test_writer {
     fn write_first_2_block_in_middle_partially() {
         let bs = BlockSplitterWrite::new(100, 30, &TEST_DATA[0..90]);
         assert_eq!(bs.first_data_start_position, 30);
-        assert_eq!(bs.first_data.block_index, 0);
+        assert_eq!(bs.first_data.block_index, BlockIndex(0));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..70]);
-        assert_eq!(bs.mid_data.block_index, 1);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(1));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.last_data.block_index, 1);
+        assert_eq!(bs.last_data.block_index, BlockIndex(1));
         assert_eq!(bs.last_data.data, &TEST_DATA[70..90]);
     }
 
@@ -261,11 +263,11 @@ mod test_writer {
     fn write_first_2_block_at_end_partially() {
         let bs = BlockSplitterWrite::new(100, 70, &TEST_DATA[0..130]);
         assert_eq!(bs.first_data_start_position, 70);
-        assert_eq!(bs.first_data.block_index, 0);
+        assert_eq!(bs.first_data.block_index, BlockIndex(0));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..30]);
-        assert_eq!(bs.mid_data.block_index, 1);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(1));
         assert_eq!(bs.mid_data.data, &TEST_DATA[30..130]);
-        assert_eq!(bs.last_data.block_index, 1);
+        assert_eq!(bs.last_data.block_index, BlockIndex(1));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -276,11 +278,11 @@ mod test_writer {
         assert_eq!(bs.start, 0);
         assert_eq!(bs.data, &TEST_DATA[0..200]);
         assert_eq!(bs.first_data_start_position, 0);
-        assert_eq!(bs.first_data.block_index, 0);
+        assert_eq!(bs.first_data.block_index, BlockIndex(0));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.mid_data.block_index, 0);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(0));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..200]);
-        assert_eq!(bs.last_data.block_index, 1);
+        assert_eq!(bs.last_data.block_index, BlockIndex(1));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -292,11 +294,11 @@ mod test_writer {
         assert_eq!(bs.start, 1000);
         assert_eq!(bs.data, &TEST_DATA[0..230]);
         assert_eq!(bs.first_data_start_position, 0);
-        assert_eq!(bs.first_data.block_index, 10);
+        assert_eq!(bs.first_data.block_index, BlockIndex(10));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.mid_data.block_index, 10);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(10));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..200]);
-        assert_eq!(bs.last_data.block_index, 12);
+        assert_eq!(bs.last_data.block_index, BlockIndex(12));
         assert_eq!(bs.last_data.data, &TEST_DATA[200..230]);
     }
 
@@ -304,11 +306,11 @@ mod test_writer {
     fn write_3_block_at_offset_10_in_middle_partially() {
         let bs = BlockSplitterWrite::new(100, 1030, &TEST_DATA[0..190]);
         assert_eq!(bs.first_data_start_position, 30);
-        assert_eq!(bs.first_data.block_index, 10);
+        assert_eq!(bs.first_data.block_index, BlockIndex(10));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..70]);
-        assert_eq!(bs.mid_data.block_index, 11);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(11));
         assert_eq!(bs.mid_data.data, &TEST_DATA[70..170]);
-        assert_eq!(bs.last_data.block_index, 12);
+        assert_eq!(bs.last_data.block_index, BlockIndex(12));
         assert_eq!(bs.last_data.data, &TEST_DATA[170..190]);
     }
 
@@ -316,11 +318,11 @@ mod test_writer {
     fn write_3_block_at_offset_10_at_end_partially() {
         let bs = BlockSplitterWrite::new(100, 1070, &TEST_DATA[0..230]);
         assert_eq!(bs.first_data_start_position, 70);
-        assert_eq!(bs.first_data.block_index, 10);
+        assert_eq!(bs.first_data.block_index, BlockIndex(10));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..30]);
-        assert_eq!(bs.mid_data.block_index, 11);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(11));
         assert_eq!(bs.mid_data.data, &TEST_DATA[30..230]);
-        assert_eq!(bs.last_data.block_index, 12);
+        assert_eq!(bs.last_data.block_index, BlockIndex(12));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 
@@ -331,11 +333,11 @@ mod test_writer {
         assert_eq!(bs.start, 1000);
         assert_eq!(bs.data, &TEST_DATA[0..300]);
         assert_eq!(bs.first_data_start_position, 0);
-        assert_eq!(bs.first_data.block_index, 10);
+        assert_eq!(bs.first_data.block_index, BlockIndex(10));
         assert_eq!(bs.first_data.data, &TEST_DATA[0..0]);
-        assert_eq!(bs.mid_data.block_index, 10);
+        assert_eq!(bs.mid_data.block_index, BlockIndex(10));
         assert_eq!(bs.mid_data.data, &TEST_DATA[0..300]);
-        assert_eq!(bs.last_data.block_index, 12);
+        assert_eq!(bs.last_data.block_index, BlockIndex(12));
         assert_eq!(bs.last_data.data, &TEST_DATA[0..0]);
     }
 }

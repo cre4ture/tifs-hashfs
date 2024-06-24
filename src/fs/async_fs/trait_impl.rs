@@ -1,6 +1,6 @@
 use std::{ffi::OsStr, path::Path, sync::Arc, time::SystemTime};
 
-use fuser::{Filesystem, KernelConfig, ReplyAttr, ReplyBmap, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow};
+use fuser::{Filesystem, KernelConfig, ReplyAttr, ReplyBmap, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow};
 use tokio::spawn;
 
 use super::{block_on, spawn_reply, AsyncFileSystem};
@@ -504,21 +504,21 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         });
     }
 
-    #[tracing::instrument(skip(self))]
-    fn lseek(
-        &mut self,
-        req: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        whence: i32,
-        reply: ReplyLseek,
-    ) {
-        let async_impl = self.0.clone();
-        spawn_reply(req.unique(), reply, async move {
-            async_impl.lseek(ino, fh, offset, whence).await
-        });
-    }
+    //#[tracing::instrument(skip(self))]
+    //fn lseek(
+    //    &mut self,
+    //    req: &Request,
+    //    ino: u64,
+    //    fh: u64,
+    //    offset: i64,
+    //    whence: i32,
+    //    reply: ReplyLseek,
+    //) {
+    //    let async_impl = self.0.clone();
+    //    spawn_reply(req.unique(), reply, async move {
+    //        async_impl.lseek(ino, fh, offset, whence).await
+    //    });
+    //}
 
     #[tracing::instrument(skip(self))]
     fn copy_file_range(
