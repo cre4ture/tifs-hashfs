@@ -1,6 +1,7 @@
-use std::{collections::{HashMap, HashSet}, ops::Deref, sync::Arc};
+use std::{collections::{BTreeMap, HashMap, HashSet}, ops::Deref, sync::Arc};
 
-use crate::fs::{fs_config::TiFsConfig, hashed_block::HashedBlock, inode::{StorageIno, TiFsHash}, key::BlockAddress};
+use crate::fs::{fs_config::TiFsConfig, hash_fs_interface::BlockIndex, hashed_block::HashedBlock};
+use crate::fs::inode::{StorageIno, TiFsHash};
 
 use super::block_splitter::BlockIndexAndData;
 
@@ -18,15 +19,11 @@ impl<'ol> UpdateIrregularBlock<'ol> {
         ino: StorageIno,
         block_splitter_data: BlockIndexAndData<'ol>,
         block_splitter_data_start_position: usize,
-        hash_list_prev: &HashMap<BlockAddress, TiFsHash>,
+        hash_list_prev: &BTreeMap<BlockIndex, TiFsHash>,
         pre_data_hash_request: &mut HashSet<TiFsHash>,
     ) -> Self {
         let first_data_hash = if block_splitter_data.data.len() > 0 {
-            let address = BlockAddress {
-                ino,
-                index: block_splitter_data.block_index,
-            };
-            if let Some(hash) = hash_list_prev.get(&address) {
+            if let Some(hash) = hash_list_prev.get(&block_splitter_data.block_index) {
                 pre_data_hash_request.insert(hash.clone());
                 Some(hash)
             } else { None }
@@ -45,7 +42,7 @@ impl<'ol> UpdateIrregularBlock<'ol> {
         &self,
         pre_data: &HashMap<TiFsHash, Arc<Vec<u8>>>,
         new_blocks: &mut HashMap<TiFsHash, Arc<Vec<u8>>>,
-        new_block_hashes: &mut HashMap<BlockAddress, TiFsHash>,
+        new_block_hashes: &mut HashMap<BlockIndex, TiFsHash>,
     ) {
         if self.block_splitter_data.data.len() > 0 {
             let original = self.original_data_hash.as_ref().and_then(|h| pre_data.get(h));
@@ -57,7 +54,7 @@ impl<'ol> UpdateIrregularBlock<'ol> {
             HashedBlock::update_data_range_in_vec(self.block_splitter_data_start_position, self.block_splitter_data.data, &mut modifiable);
             let new_hash = self.fs_config.calculate_hash(&modifiable);
             let _ = new_blocks.try_insert(new_hash.clone(), Arc::new(modifiable));
-            new_block_hashes.insert(BlockAddress{ino: self.ino, index: self.block_splitter_data.block_index}, new_hash);
+            new_block_hashes.insert(self.block_splitter_data.block_index, new_hash);
         }
     }
 }

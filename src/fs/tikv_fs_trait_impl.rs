@@ -1,17 +1,19 @@
-use std::{mem, ops::Deref, sync::Arc, time::{Duration, SystemTime}};
+use std::{mem, sync::Arc, time::{Duration, SystemTime}};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{consts::FOPEN_DIRECT_IO, KernelConfig, TimeOrNow};
 use futures::FutureExt;
-use libc::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace};
 use uuid::Uuid;
 
-use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, key::{PARENT_OF_ROOT_INODE, ROOT_INODE}, reply::InoKind};
+use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, reply::InoKind};
 
-use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::StorageDirItemKind, mode::{as_file_kind, as_file_perm}, open_modes::OpenMode, reply::{get_time, Attr, Create, Data, Dir, Entry, Lock, LogicalIno, Lseek, Open, StatFs, Write, Xattr}, tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable}};
+use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, open_modes::OpenMode};
+use super::mode::{as_file_kind, as_file_perm};
+use super::tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable};
+use super::reply::{get_time, Attr, Create, Data, Dir, Entry, LogicalIno, Open, StatFs, Write, Xattr};
 
 
 
@@ -42,23 +44,7 @@ impl AsyncFileSystem for TiFs {
 
         arc.spin_no_delay(format!("init"), move |fs, txn| {
             Box::pin(async move {
-                info!("initializing tifs on {:?} ...", &fs.pd_endpoints);
-                let root_inode = txn.clone().read_inode(ROOT_INODE).await;
-                if let Err(FsError::KeyNotFound) = root_inode {
-                    let attr = txn
-                        .mkdir(
-                            PARENT_OF_ROOT_INODE,
-                            Default::default(),
-                            StorageFilePermission(0o777),
-                            gid,
-                            uid,
-                        )
-                        .await?;
-                    debug!("make root directory {:?}", &attr);
-                    Ok(())
-                } else {
-                    root_inode.map(|_| ())
-                }
+                Ok(txn.f_txn.init().await?)
             })
         })
         .await
@@ -237,7 +223,7 @@ impl AsyncFileSystem for TiFs {
         let data = match l_ino.kind {
             InoKind::Regular => self.read_kind_regular(l_ino.storage_ino(), file_handler, start as u64, size, flags, lock_owner).await,
             InoKind::Hash => self.read_kind_hash(l_ino.storage_ino(), start as u64, size).await,
-            InoKind::Hashes => self.read_kind_hashes(l_ino.storage_ino(), start as u64, size).await,
+            InoKind::Hashes => self.read_file_kind_hashes(l_ino.storage_ino(), start as u64, size).await,
         }?;
 
         trace!("read() result len: {}", data.data.len());
@@ -337,7 +323,7 @@ impl AsyncFileSystem for TiFs {
         Self::check_file_name(&name)?;
         let (i_desc, i_size, i_attr) = self
             .spin_no_delay(format!("mknod"), move |_, txn| {
-                Box::pin(txn.make_inode(p_ino.storage_ino(), name.clone(), typ, perm, gid, uid, rdev, None))
+                Box::pin(txn.directory_add_child_checked_new_inode(p_ino.storage_ino(), name.clone(), typ, perm, gid, uid, rdev, None))
             })
             .await?;
         Ok(Entry::new(self.map_storage_attr_to_fuser(
@@ -370,7 +356,7 @@ impl AsyncFileSystem for TiFs {
             open.flags,
         ))
     }
-
+/*
     async fn lseek(&self, ino: u64, fh: u64, offset: i64, whence: i32) -> Result<Lseek> {
         let l_ino = LogicalIno::from_raw(ino);
         eprintln!("lseek-begin(ino:{ino},fh:{fh},offset:{offset},whence:{whence}");
@@ -411,7 +397,7 @@ impl AsyncFileSystem for TiFs {
 
         Ok(result)
     }
-
+*/
     async fn release(
         &self,
         _ino: u64,
@@ -429,7 +415,7 @@ impl AsyncFileSystem for TiFs {
         let l_ino = LogicalIno::from_raw(ino);
         let p_ino = LogicalIno::from_raw(new_parent);
         Self::check_file_name(&new_name)?;
-        let _inode = self
+        self
             .spin_no_delay(format!("link"), move |_, txn| Box::pin(txn.add_hard_link(l_ino.storage_ino(), p_ino.storage_ino(), new_name.clone())))
             .await?;
         let (i_desc, i_attr,
@@ -457,16 +443,11 @@ impl AsyncFileSystem for TiFs {
     ) -> Result<()> {
         let p_ino = LogicalIno::from_raw(parent);
         let np_ino = LogicalIno::from_raw(new_parent);
-        Self::check_file_name(&raw_name)?;
-        Self::check_file_name(&new_raw_name)?;
         self.spin_no_delay(format!("rename"), move |_, txn| {
             let name = raw_name.clone();
             let new_name = new_raw_name.clone();
             Box::pin(async move {
-                let dir_item = txn.clone().lookup_ino(p_ino.storage_ino(), name.clone()).await?;
-                txn.clone().add_hard_link(dir_item.ino, np_ino.storage_ino(), new_name).await?;
-                txn.clone().unlink(p_ino.storage_ino(), name).await?;
-                Ok(())
+                txn.f_txn.directory_rename_child(p_ino.storage_ino(), raw_name, np_ino.storage_ino(), new_raw_name).await
             })
         })
         .await
@@ -490,19 +471,7 @@ impl AsyncFileSystem for TiFs {
             let name = name_clone1.clone();
             let link_data_vec = link_data_vec.clone();
             Box::pin(async move {
-                if txn.clone().check_if_dir_entry_exists(p_ino.storage_ino(), &name).await? {
-                    return Err(FsError::FileExist {
-                        file: name.to_string(),
-                    });
-                }
-                txn.clone().make_inode(
-                    p_ino.storage_ino(),
-                    name,
-                    StorageDirItemKind::Symlink,
-                    StorageFilePermission(0o777),
-                    gid, uid, 0,
-                    Some(link_data_vec),
-                ).await
+                Ok(txn.f_txn.directory_add_new_symlink(gid, uid, parent, name, link).await?)
             })
         }).await?;
 
@@ -548,6 +517,7 @@ impl AsyncFileSystem for TiFs {
         self.spin_no_delay(format!("statfs"), |_, txn| Box::pin(txn.statfs())).await
     }
 
+/*
     #[tracing::instrument]
     async fn setlk(
         &self,
@@ -659,6 +629,7 @@ impl AsyncFileSystem for TiFs {
         })
         .await
     }
+*/
 
     /// Set an extended attribute.
     async fn setxattr(

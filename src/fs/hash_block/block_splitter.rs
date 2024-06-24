@@ -1,8 +1,10 @@
 use std::ops::Range;
 
+use crate::fs::hash_fs_interface::BlockIndex;
+
 #[derive(Default)]
 pub struct BlockIndexAndData<'a> {
-    pub block_index: u64,
+    pub block_index: BlockIndex,
     pub data: &'a[u8],
 }
 
@@ -58,8 +60,8 @@ impl<'a> BlockSplitterWrite<'a> {
         }
     }
 
-    pub fn get_range(&self) -> Range<u64> {
-        self.first_data.block_index..self.last_data.block_index+1
+    pub fn get_range(&self) -> Range<BlockIndex> {
+        BlockIndex(self.first_data.block_index)..BlockIndex(self.last_data.block_index+1)
     }
 }
 

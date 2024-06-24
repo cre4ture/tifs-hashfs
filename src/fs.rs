@@ -24,3 +24,6 @@ pub mod szymanskis_critical_section;
 pub mod flexible_transaction;
 pub mod open_modes;
 pub mod pending_deletes;
+pub mod hash_fs_interface;
+pub mod hash_fs_tikv_implementation;
+pub mod mini_transaction;

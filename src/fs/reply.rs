@@ -295,11 +295,11 @@ impl Bmap {
 }
 
 #[derive(Debug)]
-pub struct Lseek {
+pub struct Sleek {
     pub offset: i64,
 }
 
-impl Lseek {
+impl Sleek {
     pub fn new(offset: i64) -> Self {
         Self { offset }
     }
@@ -473,8 +473,8 @@ impl FsReply<Bmap> for ReplyBmap {
     }
 }
 
-impl FsReply<Lseek> for ReplyLseek {
-    fn reply_ok(self, item: Lseek) {
+impl FsReply<Sleek> for ReplyLseek {
+    fn reply_ok(self, item: Sleek) {
         self.offset(item.offset)
     }
     fn reply_err(self, err: libc::c_int) {

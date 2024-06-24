@@ -11,6 +11,7 @@ use super::error::FsError;
 use super::fs_config::TiFsConfig;
 use super::index::{deserialize_json, serialize_json};
 use super::key::{KeyGenerator, KeyParser, ScopedKeyBuilder};
+use super::mini_transaction::MiniTransaction;
 use super::utils::txn_data_cache::{TxnDelete, TxnFetch, TxnPut};
 use super::{error::TiFsResult, transaction::{DEFAULT_REGION_BACKOFF, OPTIMISTIC_BACKOFF}, transaction_client_mux::TransactionClientMux};
 
@@ -72,19 +73,19 @@ impl SpinningTxn {
     }
     */
 
-    pub async fn end_iter<R: std::fmt::Debug>(
-        &mut self,
-        result: TiKvResult<R>,
-        mini: Transaction
-    ) -> SpinningIterResult<R> {
-        match self.end_iter_b(result, mini).await {
-            None => return SpinningIterResult::TryAgain,
-            Some(Ok(value)) => return SpinningIterResult::Done(value),
-            Some(Err(err)) => return SpinningIterResult::Failed(err),
-        }
-    }
+//    pub async fn end_iter<R: std::fmt::Debug>(
+//        &mut self,
+//        result: TiKvResult<R>,
+//        mini: Transaction
+//    ) -> SpinningIterResult<R> {
+//        match self.end_iter_b(result, mini).await {
+//            None => return SpinningIterResult::TryAgain,
+//            Some(Ok(value)) => return SpinningIterResult::Done(value),
+//            Some(Err(err)) => return SpinningIterResult::Failed(err),
+//        }
+//    }
 
-    pub async fn end_iter_b<R>(&mut self, result: TiKvResult<R>, mut mini: Transaction
+    pub async fn end_iter_b<R>(&mut self, result: TransactionResult<R>, mut mini: Transaction
     ) -> Option<TiFsResult<R>> {
         match result {
             Ok(val) => {
@@ -106,13 +107,21 @@ impl SpinningTxn {
                 if let Err(error) = mini.rollback().await {
                     tracing::error!("failed to rollback mini transaction. Err: {error:?}");
                 }
-                if let Some(delay) = self.backoff.next_delay_duration() {
-                    sleep(delay).await;
-                    tracing::info!("retry rolled back transaction");
-                    return None;
-                } else {
-                    tracing::warn!("transaction failed!");
-                    return Some(Err(result_err.into()));
+                match result_err {
+                    TransactionError::PersistentIssue(err) => {
+                        tracing::error!("cancelling transaction retry due to persistent error. Err: {err:?}");
+                        return Some(Err(err));
+                    }
+                    TransactionError::TemporaryIssue(err) => {
+                        if let Some(delay) = self.backoff.next_delay_duration() {
+                            sleep(delay).await;
+                            tracing::info!("retry rolled back transaction");
+                            return None;
+                        } else {
+                            tracing::warn!("transaction failed!");
+                            return Some(Err(err));
+                        }
+                    }
                 }
             }
         }
@@ -155,13 +164,25 @@ impl FlexibleTransaction {
         Ok(client_mux.give_one_transaction(&options).await?)
     }
 
-    pub async fn mini_txn(&self) -> TiFsResult<Transaction> {
+    pub fn get_endpoints(&self) -> Vec<String> {
+        self.txn_client_mux.get_endpoints()
+    }
+
+    pub fn fs_config(&self) -> &TiFsConfig {
+        &self.fs_config
+    }
+
+    pub async fn mini_txn_raw(&self) -> TiFsResult<Transaction> {
         let transaction = Self::begin_optimistic_small(
             self.txn_client_mux.clone()).await.map_err(|err|{
                 tracing::warn!("mini_txn failed. Err: {err:?}");
                 err
             })?;
         Ok(transaction)
+    }
+
+    pub async fn spinningMiniTxn(&self) -> TiFsResult<MiniTransaction> {
+        MiniTransaction::new(self).await
     }
 
     pub async fn finish_txn<R>(result: TiKvResult<R>, mut mini: Transaction) -> TiFsResult<R> {
@@ -181,10 +202,10 @@ impl FlexibleTransaction {
                 let key: Key = key.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.mini_txn().await?;
+                    let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
-                        mini.get(key.clone())
-                        .await, mini).await { break Ok(r?); }
+                        mini.get(key.clone()).await.map_err(|e|e.into()),
+                        mini).await { break Ok(r?); }
                 }
             } else {
                 Ok(self.raw.get(key).await?)
@@ -204,10 +225,10 @@ impl FlexibleTransaction {
                 let keys = keys.into_iter().map(|k|Key::from(k.into())).collect::<Vec<_>>();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.mini_txn().await?;
+                    let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
-                        mini.batch_get(keys.clone())
-                        .await, mini).await { break Ok(r?.into_iter().collect::<Vec<_>>()); }
+                        mini.batch_get(keys.clone()).await.map_err(|e|e.into()),
+                        mini).await { break Ok(r?.into_iter().collect::<Vec<_>>()); }
                 }
             } else {
                 Ok(self.raw.batch_get(keys).await?)
@@ -224,10 +245,10 @@ impl FlexibleTransaction {
                 let value: Value = value.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.mini_txn().await?;
+                    let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
-                        mini.put(key.clone(), value.clone())
-                        .await, mini).await { break Ok(r?); }
+                        mini.put(key.clone(), value.clone()).await.map_err(|e|e.into()),
+                        mini).await { break Ok(r?); }
                 }
             } else {
                 Ok(self.raw.put(key, value).await?)
@@ -244,10 +265,10 @@ impl FlexibleTransaction {
                 let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.mini_txn().await?;
+                    let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
-                        mini.batch_mutate(mutations.clone())
-                        .await, mini).await { break Ok(r?); }
+                        mini.batch_mutate(mutations.clone()).await.map_err(|e|e.into()),
+                        mini).await { break Ok(r?); }
                 }
             } else {
                 Ok(self.raw.batch_put(pairs).await?)
@@ -263,10 +284,10 @@ impl FlexibleTransaction {
                 let key: Key = key.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.mini_txn().await?;
+                    let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
-                        mini.delete(key.clone())
-                        .await, mini).await { break Ok(r?); }
+                        mini.delete(key.clone()).await.map_err(|e|e.into()),
+                        mini).await { break Ok(r?); }
                 }
             } else {
                 Ok(self.raw.delete(key).await?)
@@ -282,10 +303,10 @@ impl FlexibleTransaction {
                 let mutations: Vec<Mutation> = mutations.into_iter().collect();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.mini_txn().await?;
+                    let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
-                        mini.batch_mutate(mutations.clone())
-                        .await, mini).await { break Ok(r?); }
+                        mini.batch_mutate(mutations.clone()).await.map_err(|e|e.into()),
+                        mini).await { break Ok(r?); }
                 }
             } else {
                 let mut deletes = Vec::new();
@@ -322,10 +343,10 @@ impl FlexibleTransaction {
                 let range: BoundRange = range.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.mini_txn().await?;
+                    let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
-                        mini.scan(range.clone(), limit)
-                        .await, mini).await { break Ok(r?.collect::<Vec<KvPair>>()); }
+                        mini.scan(range.clone(), limit).await.map_err(|e|e.into())
+                        , mini).await { break Ok(r?.collect::<Vec<KvPair>>()); }
                 }
             } else {
                 Ok(self.raw.scan(range, limit).await?)
@@ -346,10 +367,10 @@ impl FlexibleTransaction {
                 let range: BoundRange = range.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.mini_txn().await?;
+                    let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
-                        mini.scan_keys(range.clone(), limit)
-                        .await, mini).await { break Ok(r?.collect::<Vec<Key>>()); }
+                        mini.scan_keys(range.clone(), limit).await.map_err(|e|e.into()),
+                        mini).await { break Ok(r?.collect::<Vec<Key>>()); }
                 }
             } else {
                 Ok(self.raw.scan_keys(range, limit).await?)
@@ -423,3 +444,39 @@ where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
         Ok(())
     }
 }
+
+pub enum TransactionError {
+    TemporaryIssue(FsError),
+    PersistentIssue(FsError),
+}
+
+pub type TransactionResult<V> = std::result::Result<V, TransactionError>;
+
+impl From<FsError> for TransactionError {
+    fn from(value: FsError) -> Self {
+        match &value {
+            FsError::KeyError(_) => TransactionError::TemporaryIssue(value),
+            FsError::TryLockFailed => TransactionError::TemporaryIssue(value),
+            FsError::UnknownError(_) => {
+                tracing::warn!("considering unknown error as temporary: {value:?}");
+                TransactionError::TemporaryIssue(value)
+            }
+            _ => TransactionError::PersistentIssue(value),
+        }
+    }
+}
+
+impl From<tikv_client::Error> for TransactionError {
+    fn from(value: tikv_client::Error) -> Self {
+        TransactionError::from(FsError::from(value))
+    }
+}
+
+//impl From<TransactionError> for FsError {
+//    fn from(value: TransactionError) -> Self {
+//        match &value {
+//            TransactionError::TemporaryIssue(value) => value,
+//            TransactionError::PersistentIssue(value) => value,
+//        }
+//    }
+//}

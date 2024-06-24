@@ -5,7 +5,7 @@ use tracing::error;
 
 use super::{inode::{StorageIno, TiFsHash}, reply::InoKind};
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum FsError {
     #[error("unimplemented")]
     Unimplemented,

@@ -13,8 +13,8 @@ pub struct MetaStatic{
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub struct Meta {
-    pub inode_next: u64, // TODO: get rid of global counter
+pub struct MetaMutable {
+    pub inode_next: u64,
     pub last_stat: Option<StatFs>,
 }
 
@@ -35,7 +35,7 @@ Means:
 - ensure that the time between read and announcement of the writers state if relatively short.
 */
 
-impl Meta {
+impl MetaMutable {
     pub const fn new() -> Self {
         Self {
             inode_next: ROOT_INODE.0,

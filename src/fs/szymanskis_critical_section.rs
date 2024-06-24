@@ -5,7 +5,9 @@ use strum::{EnumIter, IntoEnumIterator};
 use tikv_client::{BoundRange, Key, KvPair};
 use uuid::Uuid;
 
-use super::{error::TiFsResult, key::ScopedKeyBuilder, transaction::{Txn, MAX_TIKV_SCAN_LIMIT}};
+use super::{error::TiFsResult, flexible_transaction::FlexibleTransaction, key::ScopedKeyBuilder, transaction::MAX_TIKV_SCAN_LIMIT};
+
+type MyTxn = FlexibleTransaction;
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
 pub enum SzymanskisState {
@@ -76,7 +78,7 @@ impl SzymanowskiCriticalSection {
         self.entered
     }
 
-    pub async fn enter(&mut self, txn: &Txn) -> TiFsResult<()> {
+    pub async fn enter(&mut self, txn: &FlexibleTransaction) -> TiFsResult<()> {
 
         if self.entered {
             return TiFsResult::Ok(())
@@ -116,11 +118,11 @@ impl SzymanowskiCriticalSection {
         Ok(())
     }
 
-    pub async fn leave_arc(mut self, txn: Arc<Txn>) -> TiFsResult<()> {
+    pub async fn leave_arc(mut self, txn: Arc<FlexibleTransaction>) -> TiFsResult<()> {
         self.leave(&txn).await
     }
 
-    pub async fn leave(&mut self, txn: &Txn) -> TiFsResult<()> {
+    pub async fn leave(&mut self, txn: &FlexibleTransaction) -> TiFsResult<()> {
 
         if !self.entered {
             return Ok(())
@@ -141,20 +143,20 @@ impl SzymanowskiCriticalSection {
         Ok(())
     }
 
-    async fn change_own_state(&mut self, new_state: SzymanskisState, txn: &Txn
+    async fn change_own_state(&mut self, new_state: SzymanskisState, txn: &MyTxn
     ) -> TiFsResult<()> {
         if new_state == SzymanskisState::S0Noncritical {
-            txn.weak.upgrade().unwrap().f_txn.delete(self.key_for_state_report.clone()).await?;
+            txn.delete(self.key_for_state_report.clone()).await?;
         } else {
             let new_state_id = new_state.as_u8();
-            txn.weak.upgrade().unwrap().f_txn.put(self.key_for_state_report.clone(),
+            txn.put(self.key_for_state_report.clone(),
                 vec![new_state_id]).await?;
         }
         self.my_state = new_state;
         Ok(())
     }
 
-    async fn poll_for_condition(&mut self, txn: &Txn, predicate: impl Fn(&[(Uuid, SzymanskisState)]) -> bool) -> TiFsResult<()> {
+    async fn poll_for_condition(&mut self, txn: &FlexibleTransaction, predicate: impl Fn(&[(Uuid, SzymanskisState)]) -> bool) -> TiFsResult<()> {
         loop {
             let all_states = self.get_current_states_excluding_mine(txn).await?;
             let done = predicate(&all_states);
@@ -164,8 +166,8 @@ impl SzymanowskiCriticalSection {
         }
     }
 
-    async fn get_current_states_excluding_mine(&mut self, txn: &Txn) -> TiFsResult<Vec<(Uuid, SzymanskisState)>> {
-        let all_states_kv = txn.f_txn.scan(self.key_range.clone(), MAX_TIKV_SCAN_LIMIT).await?;
+    async fn get_current_states_excluding_mine(&mut self, txn: &FlexibleTransaction) -> TiFsResult<Vec<(Uuid, SzymanskisState)>> {
+        let all_states_kv = txn.scan(self.key_range.clone(), MAX_TIKV_SCAN_LIMIT).await?;
         let all_states = all_states_kv.into_iter().filter_map(
             |KvPair(k,v)| {
                 let key_buffer = Vec::from(k);
@@ -188,13 +190,13 @@ impl SzymanowskiCriticalSection {
 
 pub struct CriticalSectionKeyLock {
     critical_section: Option<SzymanowskiCriticalSection>,
-    txn: Arc<Txn>,
+    txn: Arc<FlexibleTransaction>,
 }
 
 impl CriticalSectionKeyLock {
-    pub async fn new(txn: Arc<Txn>, key_to_lock: Vec<u8>) -> TiFsResult<Self> {
+    pub async fn new(txn: Arc<FlexibleTransaction>, key_to_lock: Vec<u8>) -> TiFsResult<Self> {
         let mut cs = SzymanowskiCriticalSection::new(
-            txn.fs_config().key_prefix, key_to_lock);
+            txn.fs_config().key_prefix.clone(), key_to_lock);
         cs.enter(&txn).await?;
         TiFsResult::Ok(Self {
             critical_section: Some(cs),

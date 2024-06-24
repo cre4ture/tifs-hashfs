@@ -437,7 +437,7 @@ dependencies = [
  "futures-core",
  "prost",
  "prost-types",
- "tonic",
+ "tonic 0.10.2",
  "tracing-core",
 ]
 
@@ -459,7 +459,7 @@ dependencies = [
  "thread_local",
  "tokio",
  "tokio-stream",
- "tonic",
+ "tonic 0.10.2",
  "tracing",
  "tracing-core",
  "tracing-subscriber",
@@ -470,6 +470,12 @@ name = "constant_time_eq"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7144d30dcf0fafbce74250a3963025d8d52177934239851c917d29f1df280c2"
+
+[[package]]
+name = "convert_case"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
 
 [[package]]
 name = "core-foundation"
@@ -574,6 +580,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "derive_more"
+version = "0.99.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f33878137e4dafd7fa914ad4e259e18a4e8e532b9617a2d0150262bf53abfce"
+dependencies = [
+ "convert_case",
+ "proc-macro2",
+ "quote",
+ "rustc_version",
+ "syn 2.0.63",
 ]
 
 [[package]]
@@ -2636,6 +2655,7 @@ dependencies = [
  "bytestring",
  "clap 2.34.0",
  "console-subscriber",
+ "derive_more",
  "fuser",
  "futures",
  "lazy_static",
@@ -2662,6 +2682,7 @@ dependencies = [
  "tokio",
  "tokio-console",
  "toml",
+ "tonic 0.11.0",
  "tracing",
  "tracing-futures",
  "tracing-opentelemetry",
@@ -2695,7 +2716,7 @@ dependencies = [
  "take_mut",
  "thiserror",
  "tokio",
- "tonic",
+ "tonic 0.10.2",
 ]
 
 [[package]]
@@ -2757,7 +2778,7 @@ dependencies = [
  "serde",
  "tokio",
  "toml",
- "tonic",
+ "tonic 0.10.2",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -2860,6 +2881,33 @@ dependencies = [
  "rustls-pemfile 1.0.4",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tonic"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76c4eb7a4e9ef9d4763600161f12f5070b92a578e1b634db88a6887844c91a13"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "base64 0.21.7",
+ "bytes",
+ "h2 0.3.26",
+ "http 0.2.12",
+ "http-body 0.4.6",
+ "hyper 0.14.28",
+ "hyper-timeout",
+ "percent-encoding",
+ "pin-project",
+ "prost",
+ "tokio",
  "tokio-stream",
  "tower",
  "tower-layer",

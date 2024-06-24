@@ -400,11 +400,12 @@ pub trait AsyncFileSystem: Send + Sync {
     ) -> Result<()> {
         Err(FsError::unimplemented())
     }
-
+/*
     /// Reposition read/write file offset
     async fn lseek(&self, _ino: u64, _fh: u64, _offset: i64, _whence: i32) -> Result<Lseek> {
         Err(FsError::unimplemented())
     }
+*/
 
     /// Copy the specified range from the source inode to the destination inode
     async fn copy_file_range(

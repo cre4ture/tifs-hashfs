@@ -21,6 +21,23 @@ pub trait TxnDelete<K, V> {
     async fn delete(&self, key: &K) -> TiFsResult<()>;
 }
 
+
+pub trait TxnFetchMut<K, V> {
+    #[allow(async_fn_in_trait)]
+    async fn fetch_try(&mut self, key: &K) -> TiFsResult<Option<V>>;
+    async fn fetch(&mut self, key: &K) -> TiFsResult<Arc<V>>;
+}
+
+pub trait TxnPutMut<K, V> {
+    #[allow(async_fn_in_trait)]
+    async fn put(&mut self, key: &K, value: Arc<V>) -> TiFsResult<()>;
+}
+
+pub trait TxnDeleteMut<K, V> {
+    #[allow(async_fn_in_trait)]
+    async fn delete(&mut self, key: &K) -> TiFsResult<()>;
+}
+
 #[derive(Clone)]
 pub struct TxnDataCache<K, V> {
     cache: moka::future::Cache<K, (Instant, Arc<V>)>,

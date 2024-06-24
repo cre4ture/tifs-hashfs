@@ -20,9 +20,18 @@ pub type TiFsHash = Vec<u8>;
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StorageIno(pub u64);
 
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ParentStorageIno(pub StorageIno);
+
 impl Display for StorageIno {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl Display for ParentStorageIno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.0)
     }
 }
 
@@ -145,6 +154,46 @@ impl InoSize {
         self.inline_data = Some(data);
         self.data_hash = None;
     }
+
+    async fn write_into_inline_data(
+        &mut self,
+        start: u64,
+        data: &[u8],
+        block_size: u64,
+    ) -> () {
+        let size = data.len();
+        let start = start as usize;
+
+        let mut inlined = self.take_inline_data().unwrap_or_else(Vec::new);
+        if start + size > inlined.len() {
+            inlined.resize(start + size, 0);
+        }
+        inlined[start..start + size].copy_from_slice(data);
+
+        self.last_change = SystemTime::now();
+        self.set_size(inlined.len() as u64, block_size);
+        self.set_inline_data(inlined);
+    }
+
+    async fn read_from_inline_data(
+        &mut self,
+        start: u64,
+        size: u64,
+    ) -> Vec<u8> {
+        let start = start as usize;
+        let size = size as usize;
+
+        let inlined = self.inline_data().unwrap();
+        debug_assert!(self.size() as usize == inlined.len());
+
+        let mut data = Vec::with_capacity(size);
+        if inlined.len() > start {
+            let to_copy = size.min(inlined.len() - start);
+            data.extend_from_slice(&inlined[start..start + to_copy]);
+        }
+        data
+    }
+
 }
 
 /*

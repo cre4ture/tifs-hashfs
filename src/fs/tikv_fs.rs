@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Debug};
 use std::future::Future;
+use std::io::{BufRead, Read};
 use std::mem;
 use std::ops::DerefMut;
 use std::pin::Pin;
@@ -9,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::anyhow;
 use bimap::BiHashMap;
+use bytes::Buf;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
 use futures::FutureExt;
@@ -27,7 +29,7 @@ use crate::fs::reply::{DirItem, InoKind};
 use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
-use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageDirItemKind, StorageFileAttr, StorageIno, TiFsHash};
+use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItemKind, StorageFileAttr, StorageIno, TiFsHash};
 use super::reply::{
     Data, Directory, LogicalIno
 };
@@ -397,19 +399,28 @@ impl TiFs {
     }
 
     #[tracing::instrument]
-    pub async fn read_kind_hashes(
+    pub async fn read_file_kind_hashes(
         &self,
         ino: StorageIno,
         start: u64,
         size: u32,
     ) -> Result<Data> {
 
+        let hash_size = self.fs_config.hash_len as u64;
+        let first_block = start / hash_size;
+        let first_block_offset = start % hash_size;
+        let block_cnt = (first_block_offset + size as u64).div_ceil(hash_size);
+        let block_range = first_block..(first_block+block_cnt);
+
         let arc = self.weak.upgrade().unwrap();
-        let data = arc
+        let mut data = VecDeque::<u8>::from(arc
             .spin_no_delay(format!("read_kind_hashes, ino:{ino}, start:{start}, size:{size}"),
-            move |_, txn| txn.read_hashes_of_file(ino, start, size).boxed())
-            .await?;
-        Ok(Data::new(data))
+            move |_, txn| txn.clone().get_hashes_of_file(ino, block_range.clone()).boxed())
+            .await?);
+
+        data.consume(first_block_offset as usize);
+        data.truncate(size as usize);
+        Ok(Data { data: data.into() })
     }
 
     #[instrument(skip(txn, f))]
@@ -421,7 +432,7 @@ impl TiFs {
         match f(self, txn.clone()).await {
             Ok(v) => {
                 let commit_start = SystemTime::now();
-                txn.f_txn.commit().await?;
+                //txn.f_txn.commit().await?;
                 tracing::trace!(
                     "transaction committed in {} ms",
                     commit_start.elapsed().unwrap().as_millis()
@@ -429,7 +440,7 @@ impl TiFs {
                 Ok(v)
             }
             Err(e) => {
-                txn.f_txn.rollback().await?;
+                //txn.f_txn.rollback().await?;
                 debug!("transaction rolled back");
                 Err(e)
             }
@@ -550,15 +561,14 @@ impl TiFs {
         stat
     }
 
-    pub async fn lookup_all_info(&self, parent: StorageIno, name: ByteString
+    pub async fn lookup_all_info(&self, parent: ParentStorageIno, name: ByteString
     ) -> TiFsResult<FileAttr> {
         let (desc, attr, size, atime) =
             self.spin_no_delay(format!("lookup parent({}), name({})", parent, name),
             move |_, txn| {
                 let name = name.clone();
                 Box::pin(async move {
-                    let dir_item = txn.clone().lookup_ino(parent, name.clone()).await?;
-                    txn.clone().get_all_ino_data(dir_item.ino).await
+                    Ok(txn.f_txn.directory_child_get_all_attributes(parent, name).await?)
                 })
             }).await?;
         let stat = self.map_storage_attr_to_fuser(
@@ -568,7 +578,7 @@ impl TiFs {
 
     pub async fn lookup_all_info_logical(
         &self,
-        parent: StorageIno,
+        parent: ParentStorageIno,
         name: ByteString,
         kind: InoKind,
     ) -> TiFsResult<FileAttr> {
@@ -577,8 +587,7 @@ impl TiFs {
             move |_, txn| {
                 let name = name.clone();
                 Box::pin(async move {
-                    let item = txn.clone().lookup_ino(parent, name.clone()).await?;
-                    txn.clone().get_all_ino_data(item.ino).await
+                    Ok(txn.f_txn.directory_child_get_all_attributes(parent, name).await?)
                 })
             }).await?;
         let stat = self.map_storage_attr_to_fuser(
@@ -642,15 +651,7 @@ impl TiFs {
         trace!("read_dir1 - out: {dir_complete:?}");
         Ok(dir_complete)
     }
-
-    pub async fn read_inode(&self, ino: StorageIno) -> Result<Arc<InoDescription>> {
-        let arc = self.weak.upgrade().unwrap();
-        let ino = arc
-            .spin_no_delay(format!("read_inode"), move |_, txn| Box::pin(txn.read_inode_arc(ino)))
-            .await?;
-        Ok(ino)
-    }
-
+/*
     pub async fn setlkw(
         &self,
         ino: StorageIno,
@@ -669,16 +670,7 @@ impl TiFs {
         {}
         Ok(())
     }
-
-    pub fn check_file_name(name: &str) -> Result<()> {
-        if name.len() <= Self::MAX_NAME_LEN as usize {
-            Ok(())
-        } else {
-            Err(FsError::NameTooLong {
-                file: name.to_string(),
-            })
-        }
-    }
+*/
 
     async fn release_inode_use(&self, ino: StorageIno, use_id: Uuid) {
         let arc = self.weak.upgrade().unwrap();

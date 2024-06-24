@@ -32,6 +32,10 @@ impl TransactionClientMux {
         })
     }
 
+    pub fn get_endpoints(&self) -> Vec<String> {
+        self._pd_endpoints
+    }
+
     pub async fn give_one_transaction(&self, options: &TransactionOptions) -> tikv_client::Result<Transaction> {
         loop {
             let (client, id) = self.give_one().await?;

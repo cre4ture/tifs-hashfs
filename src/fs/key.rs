@@ -9,14 +9,21 @@ use uuid::Uuid;
 use strum::{EnumIter, IntoEnumIterator};
 
 use super::error::TiFsResult;
-use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, StorageFileAttr, StorageIno};
+use super::hash_fs_interface::BlockIndex;
+use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItem, StorageFileAttr, StorageIno};
+use super::meta::{MetaMutable, MetaStatic};
 use super::reply::LogicalIno;
 use super::tikv_fs::InoUse;
 use super::{error::FsError, inode::TiFsHash};
 
-pub const PARENT_OF_ROOT_INODE: StorageIno = StorageIno(0);
-pub const ROOT_INODE: StorageIno = StorageIno(fuser::FUSE_ROOT_ID);
+pub const PARENT_OF_ROOT_INODE: ParentStorageIno = ParentStorageIno(StorageIno(0)); // NR: 0
+pub const ROOT_INODE: ParentStorageIno = ParentStorageIno(StorageIno(fuser::FUSE_ROOT_ID)); // NR: 1
 pub const ROOT_LOGICAL_INODE: LogicalIno = LogicalIno::from_raw(fuser::FUSE_ROOT_ID);
+
+// to avoid that opened inode are deleted when they are removed from the directory,
+// we add those opened inodes to a special invisible parent directory:
+pub const OPENED_INODE_PARENT_INODE: ParentStorageIno = ParentStorageIno(StorageIno(ROOT_INODE.0.0+1)); // NR: 2
+pub const FIRST_DATA_INODE: StorageIno = StorageIno(10); // keep some reserved inodes for later use
 
 /// ATTENTION: Order of enums in this struct matters for serialization!
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
@@ -101,7 +108,7 @@ pub type KeyBuffer = Vec<u8>;
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct BlockAddress {
     pub ino: StorageIno,
-    pub index: u64,
+    pub index: BlockIndex,
 }
 
 pub fn read_big_endian<const N: usize, T: num_traits::FromBytes<Bytes = [u8; N]>>(i: &mut Iter<u8>) -> TiFsResult<T>
@@ -143,7 +150,7 @@ impl KeyDeSer for StorageIno {
 impl KeyDeSer for BlockAddress {
     fn deserialize_from(i: &mut Iter<u8>) -> TiFsResult<Self> {
         let ino = StorageIno(read_big_endian::<8, u64>(i)?);
-        let index = read_big_endian::<8, u64>(i)?;
+        let index = BlockIndex(read_big_endian::<8, u64>(i)?);
         Ok(Self { ino, index })
     }
     fn deserialize_self_from(&mut self, i: &mut Iter<u8>) -> TiFsResult<()> {
@@ -151,7 +158,7 @@ impl KeyDeSer for BlockAddress {
     }
     fn serialize_to(self, buf: &mut KeyBuffer) {
         buf.extend_from_slice(&self.ino.0.to_be_bytes());
-        buf.extend_from_slice(&self.index.to_be_bytes());
+        buf.extend_from_slice(&self.index.0.to_be_bytes());
     }
 }
 
@@ -319,7 +326,7 @@ pub struct KeyParserHashBlock<'ol> {
 
 #[derive(Clone)]
 pub struct ScopedKeyBuilder {
-    buf: KeyBuffer,
+    pub buf: KeyBuffer,
 }
 
 impl ScopedKeyBuilder {
@@ -329,6 +336,10 @@ impl ScopedKeyBuilder {
         Self {
             buf,
         }
+    }
+
+    pub fn as_key(self) -> Key {
+        Key::from(self.buf)
     }
 
     // ignore, private
@@ -403,7 +414,7 @@ impl ScopedKeyBuilder {
     }
 
     // ignore, private
-    fn inode_x(self, ino: StorageIno, meta: InoMetadata) -> Self {
+    pub fn inode_x(self, ino: StorageIno, meta: InoMetadata) -> Self {
         let mut me = self.write_key_kind(KeyKind::InoMetadata);
         write_big_endian::<u64>(ino.0, &mut me.buf);
         me.buf.push(*INO_META_KEY_IDS.get_by_right(&meta).unwrap());
@@ -509,14 +520,14 @@ impl ScopedKeyBuilder {
         self.inode_description(ROOT_INODE)
     }
 
-    pub fn directory_child(self, parent: StorageIno, name: &str) -> KeyBuffer {
+    pub fn directory_child(self, parent: StorageIno, name: &[u8]) -> KeyBuffer {
         let mut me = self.write_key_kind(KeyKind::DirectoryChild);
         write_big_endian::<u64>(parent.0, &mut me.buf);
         me.buf.extend_from_slice(name.as_bytes());
         me.buf
     }
 
-    pub fn parent_link(self, ino: StorageIno, parent: StorageIno, name: &str) -> Vec<u8> {
+    pub fn parent_link(self, ino: StorageIno, parent: StorageIno, name: &[u8]) -> Vec<u8> {
         let mut me = self.write_key_kind(KeyKind::ParentLink);
         ino.serialize_to(&mut me.buf);
         parent.serialize_to(&mut me.buf);
@@ -560,14 +571,38 @@ impl ScopedKeyBuilder {
             .into()..self.block_hash(BlockAddress { ino, index: block_range.end }).into()
     }
 
-    pub fn inode_range(self, ino_range: Range<StorageIno>) -> Range<Key> {
-        self.clone().inode_description(ino_range.start).into()
-            ..self.inode_description(ino_range.end).into()
+    pub fn inode_metadata_range(self, ino: StorageIno) -> Range<Key> {
+        self.clone().inode_description(ino).into()
+            ..self.inode_description(StorageIno(ino.0 + 1)).into() // end not included
     }
 }
 
 pub trait KeyGenerator<K, V> {
     fn generate_key(self, k: &K) -> KeyBuffer;
+}
+
+impl KeyGenerator<(), MetaStatic> for ScopedKeyBuilder {
+    fn generate_key(self, k: &()) -> KeyBuffer {
+        self.meta_static()
+    }
+}
+
+impl KeyGenerator<(), MetaMutable> for ScopedKeyBuilder {
+    fn generate_key(self, k: &()) -> KeyBuffer {
+        self.meta()
+    }
+}
+
+impl KeyGenerator<(ParentStorageIno, &[u8]), StorageDirItem> for ScopedKeyBuilder {
+    fn generate_key(self, k: &(ParentStorageIno, &[u8])) -> KeyBuffer {
+        self.directory_child(k.0.0, k.1)
+    }
+}
+
+impl KeyGenerator<(StorageIno, ParentStorageIno, &[u8]), ()> for ScopedKeyBuilder {
+    fn generate_key(self, k: &(StorageIno, ParentStorageIno, &[u8])) -> KeyBuffer {
+        self.parent_link(k.0, k.1, k.2)
+    }
 }
 
 impl KeyGenerator<StorageIno, InoDescription> for ScopedKeyBuilder {
