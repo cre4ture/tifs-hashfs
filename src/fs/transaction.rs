@@ -11,12 +11,13 @@ use multimap::MultiMap;
 use num_bigint::BigUint;
 use num_format::{Buffer, Locale, ToFormattedString};
 use num_traits::FromPrimitive;
-use tikv_client::{Backoff, Key, RetryOptions, TransactionOptions};
+use tikv_client::{Backoff, RetryOptions, TransactionOptions};
 use tokio::sync::RwLock;
 use tracing::{debug, instrument, trace, Level};
 use uuid::Uuid;
 
 use crate::fs::inode::{StorageDirItemKind, StorageIno};
+use crate::fs::key::MAX_NAME_LEN;
 use crate::fs::meta::MetaStatic;
 use crate::fs::utils::stop_watch::AutoStopWatch;
 use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
@@ -28,11 +29,9 @@ use super::flexible_transaction::FlexibleTransaction;
 use super::fs_config::TiFsConfig;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
-use super::hash_fs_interface::{BlockIndex, GotOrMade, HashFsInterface, HashFsResult};
+use super::hash_fs_interface::{BlockIndex, GotOrMade, HashFsInterface};
 use super::hash_fs_tikv_implementation::TikvBasedHashFs;
 use super::inode::{AccessTime, InoDescription, InoSize, ParentStorageIno, StorageDirItem, StorageFileAttr, StorageFilePermission, TiFsHash};
-use super::key::HashedBlockMeta;
-use super::meta::MetaMutable;
 use super::mode::as_file_perm;
 use super::parsers;
 use super::reply::StatFs;
@@ -86,17 +85,12 @@ pub struct Txn {
     pub f_txn: Arc<dyn HashFsInterface>,
     fs_config: TiFsConfig,
     block_size: u64,            // duplicate of fs_config.block_size. Keep it to avoid refactoring efforts.
-    max_name_len: u32,
     caches: TiFsCaches,
 }
 
 pub type TxnArc = Arc<Txn>;
 
 impl Txn {
-    fn inline_data_threshold(&self) -> u64 {
-        self.fs_config.inline_data_limit
-    }
-
     pub fn block_size(&self) -> u64 {
         self.block_size
     }
@@ -105,14 +99,14 @@ impl Txn {
         self.fs_config.clone()
     }
 
-    fn check_space_left(self: TxnArc, meta: &MetaMutable) -> TiFsResult<()> {
-        match meta.last_stat {
-            Some(ref stat) if stat.bavail == 0 => {
-                Err(FsError::NoSpaceLeft(stat.bsize as u64 * stat.blocks))
-            }
-            _ => Ok(()),
-        }
-    }
+//    fn check_space_left(self: TxnArc, meta: &MetaMutable) -> TiFsResult<()> {
+//        match meta.last_stat {
+//            Some(ref stat) if stat.bavail == 0 => {
+//                Err(FsError::NoSpaceLeft(stat.bsize as u64 * stat.blocks))
+//            }
+//            _ => Ok(()),
+//        }
+//    }
 
     pub async fn begin_optimistic(
         instance_id: Uuid,
@@ -120,7 +114,6 @@ impl Txn {
         raw: Arc<tikv_client::RawClient>,
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
-        max_name_len: u32,
     ) -> TiFsResult<TxnArc> {
         let txn = if fs_config.pure_raw { None } else {
             let options = TransactionOptions::new_optimistic().use_async_commit();
@@ -140,7 +133,6 @@ impl Txn {
                 ),
                 fs_config: fs_config.clone(),
                 block_size: fs_config.block_size,
-                max_name_len,
                 caches,
             }
         }))
@@ -152,7 +144,6 @@ impl Txn {
         raw: Arc<tikv_client::RawClient>,
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
-        max_name_len: u32,
     ) -> TxnArc {
         Arc::new_cyclic(|weak| Txn {
             weak: weak.clone(),
@@ -163,7 +154,6 @@ impl Txn {
             ),
             fs_config: fs_config.clone(),
             block_size: fs_config.block_size,
-            max_name_len,
             caches,
         })
     }
@@ -224,9 +214,9 @@ impl Txn {
         uid: u32,
         rdev: u32,
         inline_data: Option<Vec<u8>>,
-    ) -> HashFsResult<GotOrMade<StorageDirItem>> {
+    ) -> TiFsResult<GotOrMade<StorageDirItem>> {
         self.f_txn.directory_add_child_checked_new_inode(
-            parent, name, typ, perm, gid, uid, rdev, inline_data).await
+            parent, name, typ, perm, gid, uid, rdev, inline_data).await.map_err(|e|e.into())
     }
 
     #[tracing::instrument(skip(self))]
@@ -248,7 +238,7 @@ impl Txn {
         let bs = BlockSplitterRead::new(self.fs_config.block_size, start, size);
         let blocks_data = self.clone().hb_get_block_data_by_hashes_cached(&block_hashes_set).await?;
 
-        let result = parsers::hb_read_from_blocks(ino, &bs, &block_hashes, &blocks_data)?;
+        let result = parsers::hb_read_from_blocks(&bs, &block_hashes, &blocks_data)?;
 
         if tracing::enabled!(Level::DEBUG) {
             let mut buf_start = Buffer::default();
@@ -425,31 +415,6 @@ impl Txn {
         Ok(result)
     }
 
-    pub fn parse_keys_to_struct(&self, result: Vec<Key>, my_uuid: &Uuid) -> TiFsResult<HashedBlockMetaData> {
-        let mut all = HashedBlockMetaData::new();
-        for key in result.into_iter().map(|k|Vec::from(k)) {
-            let mut i = key.iter();
-            let kp = self.key_parser(&mut i)?.parse_hash_block_key_x()?;
-            match kp.meta {
-                HashedBlockMeta::ANamedBlock => {
-                    let (_kp, uuid) = kp.pre.parse_uuid()?;
-                    all.existing.insert(uuid);
-                }
-                HashedBlockMeta::BNamedUsages => {
-                    let (_kp, uuid) = kp.pre.parse_uuid()?;
-                    if uuid != *my_uuid { // filter own registration
-                        all.named_usages.insert(uuid);
-                    }
-                }
-                HashedBlockMeta::CCountedNamedUsages => {
-                    let (_kp, uuid) = kp.pre.parse_uuid()?;
-                    all.counters.insert(uuid);
-                }
-            }
-        }
-        Ok(all)
-    }
-
     async fn inode_write_upload_block_reference_counting_and_write_addresses(
         self: TxnArc,
         ino: StorageIno,
@@ -461,13 +426,15 @@ impl Txn {
         let previous_reference_count = self.f_txn.hb_increment_reference_count(
             &block_hash, ref_count_delta).await?;
 
+        let block_len = data.len() as u64;
+
         // Upload block if new
         if previous_reference_count == BigUint::from_u8(0).unwrap() {
             self.f_txn.hb_upload_new_block(block_hash.clone(), data).await?;
         }
 
         self.f_txn.inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
-            ino, block_hash, block_ids).await?;
+            ino, block_hash, block_len, block_ids).await?;
 
         Ok(())
     }
@@ -492,7 +459,6 @@ impl Txn {
         let mut pre_data_hash_request = HashSet::<TiFsHash>::new();
         let first_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
             self.fs_config.clone(),
-            ino,
             bs.first_data,
             bs.first_data_start_position,
             &hash_list_prev,
@@ -500,7 +466,6 @@ impl Txn {
         );
         let last_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
             self.fs_config.clone(),
-            ino,
             bs.last_data,
             0,
             &hash_list_prev,
@@ -735,7 +700,7 @@ impl Txn {
             0,
             u64::MAX,
             self.fs_config.block_size as u32,
-            self.max_name_len,
+            MAX_NAME_LEN,
             0,
         );
 
@@ -787,7 +752,11 @@ impl Txn {
         }
     }
 */
-    pub async fn get_hashes_of_file(self: TxnArc, ino: StorageIno, block_range: Range<u64>) -> TiFsResult<Vec<u8>> {
+    pub async fn get_hashes_of_file(
+        self: TxnArc,
+        ino: StorageIno,
+        block_range: Range<BlockIndex>
+    ) -> TiFsResult<Vec<u8>> {
         Ok(self.f_txn.file_read_block_hashes(ino, block_range).await?)
     }
 }

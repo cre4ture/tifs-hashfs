@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Debug};
 use std::future::Future;
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 use std::mem;
 use std::ops::DerefMut;
 use std::pin::Pin;
@@ -10,7 +10,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::anyhow;
 use bimap::BiHashMap;
-use bytes::Buf;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
 use futures::FutureExt;
@@ -29,6 +28,7 @@ use crate::fs::reply::{DirItem, InoKind};
 use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
+use super::hash_fs_interface::BlockIndex;
 use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItemKind, StorageFileAttr, StorageIno, TiFsHash};
 use super::reply::{
     Data, Directory, LogicalIno
@@ -198,7 +198,6 @@ pub type BoxedFuture<'a, T> = Pin<Box<dyn 'a + Send + Future<Output = Result<T>>
 
 impl TiFs {
     pub const SCAN_LIMIT: u32 = 1 << 10;
-    pub const MAX_NAME_LEN: u32 = 1 << 8;
 
     #[instrument]
     pub async fn construct<S>(
@@ -410,7 +409,7 @@ impl TiFs {
         let first_block = start / hash_size;
         let first_block_offset = start % hash_size;
         let block_cnt = (first_block_offset + size as u64).div_ceil(hash_size);
-        let block_range = first_block..(first_block+block_cnt);
+        let block_range = BlockIndex(first_block)..BlockIndex(first_block+block_cnt);
 
         let arc = self.weak.upgrade().unwrap();
         let mut data = VecDeque::<u8>::from(arc
@@ -464,7 +463,6 @@ impl TiFs {
             self.raw.clone(),
             &self.fs_config,
             block_cache,
-            Self::MAX_NAME_LEN,
         )
         .await?;
         self.process_txn(txn, f).await
@@ -595,18 +593,43 @@ impl TiFs {
         Ok(stat)
     }
 
-    pub async fn get_all_file_attributes(&self, l_ino: LogicalIno
+    pub async fn get_all_file_attributes_storage_ino(
+        &self,
+        ino: StorageIno,
+        kind: InoKind,
     ) -> TiFsResult<FileAttr> {
         let (desc, attr, size, atime) =
-            self.spin_no_delay(format!("get attrs ino({:?})", l_ino),
+            self.spin_no_delay(format!("get attrs ino({:?})", ino),
             move |_, txn| {
                 Box::pin(async move {
-                    txn.clone().get_all_ino_data(l_ino.storage_ino()).await
+                    txn.clone().get_all_ino_data(ino).await
                 })
             }).await?;
         let stat = self.map_storage_attr_to_fuser(
-            l_ino.kind, &desc, &size, &attr, Some(atime.0));
+            kind, &desc, &size, &attr, Some(atime.0));
         Ok(stat)
+    }
+
+    pub async fn get_all_file_attributes_storage_ino_entry_reply(
+        &self,
+        ino: StorageIno,
+        kind: InoKind,
+    ) -> TiFsResult<super::reply::Entry> {
+        let (desc, attr, size, atime) =
+            self.spin_no_delay(format!("get attrs ino({:?})", ino),
+            move |_, txn| {
+                Box::pin(async move {
+                    txn.clone().get_all_ino_data(ino).await
+                })
+            }).await?;
+        let stat = self.map_storage_attr_to_fuser(
+            kind, &desc, &size, &attr, Some(atime.0));
+        Ok(super::reply::Entry::new(stat, 0))
+    }
+
+    pub async fn get_all_file_attributes(&self, l_ino: LogicalIno
+    ) -> TiFsResult<FileAttr> {
+        self.get_all_file_attributes_storage_ino(l_ino.storage_ino(), l_ino.kind).await
     }
 
     #[tracing::instrument]

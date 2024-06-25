@@ -126,6 +126,10 @@ impl LogicalIno {
     pub const fn storage_ino(&self) -> StorageIno {
         self.storage_ino
     }
+
+    pub fn is_regular(&self) -> bool {
+        self.kind == InoKind::Regular
+    }
 }
 
 #[derive(Debug, Clone)]

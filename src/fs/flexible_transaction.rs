@@ -181,7 +181,7 @@ impl FlexibleTransaction {
         Ok(transaction)
     }
 
-    pub async fn spinningMiniTxn(&self) -> TiFsResult<MiniTransaction> {
+    pub async fn spinning_mini_txn(&self) -> TiFsResult<MiniTransaction> {
         MiniTransaction::new(self).await
     }
 
@@ -424,7 +424,7 @@ where V: for<'dl> Deserialize<'dl>, ScopedKeyBuilder: KeyGenerator<K, V>
 impl<K, V> TxnPut<K, V> for FlexibleTransaction
 where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
 {
-    async fn put(&self, key: &K, value: Arc<V>) -> TiFsResult<()> {
+    async fn put_json(&self, key: &K, value: Arc<V>) -> TiFsResult<()> {
         let t = self.key_builder();
         let key = t.generate_key(key);
         let data = serialize_json(value.deref())

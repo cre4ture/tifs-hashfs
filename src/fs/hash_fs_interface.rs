@@ -17,6 +17,7 @@ pub enum HashFsError {
     FsHasInvalidData(Option<String>),
     FileNotFound,
     FileAlreadyExists,
+    InodeHasNoInlineData,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
@@ -26,19 +27,25 @@ pub struct BlockIndex(pub u64);
 
 impl std::iter::Step for BlockIndex {
     fn steps_between(start: &Self, end: &Self) -> Option<usize> {
-        u64::steps_between(start, end)
+        u64::steps_between(&start.0, &end.0)
     }
 
     fn forward_checked(start: Self, count: usize) -> Option<Self> {
-        u64::forward_checked(start, count)
+        u64::forward_checked(start.0, count).map(BlockIndex)
     }
 
     fn backward_checked(start: Self, count: usize) -> Option<Self> {
-        u64::backward_checked(start, count)
+        u64::backward_checked(start.0, count).map(BlockIndex)
     }
 }
 
 pub type HashFsResult<V> = Result<V, HashFsError>;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GotOrMadePure {
+    ExistedAlready,
+    NewlyCreated
+}
 
 pub enum GotOrMade<R> {
     ExistedAlready(R),
@@ -47,7 +54,7 @@ pub enum GotOrMade<R> {
 
 impl<R> GotOrMade<R> {
     pub fn was_made(&self) -> bool {
-        if let Self::NewlyCreated(r) = self {
+        if let Self::NewlyCreated(_r) = self {
             true
         } else {
             false
@@ -64,11 +71,18 @@ impl<R> GotOrMade<R> {
             GotOrMade::NewlyCreated(r) => r,
         }
     }
+
+    pub fn unpack(self) -> (GotOrMadePure, R) {
+        match self {
+            GotOrMade::ExistedAlready(r) => (GotOrMadePure::ExistedAlready, r),
+            GotOrMade::NewlyCreated(r) => (GotOrMadePure::NewlyCreated, r),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 pub trait HashFsInterface: Send + Sync  {
-    async fn init(&self, gid: u32, uid: u32) -> HashFsResult<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)>;
+    async fn init(&self, gid: u32, uid: u32) -> HashFsResult<StorageDirItem>;
     async fn meta_static_read(&self) -> HashFsResult<MetaStatic>;
     async fn directory_read_children(&self, dir_ino: StorageIno) -> HashFsResult<Vec<DirectoryItem>>;
     async fn directory_add_child_checked_existing_inode(
@@ -117,7 +131,7 @@ pub trait HashFsInterface: Send + Sync  {
         parent: ParentStorageIno,
         name: ByteString,
         link: ByteString,
-    ) -> HashFsResult<(Arc<InoDescription>, Arc<InoSize>, Arc<StorageFileAttr>)>;
+    ) -> HashFsResult<StorageDirItem>;
     async fn inode_get_all_attributes(
         &self,
         ino: StorageIno,
@@ -162,7 +176,11 @@ pub trait HashFsInterface: Send + Sync  {
         hashes: &HashSet<&TiFsHash>,
     ) -> HashFsResult<HashMap<TiFsHash, Arc<Vec<u8>>>>;
     async fn file_get_hash(&self, ino: StorageIno) -> HashFsResult<Vec<u8>>;
-    async fn file_read_block_hashes(&self, ino: StorageIno, block_range: Range<u64>) -> HashFsResult<Vec<u8>>;
+    async fn file_read_block_hashes(
+        &self,
+        ino: StorageIno,
+        block_range: Range<BlockIndex>
+    ) -> HashFsResult<Vec<u8>>;
     // Increments the reference counter by provided delta and returns previous counter value.
     // Also succeeds if block didn't exist before. Returns previous counter value 0 in this case.
     async fn hb_increment_reference_count(&self, hash: &TiFsHash, cnt: u64) -> HashFsResult<BigUint>;
@@ -173,6 +191,7 @@ pub trait HashFsInterface: Send + Sync  {
         &self,
         ino: StorageIno,
         block_hash: TiFsHash,
+        blocks_size: u64,
         block_ids: Vec<BlockIndex>,
     ) -> HashFsResult<()>;
 }

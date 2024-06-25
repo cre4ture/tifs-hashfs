@@ -8,7 +8,7 @@ use tikv_client::{transaction::Mutation, Key, KvPair, Transaction};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::fs::{inode::ParentStorageIno, meta::MetaMutable, utils::txn_data_cache::TxnFetch};
+use crate::fs::{inode::ParentStorageIno, meta::MetaMutable};
 
 use super::{dir::StorageDirectory, error::{FsError, TiFsResult}, hash_fs_interface::GotOrMade, inode::{DirectoryItem, TiFsHash}, key::{BlockAddress, HashedBlockMeta, OPENED_INODE_PARENT_INODE}, transaction::MAX_TIKV_SCAN_LIMIT, utils::txn_data_cache::{TxnDeleteMut, TxnFetchMut, TxnPutMut}};
 use super::index::{deserialize_json, serialize_json};
@@ -178,7 +178,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         self.fetch_try(&(parent, name.as_bytes().deref())).await
     }
 
-    async fn directory_scan_for_children(&mut self, dir_ino: StorageIno, limit: u32
+    pub async fn directory_scan_for_children(&mut self, dir_ino: StorageIno, limit: u32
     ) -> TiFsResult<Vec<DirectoryItem>> {
         let range = self.key_builder().directory_child_range(dir_ino);
         let data = self.mini.scan(range, limit).await?.collect::<Vec<_>>();

@@ -13,7 +13,7 @@ pub trait TxnFetch<K, V> {
 
 pub trait TxnPut<K, V> {
     #[allow(async_fn_in_trait)]
-    async fn put(&self, key: &K, value: Arc<V>) -> TiFsResult<()>;
+    async fn put_json(&self, key: &K, value: Arc<V>) -> TiFsResult<()>;
 }
 
 pub trait TxnDelete<K, V> {
@@ -25,6 +25,7 @@ pub trait TxnDelete<K, V> {
 pub trait TxnFetchMut<K, V> {
     #[allow(async_fn_in_trait)]
     async fn fetch_try(&mut self, key: &K) -> TiFsResult<Option<V>>;
+    #[allow(async_fn_in_trait)]
     async fn fetch(&mut self, key: &K) -> TiFsResult<Arc<V>>;
 }
 
@@ -81,7 +82,7 @@ where
 
     pub async fn write_cached(&self, key: K, value: Arc<V>, txn: &impl TxnPut<K, V>) -> TiFsResult<()> {
         self.cache.insert(key.clone(), (Instant::now(), value.clone())).await;
-        Ok(txn.put(&key, value).await?)
+        Ok(txn.put_json(&key, value).await?)
     }
 
     pub async fn delete_with_cache(&self, key: &K, txn: &impl TxnDelete<K, V>) -> TiFsResult<()> {

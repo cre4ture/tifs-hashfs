@@ -6,11 +6,10 @@ use bytestring::ByteString;
 use fuser::{consts::FOPEN_DIRECT_IO, KernelConfig, TimeOrNow};
 use futures::FutureExt;
 use tracing::{debug, trace};
-use uuid::Uuid;
 
 use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, reply::InoKind};
 
-use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, inode::ParentStorageIno, open_modes::OpenMode};
+use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, hash_fs_interface::GotOrMade, inode::{ParentStorageIno, StorageDirItem}, key::check_file_name, open_modes::OpenMode};
 use super::mode::{as_file_kind, as_file_perm};
 use super::tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable};
 use super::reply::{get_time, Attr, Create, Data, Dir, Entry, LogicalIno, Open, StatFs, Write, Xattr};
@@ -42,12 +41,13 @@ impl AsyncFileSystem for TiFs {
             }).unwrap();
         }
 
-        arc.spin_no_delay(format!("init"), move |fs, txn| {
-            Box::pin(async move {
-                Ok(txn.f_txn.init().await?)
+        let _r = arc.spin_no_delay(format!("init"), move |_fs, txn| {
+                Box::pin(async move {
+                    Ok(txn.f_txn.init(gid, uid).await?)
+                })
             })
-        })
-        .await
+            .await?;
+        Ok(())
     }
 
     #[tracing::instrument]
@@ -56,8 +56,9 @@ impl AsyncFileSystem for TiFs {
 
         let (filename, kind) = parse_filename(name);
 
-        Self::check_file_name(&filename)?;
-        let stat = self.lookup_all_info_logical(p_ino.storage_ino(), filename, kind).await?;
+        check_file_name(&filename)?;
+        let stat = self.lookup_all_info_logical(
+            ParentStorageIno(p_ino.storage_ino()), filename, kind).await?;
 
         let entry = Entry {
             generation: 0,
@@ -155,10 +156,9 @@ impl AsyncFileSystem for TiFs {
         let mut ino_use = self.with_mut_data(|d| d.get_ino_use(ino)).await?;
         if ino_use.is_none() {
             // not opened yet on this instance. open it:
-            let new_use_id = Uuid::new_v4();
-            self
+            let new_use_id = self
                 .spin_no_delay(format!("open ino: {ino}, flags: {flags}"),
-                move |_, txn| Box::pin(txn.open(l_ino.storage_ino(), new_use_id)))
+                move |_, txn| Box::pin(txn.open(l_ino.storage_ino())))
                 .await?;
             // file exists and registration was successful, register use locally:
             let new_ino_use = Arc::new(InoUse{
@@ -286,24 +286,22 @@ impl AsyncFileSystem for TiFs {
         _umask: u32,
     ) -> Result<Entry> {
         let p_ino = LogicalIno::from_raw(parent);
-        Self::check_file_name(&name)?;
+        check_file_name(&name)?;
         let perm = StorageFilePermission(as_file_perm(mode));
-        let (i_desc, i_size, i_attr) = self
+        let item = self
             .spin_no_delay(format!("mkdir"), move |_, txn| {
-                Box::pin(txn.mkdir(p_ino.storage_ino(), name.clone(), perm, gid, uid))
+                Box::pin(txn.mkdir(ParentStorageIno(p_ino.storage_ino()), name.clone(), perm, gid, uid))
                 }).await?;
-        Ok(Entry::new(self.map_storage_attr_to_fuser(
-            InoKind::Regular, &i_desc, &i_size, &i_attr,
-            Some(i_size.last_change) // TODO: fetch real atime?
-        ), 0))
+        self.get_all_file_attributes_storage_ino_entry_reply(item.ino, InoKind::Regular).await
     }
 
     #[tracing::instrument]
     async fn rmdir(&self, parent: u64, raw_name: ByteString) -> Result<()> {
         let p_ino = LogicalIno::from_raw(parent);
-        Self::check_file_name(&raw_name)?;
-        self.spin_no_delay(format!("rmdir"), move |_, txn| Box::pin(txn.rmdir(p_ino.storage_ino(), raw_name.clone())))
-            .await
+        check_file_name(&raw_name)?;
+        self.spin_no_delay(format!("rmdir"), move |_, txn| {
+            Box::pin(txn.rmdir(ParentStorageIno(p_ino.storage_ino()), raw_name.clone()))
+        }).await
     }
 
     #[tracing::instrument]
@@ -320,15 +318,19 @@ impl AsyncFileSystem for TiFs {
         let p_ino = LogicalIno::from_raw(parent);
         let perm = StorageFilePermission(as_file_perm(mode));
         let typ = map_file_type_to_storage_dir_item_kind(as_file_kind(mode))?;
-        Self::check_file_name(&name)?;
-        let (i_desc, i_size, i_attr) = self
+        check_file_name(&name)?;
+        let name_clone = name.clone();
+        let item: GotOrMade<StorageDirItem> = self
             .spin_no_delay(format!("mknod"), move |_, txn| {
-                Box::pin(txn.directory_add_child_checked_new_inode(p_ino.storage_ino(), name.clone(), typ, perm, gid, uid, rdev, None))
-            })
-            .await?;
-        Ok(Entry::new(self.map_storage_attr_to_fuser(
-            InoKind::Regular, &i_desc, &i_size, &i_attr, Some(i_size.last_change) // TODO: fetch real atime?
-        ), 0))
+                Box::pin(txn.directory_add_child_checked_new_inode(
+                    ParentStorageIno(p_ino.storage_ino()),
+                    name_clone.clone(), typ, perm, gid, uid, rdev, None))
+            }).await?;
+        if item.existed_before() {
+            return Err(FsError::FileExist { file: name.into() });
+        }
+
+        self.get_all_file_attributes_storage_ino_entry_reply(item.value().ino, InoKind::Regular).await
     }
 
     #[tracing::instrument]
@@ -346,7 +348,7 @@ impl AsyncFileSystem for TiFs {
         umask: u32,
         flags: i32,
     ) -> Result<Create> {
-        Self::check_file_name(&name)?;
+        check_file_name(&name)?;
         let entry = self.mknod(parent, name, mode, gid, uid, umask, 0).await?;
         let open = self.open(entry.stat.ino, flags).await?;
         Ok(Create::new(
@@ -414,22 +416,26 @@ impl AsyncFileSystem for TiFs {
     async fn link(&self, ino: u64, new_parent: u64, new_name: ByteString) -> Result<Entry> {
         let l_ino = LogicalIno::from_raw(ino);
         let p_ino = LogicalIno::from_raw(new_parent);
-        Self::check_file_name(&new_name)?;
+
+        if !(l_ino.is_regular() && p_ino.is_regular()) {
+            return Err(FsError::WrongFileType);
+        }
+
+        check_file_name(&new_name)?;
         self
-            .spin_no_delay(format!("link"), move |_, txn| Box::pin(txn.add_hard_link(l_ino.storage_ino(), p_ino.storage_ino(), new_name.clone())))
+            .spin_no_delay(format!("link"), move |_, txn| Box::pin(
+                txn.add_hard_link(
+                    l_ino.storage_ino(), ParentStorageIno(p_ino.storage_ino()), new_name.clone())))
             .await?;
-        let (i_desc, i_attr,
-             i_size, atime) = self
-            .spin_no_delay(format!("link"), move |_, txn| Box::pin(txn.get_all_ino_data(l_ino.storage_ino())))
-            .await?;
-        Ok(Entry::new(self.map_storage_attr_to_fuser(l_ino.kind, &i_desc, &i_size, &i_attr,
-             Some(atime.0)), 0))
+
+        self.get_all_file_attributes_storage_ino_entry_reply(l_ino.storage_ino(), InoKind::Regular).await
     }
 
     async fn unlink(&self, parent: u64, raw_name: ByteString) -> Result<()> {
         let p_ino = LogicalIno::from_raw(parent);
         self.spin_no_delay(format!("unlink, parent:{parent}, raw_name:{}", raw_name.escape_debug()),
-            move |_, txn| Box::pin(txn.unlink(p_ino.storage_ino(), raw_name.clone())))
+            move |_, txn| Box::pin(txn.unlink(
+                ParentStorageIno(p_ino.storage_ino()), raw_name.clone())))
             .await
     }
 
@@ -447,7 +453,11 @@ impl AsyncFileSystem for TiFs {
             let name = raw_name.clone();
             let new_name = new_raw_name.clone();
             Box::pin(async move {
-                txn.f_txn.directory_rename_child(p_ino.storage_ino(), raw_name, np_ino.storage_ino(), new_raw_name).await
+                txn.f_txn.directory_rename_child(
+                    ParentStorageIno(p_ino.storage_ino()),
+                    name,
+                    ParentStorageIno(np_ino.storage_ino()),
+                    new_name).await.map_err(|e|e.into())
             })
         })
         .await
@@ -463,21 +473,19 @@ impl AsyncFileSystem for TiFs {
         link: ByteString,
     ) -> Result<Entry> {
         let p_ino = LogicalIno::from_raw(parent);
-        let link_data_vec = link.as_bytes().to_vec();
-        Self::check_file_name(&name)?;
+        check_file_name(&name)?;
         let name_clone1 = name.clone();
-        let (i_desc, i_size, i_attr ) =
+        let item =
             self.spin_no_delay(format!("inode for symlink"), move |_, txn| {
             let name = name_clone1.clone();
-            let link_data_vec = link_data_vec.clone();
+            let link_data_vec = link.clone();
             Box::pin(async move {
                 Ok(txn.f_txn.directory_add_new_symlink(
-                    gid, uid, ParentStorageIno(p_ino.storage_ino()), name, link).await?)
+                    gid, uid, ParentStorageIno(p_ino.storage_ino()), name, link_data_vec.clone()).await?)
             })
         }).await?;
 
-        Ok(Entry::new(self.map_storage_attr_to_fuser(InoKind::Regular, &i_desc, &i_size, &i_attr,
-            Some(i_size.last_change)), 0)) // TODO: use real atime?
+        self.get_all_file_attributes_storage_ino_entry_reply(item.ino, InoKind::Regular).await
     }
 
     async fn readlink(&self, ino: u64) -> Result<Data> {

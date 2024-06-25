@@ -16,6 +16,8 @@ use super::reply::LogicalIno;
 use super::tikv_fs::InoUse;
 use super::{error::FsError, inode::TiFsHash};
 
+pub const MAX_NAME_LEN: u32 = 1 << 8;
+
 pub const PARENT_OF_ROOT_INODE: ParentStorageIno = ParentStorageIno(StorageIno(0)); // NR: 0
 pub const ROOT_INODE: ParentStorageIno = ParentStorageIno(StorageIno(fuser::FUSE_ROOT_ID)); // NR: 1
 pub const ROOT_LOGICAL_INODE: LogicalIno = LogicalIno::from_raw(fuser::FUSE_ROOT_ID);
@@ -162,6 +164,15 @@ impl KeyDeSer for BlockAddress {
     }
 }
 
+pub fn check_file_name(name: &str) -> TiFsResult<()> {
+    if name.len() <= MAX_NAME_LEN as usize {
+        Ok(())
+    } else {
+        Err(FsError::NameTooLong {
+            file: name.to_string(),
+        })
+    }
+}
 
 pub struct KeyParser<'ol> {
     hash_len: usize,
@@ -578,13 +589,13 @@ pub trait KeyGenerator<K, V> {
 }
 
 impl KeyGenerator<(), MetaStatic> for ScopedKeyBuilder {
-    fn generate_key(self, k: &()) -> KeyBuffer {
+    fn generate_key(self, _k: &()) -> KeyBuffer {
         self.meta_static()
     }
 }
 
 impl KeyGenerator<(), MetaMutable> for ScopedKeyBuilder {
-    fn generate_key(self, k: &()) -> KeyBuffer {
+    fn generate_key(self, _k: &()) -> KeyBuffer {
         self.meta()
     }
 }

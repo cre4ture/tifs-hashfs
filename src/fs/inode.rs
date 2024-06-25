@@ -155,7 +155,7 @@ impl InoSize {
         self.data_hash = None;
     }
 
-    async fn write_into_inline_data(
+    pub async fn write_into_inline_data(
         &mut self,
         start: u64,
         data: &[u8],
@@ -175,7 +175,7 @@ impl InoSize {
         self.set_inline_data(inlined);
     }
 
-    async fn read_from_inline_data(
+    pub async fn read_from_inline_data(
         &mut self,
         start: u64,
         size: u64,
