@@ -23,12 +23,14 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use uuid::Uuid;
 use lazy_static::lazy_static;
 
+use crate::fs::flexible_transaction::FlexibleTransaction;
+use crate::fs::hash_fs_tikv_implementation::TikvBasedHashFs;
 use crate::fs::inode::DirectoryItem;
 use crate::fs::reply::{DirItem, InoKind};
 use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
-use super::hash_fs_interface::BlockIndex;
+use super::hash_fs_interface::{BlockIndex, HashFsInterface};
 use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItemKind, StorageFileAttr, StorageIno, TiFsHash};
 use super::reply::{
     Data, Directory, LogicalIno
@@ -184,6 +186,7 @@ pub struct TiFs {
     pub weak: Weak<TiFs>,
     pub instance_id: Uuid,
     pub pd_endpoints: Vec<String>,
+    pub hash_fs: Arc<dyn HashFsInterface>,
     pub client_config: Config,
     pub client: Arc<TransactionClientMux>,
     pub raw: Arc<tikv_client::RawClient>,
@@ -226,19 +229,19 @@ impl TiFs {
             TiFs {
                 weak: me.clone(),
                 instance_id: uuid::Uuid::new_v4(),
-                client,
-                raw,
+                client: client.clone(),
+                raw: raw.clone(),
                 pd_endpoints: pd_endpoints.clone().into_iter().map(Into::into).collect(),
+                hash_fs: TikvBasedHashFs::new_arc(
+                    fs_config.clone(),
+                    FlexibleTransaction::new_pure_raw(client, raw, fs_config.clone()),
+                ),
                 client_config: cfg,
                 direct_io: fs_config.direct_io,
                 mut_data: RwLock::new(TiFsMutable::new(&fs_config)),
                 fs_config,
             }
         });
-
-        fs.clone().check_metadata().await?;
-
-        tokio::spawn(Self::heartbeat(fs.weak.clone()));
 
         Ok(fs)
     }
@@ -270,7 +273,7 @@ impl TiFs {
     }
 
     #[tracing::instrument]
-    async fn heartbeat(me: Weak<TiFs>) {
+    pub async fn heartbeat(me: Weak<TiFs>) {
         let mut timer = tokio::time::interval(Duration::from_millis(1000));
         loop {
             let Some(strong) = me.upgrade() else {
@@ -293,7 +296,7 @@ impl TiFs {
         }
     }
 
-    async fn check_metadata(self: TiFsArc) -> Result<()> {
+    pub async fn check_metadata(self: TiFsArc) -> Result<()> {
         let metadata = self
             .clone().spin_no_delay(format!("check_metadata"),
             move |_, txn| Box::pin(txn.read_static_meta()))
@@ -457,10 +460,9 @@ impl TiFs {
     {
         let block_cache = self.get_caches().await;
 
-        let txn = Txn::begin_optimistic(
+        let txn = Txn::begin_on_hash_fs_interface(
+            self.hash_fs.clone(),
             self.instance_id,
-            self.client.clone(),
-            self.raw.clone(),
             &self.fs_config,
             block_cache,
         )

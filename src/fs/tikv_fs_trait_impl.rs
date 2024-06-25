@@ -47,6 +47,10 @@ impl AsyncFileSystem for TiFs {
                 })
             })
             .await?;
+
+        self.weak.upgrade().unwrap().check_metadata().await?;
+        tokio::spawn(Self::heartbeat(self.weak.clone()));
+
         Ok(())
     }
 

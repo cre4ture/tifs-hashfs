@@ -11,8 +11,7 @@ use multimap::MultiMap;
 use num_bigint::BigUint;
 use num_format::{Buffer, Locale, ToFormattedString};
 use num_traits::FromPrimitive;
-use tikv_client::{Backoff, RetryOptions, TransactionOptions};
-use tokio::sync::RwLock;
+use tikv_client::Backoff;
 use tracing::{debug, instrument, trace, Level};
 use uuid::Uuid;
 
@@ -25,18 +24,15 @@ use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 use super::dir::StorageDirectory;
 use super::error::{FsError, TiFsResult};
 use super::file_handler::FileHandler;
-use super::flexible_transaction::FlexibleTransaction;
 use super::fs_config::TiFsConfig;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::hash_fs_interface::{BlockIndex, GotOrMade, HashFsInterface};
-use super::hash_fs_tikv_implementation::TikvBasedHashFs;
 use super::inode::{AccessTime, InoDescription, InoSize, ParentStorageIno, StorageDirItem, StorageFileAttr, StorageFilePermission, TiFsHash};
 use super::mode::as_file_perm;
 use super::parsers;
 use super::reply::StatFs;
 use super::tikv_fs::TiFsCaches;
-use super::transaction_client_mux::TransactionClientMux;
 
 pub const DEFAULT_REGION_BACKOFF: Backoff = Backoff::no_jitter_backoff(300, 1000, 100);
 pub const OPTIMISTIC_BACKOFF: Backoff = Backoff::no_jitter_backoff(30, 500, 1000);
@@ -108,29 +104,16 @@ impl Txn {
 //        }
 //    }
 
-    pub async fn begin_optimistic(
+    pub async fn begin_on_hash_fs_interface(
+        hash_fs: Arc<dyn HashFsInterface>,
         instance_id: Uuid,
-        client: Arc<TransactionClientMux>,
-        raw: Arc<tikv_client::RawClient>,
         fs_config: &TiFsConfig,
         caches: TiFsCaches,
-    ) -> TiFsResult<TxnArc> {
-        let txn = if fs_config.pure_raw { None } else {
-            let options = TransactionOptions::new_optimistic().use_async_commit();
-            let options = options.retry_options(RetryOptions {
-                region_backoff: DEFAULT_REGION_BACKOFF,
-                lock_backoff: OPTIMISTIC_BACKOFF,
-            });
-            Some(client.give_one_transaction(&options).await?)
-        }.map(|x|RwLock::new(x));
+    ) -> TiFsResult<Arc<Self>> {
         Ok(TxnArc::new_cyclic(|weak| { Self {
                 weak: weak.clone(),
                 _instance_id: instance_id,
-                f_txn: TikvBasedHashFs::new_arc(
-                    fs_config.clone(),
-                    FlexibleTransaction::new_txn(
-                        client, txn, raw, fs_config.clone()),
-                ),
+                f_txn: hash_fs,
                 fs_config: fs_config.clone(),
                 block_size: fs_config.block_size,
                 caches,
@@ -138,25 +121,55 @@ impl Txn {
         }))
     }
 
-    pub fn pure_raw(
-        instance_id: Uuid,
-        client: Arc<TransactionClientMux>,
-        raw: Arc<tikv_client::RawClient>,
-        fs_config: &TiFsConfig,
-        caches: TiFsCaches,
-    ) -> TxnArc {
-        Arc::new_cyclic(|weak| Txn {
-            weak: weak.clone(),
-            _instance_id: instance_id,
-            f_txn: TikvBasedHashFs::new_arc(
-                fs_config.clone(), FlexibleTransaction::new_pure_raw(
-                client, raw, fs_config.clone())
-            ),
-            fs_config: fs_config.clone(),
-            block_size: fs_config.block_size,
-            caches,
-        })
-    }
+//    pub async fn begin_optimistic(
+//        instance_id: Uuid,
+//        client: Arc<TransactionClientMux>,
+//        raw: Arc<tikv_client::RawClient>,
+//        fs_config: &TiFsConfig,
+//        caches: TiFsCaches,
+//    ) -> TiFsResult<TxnArc> {
+//        let txn = if fs_config.pure_raw { None } else {
+//            let options = TransactionOptions::new_optimistic().use_async_commit();
+//            let options = options.retry_options(RetryOptions {
+//                region_backoff: DEFAULT_REGION_BACKOFF,
+//                lock_backoff: OPTIMISTIC_BACKOFF,
+//            });
+//            Some(client.give_one_transaction(&options).await?)
+//        }.map(|x|RwLock::new(x));
+//        Ok(TxnArc::new_cyclic(|weak| { Self {
+//                weak: weak.clone(),
+//                _instance_id: instance_id,
+//                f_txn: TikvBasedHashFs::new_arc(
+//                    fs_config.clone(),
+//                    FlexibleTransaction::new_txn(
+//                        client, txn, raw, fs_config.clone()),
+//                ),
+//                fs_config: fs_config.clone(),
+//                block_size: fs_config.block_size,
+//                caches,
+//            }
+//        }))
+//    }
+
+//    pub fn pure_raw(
+//        instance_id: Uuid,
+//        client: Arc<TransactionClientMux>,
+//        raw: Arc<tikv_client::RawClient>,
+//        fs_config: &TiFsConfig,
+//        caches: TiFsCaches,
+//    ) -> TxnArc {
+//        Arc::new_cyclic(|weak| Txn {
+//            weak: weak.clone(),
+//            _instance_id: instance_id,
+//            f_txn: TikvBasedHashFs::new_arc(
+//                fs_config.clone(), FlexibleTransaction::new_pure_raw(
+//                client, raw, fs_config.clone())
+//            ),
+//            fs_config: fs_config.clone(),
+//            block_size: fs_config.block_size,
+//            caches,
+//        })
+//    }
 
     pub async fn open(self: Arc<Self>, ino: StorageIno) -> TiFsResult<Uuid> {
         Ok(self.f_txn.inode_open(ino).await?)
