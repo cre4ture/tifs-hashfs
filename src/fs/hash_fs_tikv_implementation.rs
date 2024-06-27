@@ -743,7 +743,7 @@ impl From<HashFsError> for FsError {
             HashFsError::Unspecific(msg) => FsError::UnknownError(msg),
             HashFsError::FileAlreadyExists => FsError::FileExist { file: format!("undefined") },
             HashFsError::InodeHasNoInlineData => FsError::WrongFileType,
-            HashFsError::GrpcMessageIncomplete => FsError::UnknownError(format!("Error: GrpcMessageIncomplete")),
+            HashFsError::GrpcMessageIncomplete => FsError::GrpcMessageIncomplete,
         }
     }
 }

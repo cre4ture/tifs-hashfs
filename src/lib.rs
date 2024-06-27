@@ -13,7 +13,6 @@
 pub mod fs;
 pub mod utils;
 pub mod local_storage;
-pub mod hash_fs;
 
 use fs::{async_fs::AsyncFs, fs_config::MountOption};
 use fuser::MountOption as FuseMountOption;
@@ -27,8 +26,24 @@ pub async fn mount_tifs_daemonize<F>(
 where
     F: FnOnce() -> anyhow::Result<()>,
 {
+    let fs_impl = fs::tikv_fs::TiFs::construct(pd_endpoints.clone(), options.clone()).await?;
+
+    fuse_mount_daemonize(mount_point, options, make_daemon, fs_impl).await?;
+
+    Ok(())
+}
+
+pub async fn fuse_mount_daemonize<F, FS: fs::async_fs::AsyncFileSystem + 'static>(
+    mount_point: String,
+    options: Vec<MountOption>,
+    make_daemon: F,
+    fs_impl: std::sync::Arc<FS>,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
     let mut fuse_options = vec![
-        FuseMountOption::FSName(format!("tifs:{}", pd_endpoints.join(","))),
+        FuseMountOption::FSName(format!("tifs:{}", uuid::Uuid::new_v4())),
         FuseMountOption::AllowOther,
         FuseMountOption::DefaultPermissions,
     ];
@@ -37,8 +52,6 @@ where
     fuse_options.push(FuseMountOption::AutoUnmount);
 
     fuse_options.extend(MountOption::collect_builtin(options.iter()));
-
-    let fs_impl = fs::tikv_fs::TiFs::construct(pd_endpoints, options).await?;
 
     make_daemon()?;
 

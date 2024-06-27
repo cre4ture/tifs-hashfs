@@ -193,7 +193,6 @@ fn default_tls_config_path() -> anyhow::Result<std::path::PathBuf> {
 pub struct TiFs {
     pub weak: Weak<TiFs>,
     pub instance_id: Uuid,
-    pub pd_endpoints: Vec<String>,
     pub hash_fs: Arc<dyn HashFsInterface>,
     pub client_config: Config,
     pub client: Arc<TransactionClientMux>,
@@ -261,6 +260,48 @@ impl TiFs {
     }
 
     #[instrument]
+    pub async fn construct_hash_fs_client<S>(
+        pd_endpoints: Vec<S>,
+        options: Vec<MountOption>,
+        hash_fs_impl: Arc<dyn HashFsInterface>,
+    ) -> anyhow::Result<TiFsArc>
+    where
+        S: Clone + Debug + Into<String>,
+    {
+        let cfg = Self::get_client_config(&options).await?;
+
+        let raw_cfg = cfg.clone();
+        let raw = Arc::new(tikv_client::RawClient::new_with_config(pd_endpoints.clone(), raw_cfg).await?);
+        let client = Arc::new(TransactionClientMux::new(
+                pd_endpoints.clone().into_iter().map(|s|s.into()).collect::<Vec<_>>(), cfg.clone()
+            )
+            .await
+            .map_err(|err| anyhow!("{}", err))?);
+        info!("connected to pd endpoints: {:?}", pd_endpoints);
+
+        let fs_config = TiFsConfig::from_options(&options).map_err(|err| {
+            tracing::error!("failed creating config. Err: {:?}", err);
+            err
+        })?;
+
+        let fs = Arc::new_cyclic(|me| {
+            TiFs {
+                weak: me.clone(),
+                instance_id: uuid::Uuid::new_v4(),
+                client: client.clone(),
+                raw: raw.clone(),
+                hash_fs: hash_fs_impl,
+                client_config: cfg,
+                direct_io: fs_config.direct_io,
+                mut_data: RwLock::new(TiFsMutable::new(&fs_config)),
+                fs_config,
+            }
+        });
+
+        Ok(fs)
+    }
+
+    #[instrument]
     pub async fn construct<S>(
         pd_endpoints: Vec<S>,
         options: Vec<MountOption>,
@@ -290,7 +331,6 @@ impl TiFs {
                 instance_id: uuid::Uuid::new_v4(),
                 client: client.clone(),
                 raw: raw.clone(),
-                pd_endpoints: pd_endpoints.clone().into_iter().map(Into::into).collect(),
                 hash_fs: TikvBasedHashFs::new_arc(
                     fs_config.clone(),
                     FlexibleTransaction::new_pure_raw(client, raw, fs_config.clone()),
@@ -555,6 +595,7 @@ impl TiFs {
                     sleep(Duration::from_millis(100)).await;
                 }
                 Err(err @ FsError::FileNotFound { file: _ }) => return Err(err),
+                Err(err @ FsError::GrpcMessageIncomplete) => return Err(err),
                 Err(err) => {
                     eprintln!("{msg}: no spin, error({}, {:?})", err, err);
                     return Err(err);

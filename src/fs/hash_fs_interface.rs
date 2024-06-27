@@ -1,5 +1,5 @@
 
-use std::{collections::{BTreeMap, HashMap, HashSet}, ops::Range, sync::Arc, time::SystemTime};
+use std::{collections::{BTreeMap, HashMap, HashSet}, fmt::Debug, ops::Range, sync::Arc, time::SystemTime};
 
 use bytestring::ByteString;
 use fuser::TimeOrNow;
@@ -211,5 +211,11 @@ pub trait HashFsInterface: Send + Sync  {
 impl From<tonic::Status> for HashFsError {
     fn from(value: tonic::Status) -> Self {
         Self::RawGrpcStatus(Some(value))
+    }
+}
+
+impl Debug for dyn HashFsInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HashFsI")
     }
 }

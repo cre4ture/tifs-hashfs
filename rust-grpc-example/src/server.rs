@@ -7,7 +7,7 @@ use clap::{crate_version, builder::Arg};
 use rust_grpc_example::grpc::hash_fs::hash_fs_server::HashFsServer;
 use rust_grpc_example::grpc_time_to_system_time;
 use tifs::fs::fs_config::{self};
-use tifs::fs::hash_fs_interface::{HashFsError, HashFsInterface};
+use tifs::fs::hash_fs_interface::HashFsInterface;
 use tonic::{transport::Server, Request, Response, Status};
 
 use rust_grpc_example::grpc::greeter::greeter_server::{Greeter, GreeterServer};
@@ -97,14 +97,11 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         tonic::Response<grpc_fs::DirectoryReadChildrenRs>,
         tonic::Status,
     >{
-        let r =
-        if let Some(ino) = request.get_ref().dir_ino.clone()  {
-            self.fs_impl
-                .directory_read_children(ino.into()).await
-        } else {
-            Err(HashFsError::GrpcMessageIncomplete)
+        let rq = request.into_inner();
+        let Some(dir_ino) = rq.dir_ino.clone() else {
+            return Err(tonic::Status::invalid_argument("dir_ino parameter is required!"));
         };
-
+        let r = self.fs_impl.directory_read_children(dir_ino.into()).await;
         let mut rsp = grpc_fs::DirectoryReadChildrenRs::default();
         match r {
             Err(err) => rsp.error = Some(err.into()),
@@ -128,7 +125,7 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
     >{
         let rq = request.into_inner();
         let Some(parent) = rq.parent.clone() else {
-            return Err(tonic::Status::invalid_argument("ino parameter is required!"));
+            return Err(tonic::Status::invalid_argument("parent parameter is required!"));
         };
         let Some(perm) = rq.perm.clone() else {
             return Err(tonic::Status::invalid_argument("perm parameter is required!"));
@@ -265,6 +262,7 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
                 o.attrs = Some(attr.deref().clone().into());
                 o.size = Some(size.deref().clone().into());
                 o.atime = Some(atime.into());
+                rsp.all = Some(o);
             }
         }
         Ok(tonic::Response::new(rsp))
@@ -315,6 +313,7 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
                 o.attrs = Some(attr.deref().clone().into());
                 o.size = Some(size.deref().clone().into());
                 o.atime = Some(atime.into());
+                rsp.all = Some(o);
             }
         }
         Ok(tonic::Response::new(rsp))
@@ -633,6 +632,11 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
+    tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .try_init()
+                .map_err(|err| anyhow::anyhow!("fail to init tracing subscriber: {}", err))?;
+
     let matches = clap::builder::Command::new("hashfs-tikv-server")
         .version(crate_version!())
         .author("Hexi Lee")
@@ -721,6 +725,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hash_fs = HashFsGrpcServer::new(
         pd_endpoints, options).await?;
 
+    tracing::error!("v - Starting gRPC Server...");
     println!("Starting gRPC Server...");
     Server::builder()
         .add_service(GreeterServer::new(greeter))

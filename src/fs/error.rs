@@ -97,6 +97,9 @@ pub enum FsError {
 
     #[error("close failed due to wrong ino or use_id")]
     CloseFailedDueToWrongInoOrUseId,
+
+    #[error("grpc message was incomplete")]
+    GrpcMessageIncomplete,
 }
 
 pub type Result<T> = std::result::Result<T, FsError>;
