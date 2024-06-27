@@ -1,0 +1,37 @@
+[package]
+name = "rust-grpc-example"
+version = "0.1.0"
+authors = ["swiftdiaries <adhita94@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]] # Bin to run the HelloWorld gRPC server
+name = "helloworld-server"
+path = "src/server.rs"
+
+[[bin]] # Bin to run the HelloWorld gRPC client
+name = "helloworld-client"
+path = "src/client.rs"
+
+[dependencies]
+anyhow = "1.0"
+tonic = "0.11"
+prost = "0.12.6"
+prost-types = "0.12.6"
+tokio = { version = "1.18", features = ["macros", "rt-multi-thread"] }
+tifs = { path = ".." }
+clap = { version = "4.4", features = ["wrap_help", "cargo"] }
+clap_complete = "4.4"
+clap_mangen = "0.2"
+tracing = "0.1"
+tracing-futures = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1.0"
+bytestring = "1.0"
+fuser = {git = "https://github.com/cberner/fuser.git", features = ["serializable", "abi-7-31"]}
+uuid = "1.8.0"
+num-bigint = "0.4.5"
+
+[build-dependencies]
+tonic-build = "0.11"
