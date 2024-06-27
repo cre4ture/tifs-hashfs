@@ -27,7 +27,7 @@ use super::{
 use super::key::{check_file_name, InoMetadata, KeyParser, ScopedKeyBuilder, ROOT_INODE};
 use super::hash_fs_interface::{
         BlockIndex, GotOrMade, HashFsError, HashFsInterface, HashFsResult};
-use super::inode::{AccessTime, DirectoryItem, InoDescription, InoSize, ModificationTime, ParentStorageIno, StorageDirItem, StorageDirItemKind, StorageFileAttr, StorageFilePermission, StorageIno};
+use super::inode::{InoAccessTime, DirectoryItem, InoDescription, InoSize, ModificationTime, ParentStorageIno, StorageDirItem, StorageDirItemKind, InoStorageFileAttr, StorageFilePermission, StorageIno};
 
 
 fn get_time_from_time_or_now(time: TimeOrNow) -> SystemTime {
@@ -469,7 +469,7 @@ impl HashFsInterface for TikvBasedHashFs {
         &self,
         parent: ParentStorageIno,
         name: ByteString,
-    ) -> HashFsResult<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)> {
+    ) -> HashFsResult<(Arc<InoDescription>, Arc<InoStorageFileAttr>, Arc<InoSize>, InoAccessTime)> {
         let mut spin = self.f_txn.spinning_mini_txn().await?;
         let entry_opt = loop {
             let mut started = spin.start().await?;
@@ -485,12 +485,12 @@ impl HashFsInterface for TikvBasedHashFs {
     async fn inode_get_all_attributes(
         &self,
         ino: StorageIno,
-    ) -> HashFsResult<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)> {
+    ) -> HashFsResult<(Arc<InoDescription>, Arc<InoStorageFileAttr>, Arc<InoSize>, InoAccessTime)> {
         let desc: Arc<InoDescription> = self.f_txn.fetch(&ino).await?;
-        let attr: Arc<StorageFileAttr> = self.f_txn.fetch(&ino).await?;
+        let attr: Arc<InoStorageFileAttr> = self.f_txn.fetch(&ino).await?;
         let size: Arc<InoSize> = self.f_txn.fetch(&ino).await?;
-        let atime: AccessTime = self.f_txn.fetch(&ino).await.ok().as_deref().cloned().unwrap_or_else(||{
-                AccessTime(size.last_change.max(attr.last_change))
+        let atime: InoAccessTime = self.f_txn.fetch(&ino).await.ok().as_deref().cloned().unwrap_or_else(||{
+                InoAccessTime(size.last_change.max(attr.last_change))
             });
         Ok((desc, attr, size, atime))
     }
@@ -512,7 +512,7 @@ impl HashFsInterface for TikvBasedHashFs {
     ) -> HashFsResult<()> {
 
         if let Some(atime_modification) = atime {
-            let new_atime = AccessTime(get_time_from_time_or_now(atime_modification));
+            let new_atime = InoAccessTime(get_time_from_time_or_now(atime_modification));
             self.f_txn.put_json(&ino, Arc::new(new_atime)).await?;
         }
 
@@ -522,7 +522,7 @@ impl HashFsInterface for TikvBasedHashFs {
         }
 
         // TODO: how to deal with fh, chgtime, bkuptime?
-        let ino_attr_arc: Arc<StorageFileAttr> = self.f_txn.fetch(&ino).await?;
+        let ino_attr_arc: Arc<InoStorageFileAttr> = self.f_txn.fetch(&ino).await?;
         let mut ino_attr = ino_attr_arc.deref().clone();
 
         let mut cnt = 0 as usize;
@@ -743,6 +743,7 @@ impl From<HashFsError> for FsError {
             HashFsError::Unspecific(msg) => FsError::UnknownError(msg),
             HashFsError::FileAlreadyExists => FsError::FileExist { file: format!("undefined") },
             HashFsError::InodeHasNoInlineData => FsError::WrongFileType,
+            HashFsError::GrpcMessageIncomplete => FsError::UnknownError(format!("Error: GrpcMessageIncomplete")),
         }
     }
 }

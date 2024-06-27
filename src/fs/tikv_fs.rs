@@ -31,7 +31,7 @@ use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
 use super::hash_fs_interface::{BlockIndex, HashFsInterface};
-use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItemKind, StorageFileAttr, StorageIno, TiFsHash};
+use super::inode::{InoAccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItemKind, InoStorageFileAttr, StorageIno, TiFsHash};
 use super::reply::{
     Data, Directory, LogicalIno
 };
@@ -109,9 +109,9 @@ pub struct TiFsCaches {
     pub inode_desc: TxnDataCache<StorageIno, InoDescription>,
     pub inode_size: TxnDataCache<StorageIno, InoSize>,
     pub inode_lock_state: TxnDataCache<StorageIno, InoLockState>,
-    pub inode_atime: TxnDataCache<StorageIno, AccessTime>,
+    pub inode_atime: TxnDataCache<StorageIno, InoAccessTime>,
     pub inode_mtime: TxnDataCache<StorageIno, ModificationTime>,
-    pub inode_attr: TxnDataCache<StorageIno, StorageFileAttr>,
+    pub inode_attr: TxnDataCache<StorageIno, InoStorageFileAttr>,
     pub ino_locks: Arc<RwLock<HashMap<StorageIno, Weak<RwLock<()>>>>>,
 }
 
@@ -182,6 +182,14 @@ impl TiFsMutable {
     }
 }
 
+
+const DEFAULT_TLS_CONFIG_PATH: &str = "~/.tifs/tls.toml";
+
+fn default_tls_config_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(DEFAULT_TLS_CONFIG_PATH.parse()?)
+}
+
+
 pub struct TiFs {
     pub weak: Weak<TiFs>,
     pub instance_id: Uuid,
@@ -202,15 +210,66 @@ pub type BoxedFuture<'a, T> = Pin<Box<dyn 'a + Send + Future<Output = Result<T>>
 impl TiFs {
     pub const SCAN_LIMIT: u32 = 1 << 10;
 
+    pub async fn get_client_config(options: &Vec<MountOption>) -> anyhow::Result<tikv_client::Config> {
+        let tls_cfg_path = options
+            .iter()
+            .find_map(|opt| {
+                if let MountOption::Tls(path) = opt {
+                    Some(path.parse().map_err(Into::into))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(default_tls_config_path)?;
+
+        let client_cfg: tikv_client::Config = if tokio::fs::metadata(&tls_cfg_path).await.is_ok() {
+            let client_cfg_contents = tokio::fs::read_to_string(tls_cfg_path).await?;
+            toml::from_str::<crate::fs::client::TlsConfig>(&client_cfg_contents)?.into()
+        } else {
+            Default::default()
+        };
+
+        let mut client_cfg = client_cfg.with_default_keyspace();
+        client_cfg.timeout = Duration::from_secs(1);
+        debug!("use tikv client config: {:?}", client_cfg);
+        Ok(client_cfg)
+    }
+
+    pub async fn construct_hash_fs(
+        pd_endpoints: Vec<String>,
+        options: Vec<MountOption>,
+    ) -> anyhow::Result<Arc<TikvBasedHashFs>> {
+
+        let cfg = Self::get_client_config(&options).await?;
+        let raw_cfg = cfg.clone();
+        let raw = Arc::new(tikv_client::RawClient::new_with_config(
+            pd_endpoints.clone(), raw_cfg).await?);
+        let client = Arc::new(TransactionClientMux::new(
+            pd_endpoints.clone(), cfg.clone()).await
+                .map_err(|err| anyhow!("{}", err))?);
+        tracing::info!("connected to pd endpoints: {:?}", pd_endpoints);
+
+        let fs_config = TiFsConfig::from_options(&options).map_err(|err| {
+            tracing::error!("failed creating config. Err: {:?}", err);
+            err
+        })?;
+
+        Ok(TikvBasedHashFs::new_arc(
+            fs_config.clone(),
+            FlexibleTransaction::new_pure_raw(client, raw, fs_config.clone()),
+        ))
+    }
+
     #[instrument]
     pub async fn construct<S>(
         pd_endpoints: Vec<S>,
-        cfg: Config,
         options: Vec<MountOption>,
     ) -> anyhow::Result<TiFsArc>
     where
         S: Clone + Debug + Into<String>,
     {
+        let cfg = Self::get_client_config(&options).await?;
+
         let raw_cfg = cfg.clone();
         let raw = Arc::new(tikv_client::RawClient::new_with_config(pd_endpoints.clone(), raw_cfg).await?);
         let client = Arc::new(TransactionClientMux::new(
@@ -526,7 +585,7 @@ impl TiFs {
         kind: InoKind,
         desc: &InoDescription,
         size: &InoSize,
-        attr: &StorageFileAttr,
+        attr: &InoStorageFileAttr,
         atime: Option<SystemTime>,
     ) -> FileAttr {
         let stat = FileAttr {

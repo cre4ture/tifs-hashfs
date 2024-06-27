@@ -61,7 +61,7 @@ pub struct StorageFilePermission(pub u16);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[derive(Serialize, Deserialize)]
-pub struct StorageFileAttr {
+pub struct InoStorageFileAttr {
     /// Permissions
     pub perm: StorageFilePermission,
     /// User id
@@ -77,7 +77,7 @@ pub struct StorageFileAttr {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AccessTime(pub SystemTime);
+pub struct InoAccessTime(pub SystemTime);
 
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -89,7 +89,6 @@ pub struct ModificationTime(pub SystemTime);
 pub struct InoDescription {
     pub ino: StorageIno,
     pub typ: StorageDirItemKind,
-    /// Time of creation
     pub creation_time: SystemTime,
 }
 
@@ -101,9 +100,9 @@ impl InoDescription {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InoSize {
-    size: u64,
-    blocks: u64,
-    inline_data: Option<Vec<u8>>,
+    pub size: u64,
+    pub blocks: u64,
+    pub inline_data: Option<Vec<u8>>,
     pub data_hash: Option<TiFsHash>,
     pub last_change: SystemTime,
     pub change_iteration: u64,

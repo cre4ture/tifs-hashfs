@@ -10,7 +10,7 @@ use strum::{EnumIter, IntoEnumIterator};
 
 use super::error::TiFsResult;
 use super::hash_fs_interface::BlockIndex;
-use super::inode::{AccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItem, StorageFileAttr, StorageIno};
+use super::inode::{InoAccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItem, InoStorageFileAttr, StorageIno};
 use super::meta::{MetaMutable, MetaStatic};
 use super::reply::LogicalIno;
 use super::tikv_fs::InoUse;
@@ -164,6 +164,20 @@ impl KeyDeSer for BlockAddress {
     }
 }
 
+pub fn parse_uuid(i: &mut Iter<'_, u8>) -> TiFsResult<Uuid> {
+    const UUID_LEN: usize = 16;
+    let chunk = i.as_slice().array_chunks::<UUID_LEN>().next();
+    let Some(chunk) = chunk else {
+        return Err(FsError::Serialize{
+            target: "Uuid",
+            typ: "binary",
+            msg: format!("parse_lock_key(): key length too small")
+        });
+    };
+    i.advance_by(UUID_LEN).unwrap();
+    Ok(Uuid::from_bytes_ref(chunk).clone())
+}
+
 pub fn check_file_name(name: &str) -> TiFsResult<()> {
     if name.len() <= MAX_NAME_LEN as usize {
         Ok(())
@@ -282,15 +296,9 @@ impl<'ol> KeyParser<'ol> {
         })
     }
 
-    pub fn parse_uuid(self) -> TiFsResult<(Self, Uuid)> {
-        const UUID_LEN: usize = 16;
-        let chunk = self.i.as_slice().array_chunks::<UUID_LEN>().next();
-        let Some(chunk) = chunk else {
-            return Err(FsError::UnknownError(
-                format!("parse_lock_key(): key length too small")));
-        };
-        self.i.advance_by(UUID_LEN).unwrap();
-        Ok((self, Uuid::from_bytes_ref(chunk).clone()))
+    pub fn parse_uuid(mut self) -> TiFsResult<(Self, Uuid)> {
+        let uuid = parse_uuid(&mut self.i)?;
+        Ok((self, uuid))
     }
 
     pub fn parse_lock_key(self, key_to_lock: &Vec<u8>) -> TiFsResult<Uuid> {
@@ -630,7 +638,7 @@ impl KeyGenerator<StorageIno, InoLockState> for ScopedKeyBuilder {
     }
 }
 
-impl KeyGenerator<StorageIno, AccessTime> for ScopedKeyBuilder {
+impl KeyGenerator<StorageIno, InoAccessTime> for ScopedKeyBuilder {
     fn generate_key(self, k: &StorageIno) -> KeyBuffer {
         self.inode_x(*k, InoMetadata::AccessTime).buf
     }
@@ -648,7 +656,7 @@ impl KeyGenerator<StorageIno, InoUse> for ScopedKeyBuilder {
     }
 }
 
-impl KeyGenerator<StorageIno, StorageFileAttr> for ScopedKeyBuilder {
+impl KeyGenerator<StorageIno, InoStorageFileAttr> for ScopedKeyBuilder {
     fn generate_key(self, k: &StorageIno) -> KeyBuffer {
         self.inode_x(*k, InoMetadata::UnixAttributes).buf
     }

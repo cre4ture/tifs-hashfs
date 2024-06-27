@@ -16,7 +16,7 @@ use super::fs_config::TiFsConfig;
 use super::flexible_transaction::{FlexibleTransaction, SpinningTxn, TransactionError, TransactionResult};
 use super::meta::MetaStatic;
 use super::key::{KeyGenerator, KeyParser, ScopedKeyBuilder};
-use super::inode::{InoDescription, InoSize, StorageDirItem, StorageDirItemKind, StorageFileAttr, StorageFilePermission, StorageIno};
+use super::inode::{InoDescription, InoSize, StorageDirItem, StorageDirItemKind, InoStorageFileAttr, StorageFilePermission, StorageIno};
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum DeletionCheckResult {
@@ -260,7 +260,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         let mut i_size = InoSize::new();
         inline_data.map(|data| i_size.set_inline_data(data));
         let ino_size = Arc::new(i_size);
-        let ino_attr = Arc::new(StorageFileAttr{
+        let ino_attr = Arc::new(InoStorageFileAttr{
             perm,
             uid,
             gid,

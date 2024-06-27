@@ -28,7 +28,7 @@ use super::fs_config::TiFsConfig;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::hash_fs_interface::{BlockIndex, GotOrMade, HashFsInterface};
-use super::inode::{AccessTime, InoDescription, InoSize, ParentStorageIno, StorageDirItem, StorageFileAttr, StorageFilePermission, TiFsHash};
+use super::inode::{InoAccessTime, InoDescription, InoSize, ParentStorageIno, StorageDirItem, InoStorageFileAttr, StorageFilePermission, TiFsHash};
 use super::mode::as_file_perm;
 use super::parsers;
 use super::reply::StatFs;
@@ -599,7 +599,7 @@ impl Txn {
     }
 
     pub async fn get_all_ino_data(self: TxnArc, ino: StorageIno,
-    ) -> TiFsResult<(Arc<InoDescription>, Arc<StorageFileAttr>, Arc<InoSize>, AccessTime)> {
+    ) -> TiFsResult<(Arc<InoDescription>, Arc<InoStorageFileAttr>, Arc<InoSize>, InoAccessTime)> {
         Ok(self.f_txn.inode_get_all_attributes(ino).await?)
     }
 
