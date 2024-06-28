@@ -197,20 +197,38 @@ impl TikvBasedHashFs {
         Ok(result)
     }
 
-    pub async fn hb_clear_data_single_block_arc(self: Arc<Self>, addr: BlockAddress) -> TiFsResult<()> {
-        self.hb_clear_data_single_block(addr).await
+    pub async fn hb_clear_data_single_block_arc(
+        self: Arc<Self>,
+        addr: BlockAddress,
+        do_size_update: bool,
+    ) -> TiFsResult<()> {
+        self.hb_clear_data_single_block(addr, do_size_update).await
     }
 
-    pub async fn hb_clear_data_single_block(&self, addr: BlockAddress) -> TiFsResult<()> {
+    pub async fn hb_clear_data_single_block(&self, addr: BlockAddress, do_size_update: bool) -> TiFsResult<()> {
         let mut spin = MiniTransaction::new(&self.f_txn).await?;
         let prev_hash = loop {
             let mut started = spin.start().await?;
             let r1 = started
-                .hb_replace_block_hash_for_address_and_update_inodes_size(
-                    &addr, None, 0).await;
+                .hb_replace_block_hash_for_address_no_size_update(
+                    &addr, None).await;
             if let Some(result) = started.finish(
                 r1).await { break result?; }
         };
+
+        if do_size_update {
+            let mut spin = MiniTransaction::new(&self.f_txn).await?;
+            loop {
+                let lock = self.ino_lock_lock_write(addr.ino).await;
+                let mut started = spin.start().await?;
+                let r1 = started
+                    .hb_replace_block_hash_for_address_only_size_update(
+                        &addr, 0).await;
+                if let Some(result) = started.finish(
+                    r1).await { break result?; }
+                drop(lock);
+            };
+        }
 
         let Some(prev_h) = prev_hash else {
             return Ok(());
@@ -238,7 +256,7 @@ impl TikvBasedHashFs {
         for block in (0..block_cnt).map(BlockIndex) {
             let addr = BlockAddress { ino, index: block };
             let me = self.weak.upgrade().unwrap();
-            parallel_executor.push(me.clone().hb_clear_data_single_block_arc(addr)).await;
+            parallel_executor.push(me.clone().hb_clear_data_single_block_arc(addr, false)).await;
         }
         parallel_executor.wait_finish_all().await;
         for r in parallel_executor.get_results_so_far() {
@@ -627,12 +645,27 @@ impl HashFsInterface for TikvBasedHashFs {
                 let lock = self.ino_lock_lock_write(ino).await;
                 let mut started = spin.start().await?;
                 let r1 = started
-                    .hb_replace_block_hash_for_address_and_update_inodes_size(
-                        &addr, Some(&block_hash), blocks_size).await;
+                    .hb_replace_block_hash_for_address_no_size_update(
+                        &addr, Some(&block_hash)).await;
                 if let Some(result) = started.finish(r1).await
                 { break result?; }
                 drop(lock);
             };
+
+            let do_size_update = true;
+            if do_size_update {
+                let mut spin = MiniTransaction::new(&self.f_txn).await?;
+                loop {
+                    let lock = self.ino_lock_lock_write(addr.ino).await;
+                    let mut started = spin.start().await?;
+                    let r1 = started
+                        .hb_replace_block_hash_for_address_only_size_update(
+                            &addr, blocks_size).await;
+                    if let Some(result) = started.finish(
+                        r1).await { break result?; }
+                    drop(lock);
+                };
+            }
 
             if let Some(pre_hash) = prev_hash {
                 decrement_cnts.insert(pre_hash.clone(),

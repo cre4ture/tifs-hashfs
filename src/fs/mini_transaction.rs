@@ -468,11 +468,10 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         Ok(prev_counter_value)
     }
 
-    pub async fn hb_replace_block_hash_for_address_and_update_inodes_size(
+    pub async fn hb_replace_block_hash_for_address_no_size_update(
         &mut self,
         addr: &BlockAddress,
         new_hash: Option<&TiFsHash>,
-        new_blocks_actual_size: u64,
     ) -> TiFsResult<Option<TiFsHash>> {
         let key = Key::from(self.key_builder().block_hash(addr.clone()));
         let prev_block_hash = self.mini.get(key.clone()).await?;
@@ -481,18 +480,30 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         } else {
             self.mini.delete(key.clone()).await?;
         }
+        Ok(prev_block_hash)
+    }
 
+    pub async fn hb_replace_block_hash_for_address_only_size_update(
+        &mut self,
+        addr: &BlockAddress,
+        new_blocks_actual_size: u64
+    ) -> TiFsResult<()> {
+        let mut changed = false;
         let ino_size_arc: Arc<InoSize> = self.fetch(&addr.ino).await?;
         let mut ino_size = ino_size_arc.deref().clone();
         let target_size = addr.index.0 * self.fs_config().block_size + new_blocks_actual_size;
         if target_size > ino_size.size() {
-            ino_size.set_size(target_size, self.fs_config().block_size)
+            ino_size.set_size(target_size, self.fs_config().block_size);
+            changed = true;
         }
-        ino_size.data_hash.take();
-        ino_size.change_iteration += 1;
-        self.put(&addr.ino, Arc::new(ino_size)).await?;
-
-        Ok(prev_block_hash)
+        if let Some(_prev_full_data_hash) = ino_size.data_hash.take() {
+            changed = true;
+        }
+        if changed {
+            ino_size.change_iteration += 1;
+            self.put(&addr.ino, Arc::new(ino_size)).await?;
+        }
+        Ok(())
     }
 
     pub async fn hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
