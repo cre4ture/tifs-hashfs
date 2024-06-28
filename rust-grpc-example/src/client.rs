@@ -2,6 +2,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
 use std::ops::Range;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -472,9 +473,9 @@ impl HashFsInterface for HashFsClient {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
 
-tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
                 .try_init()
                 .map_err(|err| anyhow::anyhow!("fail to init tracing subscriber: {}", err))?;
@@ -550,8 +551,9 @@ tracing_subscriber::fmt()
         v.into_iter().cloned().collect::<Vec<_>>()
     }).unwrap_or(Vec::new());
 
+    // "hash-fs:http://[::1]:50051"
     let pd_endpoints = endpoints.into_iter()
-        .filter_map(|s|s.strip_prefix("tifs:").map(String::from))
+        .filter_map(|s|s.strip_prefix("hash-fs:").map(String::from))
         .collect::<Vec<_>>();
 
     let options_str = matches.get_many::<String>("options")
@@ -562,7 +564,14 @@ tracing_subscriber::fmt()
     let options = tifs::fs::fs_config::MountOption::to_vec(
         options_str.iter().map(|s|s.as_str()));
 
-    let mut client = GreeterClient::connect("http://[::1]:50051").await?;
+    if pd_endpoints.len() == 0 {
+        return Err(anyhow::anyhow!("missing endpoint parameter"));
+    }
+
+    let endpoint_str = pd_endpoints.first().unwrap();
+    let grpc_endpoint = tonic::transport::Endpoint::from_str(endpoint_str)
+        .map_err(|err| anyhow::anyhow!("parsing endpoint {} failed: Err: {:?}", endpoint_str, err))?;
+    let mut client = GreeterClient::connect(grpc_endpoint.clone()).await?;
 
     let request = tonic::Request::new(HelloRequest {
         name: "Tonic".into(),
@@ -575,7 +584,7 @@ tracing_subscriber::fmt()
 
     let hash_fs_client = Arc::new(HashFsClient{
         grpc_client: RwLock::new(
-            rust_grpc_example::grpc::hash_fs::hash_fs_client::HashFsClient::connect("http://[::1]:50051").await?),
+            rust_grpc_example::grpc::hash_fs::hash_fs_client::HashFsClient::connect(grpc_endpoint).await?),
         });
 
     let fs = tifs::fs::tikv_fs::TiFs::construct_hash_fs_client(pd_endpoints, options.clone(), hash_fs_client).await?;
@@ -590,5 +599,5 @@ tracing_subscriber::fmt()
 
     tifs::fuse_mount_daemonize(mount_point, options, ||Ok(()), fs).await?;
 
-    Ok(())
+    anyhow::Ok(())
 }

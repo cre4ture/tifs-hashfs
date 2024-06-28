@@ -720,7 +720,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = fs_config::MountOption::to_vec(
         options_str.iter().map(|s|s.as_str()));
 
-    let addr = "[::1]:50051".parse()?;
+    let addr = "[::]:50051".parse()?;
     let greeter = MyGreeter::default();
     let hash_fs = HashFsGrpcServer::new(
         pd_endpoints, options).await?;
