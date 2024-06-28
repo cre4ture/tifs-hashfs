@@ -195,8 +195,6 @@ pub struct TiFs {
     pub instance_id: Uuid,
     pub hash_fs: Arc<dyn HashFsInterface>,
     pub client_config: Config,
-    pub client: Arc<TransactionClientMux>,
-    pub raw: Arc<tikv_client::RawClient>,
     pub direct_io: bool,
     pub fs_config: TiFsConfig,
     mut_data: RwLock<TiFsMutable>,
@@ -270,15 +268,6 @@ impl TiFs {
     {
         let cfg = Self::get_client_config(&options).await?;
 
-        let raw_cfg = cfg.clone();
-        let raw = Arc::new(tikv_client::RawClient::new_with_config(pd_endpoints.clone(), raw_cfg).await?);
-        let client = Arc::new(TransactionClientMux::new(
-                pd_endpoints.clone().into_iter().map(|s|s.into()).collect::<Vec<_>>(), cfg.clone()
-            )
-            .await
-            .map_err(|err| anyhow!("{}", err))?);
-        info!("connected to pd endpoints: {:?}", pd_endpoints);
-
         let fs_config = TiFsConfig::from_options(&options).map_err(|err| {
             tracing::error!("failed creating config. Err: {:?}", err);
             err
@@ -288,8 +277,6 @@ impl TiFs {
             TiFs {
                 weak: me.clone(),
                 instance_id: uuid::Uuid::new_v4(),
-                client: client.clone(),
-                raw: raw.clone(),
                 hash_fs: hash_fs_impl,
                 client_config: cfg,
                 direct_io: fs_config.direct_io,
@@ -329,8 +316,6 @@ impl TiFs {
             TiFs {
                 weak: me.clone(),
                 instance_id: uuid::Uuid::new_v4(),
-                client: client.clone(),
-                raw: raw.clone(),
                 hash_fs: TikvBasedHashFs::new_arc(
                     fs_config.clone(),
                     FlexibleTransaction::new_pure_raw(client, raw, fs_config.clone()),
