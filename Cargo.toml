@@ -22,7 +22,7 @@ parse-size = "1.0.0"
 serde = {version = "1", features = ["derive"]}
 slab = "0.4.2"
 thiserror = "1.0"
-tikv-client = {path = "/home/uli/dev_rust/tikv/client-rust"}
+tikv-client = {path = "../client-rust"}
 toml = "0.5"
 tracing = "0.1"
 tracing-futures = "0.2"
