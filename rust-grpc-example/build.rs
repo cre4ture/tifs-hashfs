@@ -3,6 +3,7 @@ use std::fs;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_dir = "api/protos";
     let output_dir = "./src/grpc/generated";
+    std::fs::create_dir_all(output_dir)?;
 
     let proto_list = ["greeter", "hash_fs"];
     let proto_filepaths = proto_list.map(|file| format!("{input_dir}/{file}.proto"));
