@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::mem;
 use std::ops::{Deref, DerefMut, Range};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use bytestring::ByteString;
@@ -56,6 +56,7 @@ fn parse_all_attrs(
 
 pub struct Pool<T> {
     free: std::sync::RwLock<VecDeque<T>>,
+    counter: RwLock<u64>,
 }
 
 pub struct HandedOutPoolElement<'pool, T> {
@@ -97,11 +98,17 @@ impl<'pool, T> DerefMut for HandedOutPoolElement<'pool, T> {
 impl<T> Pool<T> {
     pub fn new() -> Self {
         Self {
-            free: VecDeque::new().into()
+            free: VecDeque::new().into(),
+            counter: RwLock::new(0),
         }
     }
 
     pub fn add_new_busy_to_pool<'pool>(&'pool self, new_busy_element: T) -> HandedOutPoolElement<'pool, T> {
+        let mut counter_lock = self.counter.write().unwrap();
+        *counter_lock.deref_mut() += 1;
+        let new_count = *counter_lock.deref();
+        drop(counter_lock);
+        tracing::info!("adding element to pool. new count: {}", new_count);
         return HandedOutPoolElement::<'pool, T>::new(self, new_busy_element);
     }
 

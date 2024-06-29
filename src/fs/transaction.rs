@@ -12,7 +12,7 @@ use num_bigint::BigUint;
 use num_format::{Buffer, Locale, ToFormattedString};
 use num_traits::FromPrimitive;
 use tikv_client::Backoff;
-use tracing::{debug, instrument, trace, Level};
+use tracing::{instrument, trace, Level};
 use uuid::Uuid;
 
 use crate::fs::inode::{StorageDirItemKind, StorageIno};
@@ -440,18 +440,25 @@ impl Txn {
         data: Vec<u8>,
         block_ids: Vec<BlockIndex>,
     ) -> TiFsResult<()> {
+        let mut watch = AutoStopWatch::start("pm_details");
         let previous_reference_count = self.hash_fs.hb_increment_reference_count(
             &block_hash, ref_count_delta).await?;
+
+        watch.sync("inc");
 
         let block_len = data.len() as u64;
 
         // Upload block if new
         if previous_reference_count == BigUint::from_u8(0).unwrap() {
             self.hash_fs.hb_upload_new_block(block_hash.clone(), data).await?;
+
+            watch.sync("upload");
         }
 
         self.hash_fs.inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
             ino, block_hash, block_len, block_ids).await?;
+
+        watch.sync("register");
 
         Ok(())
     }
@@ -557,7 +564,7 @@ impl Txn {
     pub async fn write(self: TxnArc, fh: Arc<FileHandler>, start: u64, data: Bytes) -> TiFsResult<usize> {
         let mut watch = AutoStopWatch::start("write_data");
         let ino = fh.ino();
-        debug!("write data at ({})[{}]", ino, start);
+        trace!("write data at ({})[{}]", ino, start);
 
         let size = data.len();
         let _ = self.clone().hb_write_data(fh.clone(), start, data).await?;
