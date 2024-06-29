@@ -1,3 +1,4 @@
+#![feature(duration_constructors)]
 
 use std::ops::Range;
 use std::{convert::TryInto, mem, time::SystemTime};
@@ -10,6 +11,7 @@ use tifs::fs::inode::{InoAccessTime, InoDescription, InoSize, InoStorageFileAttr
 use uuid::Uuid;
 
 pub mod grpc;
+pub mod hash_fs;
 
 impl From<StorageIno> for grpc::hash_fs::StorageIno {
     fn from(value: StorageIno) -> Self {
