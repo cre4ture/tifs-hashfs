@@ -94,7 +94,7 @@ impl SpinningTxn {
                     Err(error) => {
                         if let Some(delay) = self.backoff.next_delay_duration() {
                             sleep(delay).await;
-                            tracing::info!("retry commit failed transaction");
+                            tracing::info!("retry commit failed transaction. Type: {}", std::any::type_name::<R>());
                             return None;
                         } else {
                             tracing::warn!("transaction failed!");
@@ -115,7 +115,7 @@ impl SpinningTxn {
                     TransactionError::TemporaryIssue(err) => {
                         if let Some(delay) = self.backoff.next_delay_duration() {
                             sleep(delay).await;
-                            tracing::info!("retry rolled back transaction");
+                            tracing::info!("retry rolled back transaction. Type: {}", std::any::type_name::<R>());
                             return None;
                         } else {
                             tracing::warn!("transaction failed!");
