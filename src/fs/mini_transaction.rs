@@ -56,7 +56,7 @@ impl<'ft_l> MiniTransaction<'ft_l> {
     pub async fn start<'mol>(&'mol mut self) -> TiFsResult<StartedMiniTransaction<'mol, 'ft_l>>
     {
         let mini_res = loop {
-            let r = self.txn.mini_txn_raw().await;
+            let r = self.txn.single_action_txn_raw().await;
             match r {
                 Ok(mini) => break mini,
                 Err(e) => {
