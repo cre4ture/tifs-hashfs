@@ -2337,6 +2337,7 @@ dependencies = [
  "clap_complete 4.5.6",
  "clap_mangen",
  "fuser",
+ "futures",
  "num-bigint",
  "prost",
  "prost-types",

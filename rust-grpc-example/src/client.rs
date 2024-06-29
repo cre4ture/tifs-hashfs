@@ -1,7 +1,9 @@
+#![feature(duration_constructors)]
+#![feature(type_alias_impl_trait)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::mem;
-use std::ops::Range;
+use std::ops::{Deref, DerefMut, Range};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -17,7 +19,7 @@ use rust_grpc_example::grpc::hash_fs::{self as grpc_fs, InitRq, MetaStaticReadRq
 use tifs::fs::hash_fs_interface::{BlockIndex, GotOrMade, HashFsError, HashFsInterface, HashFsResult};
 use tifs::fs::inode::{DirectoryItem, InoAccessTime, InoDescription, InoSize, InoStorageFileAttr, ParentStorageIno, StorageDirItem, StorageDirItemKind, StorageFilePermission, StorageIno, TiFsHash};
 use tifs::fs::meta::MetaStatic;
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::time::sleep;
 
 type RawGrpcClient = grpc_fs::hash_fs_client::HashFsClient<tonic::transport::Channel>;
 
@@ -59,14 +61,105 @@ fn parse_all_attrs(
     ))
 }
 
+pub struct Pool<T> {
+    free: std::sync::RwLock<VecDeque<T>>,
+}
+
+pub struct HandedOutPoolElement<'pool, T> {
+    pool: &'pool Pool<T>,
+    element: Option<T>,
+}
+
+impl<'pool, T> HandedOutPoolElement<'pool, T> {
+    pub fn new(pool: &'pool Pool<T>, element: T) -> Self {
+        Self {
+            pool,
+            element: Some(element),
+        }
+    }
+}
+
+impl<'pool, T> Drop for HandedOutPoolElement<'pool, T> {
+    fn drop(&mut self) {
+        if let Some(element) = self.element.take() {
+            self.pool.free.write().unwrap().push_back(element);
+        }
+    }
+}
+
+impl<'pool, T> Deref for HandedOutPoolElement<'pool, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.element.as_ref().unwrap()
+    }
+}
+
+impl<'pool, T> DerefMut for HandedOutPoolElement<'pool, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.element.as_mut().unwrap()
+    }
+}
+
+impl<T> Pool<T> {
+    pub fn new() -> Self {
+        Self {
+            free: VecDeque::new().into()
+        }
+    }
+
+    pub fn add_new_busy_to_pool<'pool>(&'pool self, new_busy_element: T) -> HandedOutPoolElement<'pool, T> {
+        return HandedOutPoolElement::<'pool, T>::new(self, new_busy_element);
+    }
+
+    pub fn get_one_free<'pool>(&'pool self) -> Option<HandedOutPoolElement<'pool, T>> {
+        let one_free = self.free.write().unwrap().pop_front();
+        one_free.map(|free|{
+            HandedOutPoolElement::<'pool, T>::new(self, free)
+        })
+    }
+}
+
 pub struct HashFsClient {
-    grpc_client: RwLock<RawGrpcClient>,
+    grpc_endpoint: tonic::transport::Endpoint,
+    grpc_client_pool: Pool<RawGrpcClient>,
 }
 
 impl HashFsClient {
-    async fn lock_grpc(&self) -> RwLockWriteGuard<RawGrpcClient> {
-        let r: RwLockWriteGuard<RawGrpcClient> = self.grpc_client.write().await;
-        r
+    pub fn new(grpc_endpoint: tonic::transport::Endpoint) -> Self {
+        Self {
+            grpc_endpoint: grpc_endpoint.clone(),
+            grpc_client_pool: Pool::new(),
+        }
+    }
+
+    async fn connect_with_retries(grpc_endpoint: tonic::transport::Endpoint) -> core::result::Result<RawGrpcClient, tonic::transport::Error> {
+        let start_time = std::time::Instant::now();
+        loop {
+            let hash_fs_client = RawGrpcClient::connect(grpc_endpoint.clone()).await;
+            match hash_fs_client {
+                Ok(client) => return Ok(client),
+                Err(err) => {
+                    let time_passed = start_time.elapsed();
+                    if time_passed > std::time::Duration::from_mins(10) {
+                        tracing::error!("failed to connect to grpc sever. timeout passed");
+                        return  Err(err);
+                    }
+                    tracing::warn!("failed to connect to grpc sever. trying again ...");
+                    sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    async fn lock_grpc<'pool>(&'pool self) -> core::result::Result<HandedOutPoolElement<'pool, RawGrpcClient>, tonic::transport::Error> {
+        let next = self.grpc_client_pool.get_one_free();
+        if let Some(next) = next {
+            return Ok(next);
+        }
+
+        let new_one = Self::connect_with_retries(self.grpc_endpoint.clone()).await?;
+        Ok(self.grpc_client_pool.add_new_busy_to_pool(new_one))
     }
 }
 
@@ -74,7 +167,7 @@ impl HashFsClient {
 impl HashFsInterface for HashFsClient {
 
     async fn init(&self, gid: u32, uid: u32) -> HashFsResult<StorageDirItem> {
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .init(InitRq{gid, uid}).await?.into_inner();
         handle_error(&rs.error)?;
         let Some(v) = rs.value else {
@@ -84,7 +177,7 @@ impl HashFsInterface for HashFsClient {
     }
 
     async fn meta_static_read(&self) -> HashFsResult<MetaStatic> {
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .meta_static_read(MetaStaticReadRq{}).await?.into_inner();
         handle_error(&rs.error)?;
         let Some(v) = rs.value else {
@@ -94,7 +187,7 @@ impl HashFsInterface for HashFsClient {
     }
 
     async fn directory_read_children(&self, dir_ino: StorageIno) -> HashFsResult<Vec<DirectoryItem>> {
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
         .directory_read_children(grpc_fs::DirectoryReadChildrenRq{
             dir_ino: Some(dir_ino.into()),
         }).await?;
@@ -113,7 +206,7 @@ impl HashFsInterface for HashFsClient {
         name: ByteString,
         ino: StorageIno,
     ) -> HashFsResult<()> {
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .directory_add_child_checked_existing_inode(
                 grpc_fs::DirectoryAddChildCheckedExistingInodeRq{
                     ino: Some(ino.into()),
@@ -147,7 +240,7 @@ impl HashFsInterface for HashFsClient {
         if let Some(data) = inline_data {
             rq.inline_data = data;
         }
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .directory_add_child_checked_new_inode(rq).await?.into_inner();
         handle_error(&rs.error)?;
         let existed_before = rs.existed_already;
@@ -169,7 +262,7 @@ impl HashFsInterface for HashFsClient {
         let mut rq = grpc_fs::DirectoryRemoveChildFileRq::default();
         rq.parent = Some(parent.into());
         rq.name = name.to_string();
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .directory_remove_child_file(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(())
@@ -183,7 +276,7 @@ impl HashFsInterface for HashFsClient {
         let mut rq = grpc_fs::DirectoryRemoveChildDirectoryRq::default();
         rq.parent = Some(parent.into());
         rq.name = name.to_string();
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .directory_remove_child_directory(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(())
@@ -201,7 +294,7 @@ impl HashFsInterface for HashFsClient {
         rq.child_name = child_name.to_string();
         rq.new_parent =  Some(new_parent.into());
         rq.new_child_name = new_child_name.to_string();
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .directory_rename_child(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(())
@@ -215,7 +308,7 @@ impl HashFsInterface for HashFsClient {
         let mut rq = grpc_fs::DirectoryChildGetAllAttributesRq::default();
         rq.parent = Some(parent.into());
         rq.name = name.to_string();
-        let mut rs = self.lock_grpc().await
+        let mut rs = self.lock_grpc().await?
             .directory_child_get_all_attributes(rq).await?.into_inner();
         handle_error(&rs.error)?;
         parse_all_attrs(mem::take(&mut rs.all))
@@ -235,7 +328,7 @@ impl HashFsInterface for HashFsClient {
         rq.link = link.to_string();
         rq.gid = gid;
         rq.uid = uid;
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .directory_add_new_symlink(rq).await?.into_inner();
         handle_error(&rs.error)?;
         let Some(item) = rs.item else {
@@ -250,7 +343,7 @@ impl HashFsInterface for HashFsClient {
     ) -> HashFsResult<(Arc<InoDescription>, Arc<InoStorageFileAttr>, Arc<InoSize>, InoAccessTime)> {
         let mut rq = grpc_fs::InodeGetAllAttributesRq::default();
         rq.ino = Some(ino.into());
-        let mut rs = self.lock_grpc().await
+        let mut rs = self.lock_grpc().await?
             .inode_get_all_attributes(rq).await?.into_inner();
         handle_error(&rs.error)?;
         parse_all_attrs(mem::take(&mut rs.all))
@@ -284,7 +377,7 @@ impl HashFsInterface for HashFsClient {
         rq.chgtime = chgtime.map(Into::into);
         rq.bkuptime = bkuptime.map(Into::into);
         rq.flags = flags;
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .inode_set_all_attributes(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(())
@@ -293,7 +386,7 @@ impl HashFsInterface for HashFsClient {
     async fn inode_open(&self, ino: StorageIno) -> HashFsResult<uuid::Uuid> {
         let mut rq = grpc_fs::InodeOpenRq::default();
         rq.ino = Some(ino.into());
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .inode_open(rq).await?.into_inner();
         handle_error(&rs.error)?;
         let Some(use_id) = rs.use_id else {
@@ -307,7 +400,7 @@ impl HashFsInterface for HashFsClient {
         let mut rq = grpc_fs::InodeCloseRq::default();
         rq.ino = Some(ino.into());
         rq.use_id = Some(use_id.into());
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .inode_close(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(())
@@ -323,7 +416,7 @@ impl HashFsInterface for HashFsClient {
         rq.ino = Some(ino.into());
         rq.offset = offset;
         rq.length = length;
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .inode_allocate_size(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(())
@@ -335,7 +428,7 @@ impl HashFsInterface for HashFsClient {
     ) -> HashFsResult<Vec<u8>> {
         let mut rq = grpc_fs::InodeReadInlineDataRq::default();
         rq.ino = Some(ino.into());
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .inode_read_inline_data(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(rs.data)
@@ -351,7 +444,7 @@ impl HashFsInterface for HashFsClient {
         rq.ino = Some(ino.into());
         rq.start = start;
         rq.read_size = read_size;
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .inode_read_block_hashes_data_range(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(rs.block_hashes.into_iter().map(|(k,v)|{
@@ -367,7 +460,7 @@ impl HashFsInterface for HashFsClient {
         let mut rq = grpc_fs::InodeReadBlockHashesBlockRangeRq::default();
         rq.ino = Some(ino.into());
         rq.range = Some(block_range.into());
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .inode_read_block_hashes_block_range(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(rs.block_hashes.into_iter().map(|(k,v)|{
@@ -383,7 +476,7 @@ impl HashFsInterface for HashFsClient {
         rq.hashes = hashes.iter().map(|h|{
             grpc_fs::Hash{ data: h.to_vec() }
         }).collect::<Vec<_>>();
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .hb_get_block_data_by_hashes(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(rs.block_data.into_iter().filter_map(|mut d|{
@@ -398,7 +491,7 @@ impl HashFsInterface for HashFsClient {
     async fn file_get_hash(&self, ino: StorageIno) -> HashFsResult<Vec<u8>> {
         let mut rq = grpc_fs::FileGetHashRq::default();
         rq.ino = Some(ino.into());
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .file_get_hash(rq).await?.into_inner();
         handle_error(&rs.error)?;
         let Some(hash) = rs.hash else {
@@ -415,7 +508,7 @@ impl HashFsInterface for HashFsClient {
         let mut rq = grpc_fs::FileReadBlockHashesRq::default();
         rq.ino = Some(ino.into());
         rq.block_range = Some(block_range.into());
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .file_read_block_hashes(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(rs.hashes)
@@ -429,7 +522,7 @@ impl HashFsInterface for HashFsClient {
         let mut rq = grpc_fs::HbIncrementReferenceCountRq::default();
         rq.hash = Some(grpc_fs::Hash{data: hash.clone()});
         rq.cnt = cnt;
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .hb_increment_reference_count(rq).await?.into_inner();
         handle_error(&rs.error)?;
         let Some(previous_cnt) = rs.previous_cnt else {
@@ -446,7 +539,7 @@ impl HashFsInterface for HashFsClient {
         let mut rq = grpc_fs::HbUploadNewBlockRq::default();
         rq.block_hash = Some(grpc_fs::Hash { data: block_hash });
         rq.data = data;
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .hb_upload_new_block(rq).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(())
@@ -464,7 +557,7 @@ impl HashFsInterface for HashFsClient {
         rq.block_hash = Some(grpc_fs::Hash { data: block_hash });
         rq.blocks_size = blocks_size;
         rq.block_ids = block_ids.into_iter().map(Into::into).collect::<Vec<_>>();
-        let rs = self.lock_grpc().await
+        let rs = self.lock_grpc().await?
             .inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(rq)
             .await?.into_inner();
         handle_error(&rs.error)?;
@@ -582,10 +675,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("RESPONSE={:?}", response);
 
-    let hash_fs_client = Arc::new(HashFsClient{
-        grpc_client: RwLock::new(
-            rust_grpc_example::grpc::hash_fs::hash_fs_client::HashFsClient::connect(grpc_endpoint).await?),
-        });
+    let hash_fs_client = Arc::new(HashFsClient::new(grpc_endpoint));
 
     let fs = tifs::fs::tikv_fs::TiFs::construct_hash_fs_client(pd_endpoints, options.clone(), hash_fs_client).await?;
 

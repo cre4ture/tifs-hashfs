@@ -1,5 +1,5 @@
 
-use std::{collections::{BTreeMap, HashMap, HashSet}, fmt::Debug, ops::Range, sync::Arc, time::SystemTime};
+use std::{collections::{BTreeMap, HashMap, HashSet}, fmt::Debug, ops::Range, sync::{Arc}, time::SystemTime};
 
 use bytestring::ByteString;
 use fuser::TimeOrNow;
@@ -19,6 +19,7 @@ pub enum HashFsError {
     FileAlreadyExists,
     InodeHasNoInlineData,
     GrpcMessageIncomplete,
+    RawTonicTransportError(String),
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
@@ -211,6 +212,12 @@ pub trait HashFsInterface: Send + Sync  {
 impl From<tonic::Status> for HashFsError {
     fn from(value: tonic::Status) -> Self {
         Self::RawGrpcStatus(Some(value))
+    }
+}
+
+impl From<tonic::transport::Error> for HashFsError {
+    fn from(value: tonic::transport::Error) -> Self {
+        Self::RawTonicTransportError(value.to_string())
     }
 }
 

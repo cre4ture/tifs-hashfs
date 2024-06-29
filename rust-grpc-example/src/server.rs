@@ -48,7 +48,7 @@ impl HashFsGrpcServer {
         options: Vec<fs_config::MountOption>,
     ) -> anyhow::Result<Self> {
 
-        let fs_impl = tifs::fs::tikv_fs::TiFs::construct_hash_fs(
+        let fs_impl = tifs::fs::tikv_fs::TiFs::construct_hash_fs_server(
             pd_endpoints, options).await?;
 
         Ok(HashFsGrpcServer {

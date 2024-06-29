@@ -26,7 +26,7 @@ pub async fn mount_tifs_daemonize<F>(
 where
     F: FnOnce() -> anyhow::Result<()>,
 {
-    let fs_impl = fs::tikv_fs::TiFs::construct(pd_endpoints.clone(), options.clone()).await?;
+    let fs_impl = fs::tikv_fs::TiFs::construct_direct_tikv(pd_endpoints.clone(), options.clone()).await?;
 
     fuse_mount_daemonize(mount_point, options, make_daemon, fs_impl).await?;
 

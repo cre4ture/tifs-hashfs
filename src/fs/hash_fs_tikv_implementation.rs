@@ -777,6 +777,7 @@ impl From<HashFsError> for FsError {
             HashFsError::FileAlreadyExists => FsError::FileExist { file: format!("undefined") },
             HashFsError::InodeHasNoInlineData => FsError::WrongFileType,
             HashFsError::GrpcMessageIncomplete => FsError::GrpcMessageIncomplete,
+            HashFsError::RawTonicTransportError(err) => FsError::UnknownError(format!("RawTonicTransportError: {:?}", err)),
         }
     }
 }

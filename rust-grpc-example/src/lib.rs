@@ -52,6 +52,7 @@ impl From<&grpc::hash_fs::HashFsError> for HashFsError {
             gId::RawGrpcStatus => nId::RawGrpcStatus(None),
             gId::Unspecific => nId::Unspecific(val.msg.clone()),
             gId::GrpcMessageIncomplete => nId::GrpcMessageIncomplete,
+            gId::RawTonicTransportError => nId::RawTonicTransportError(val.msg.clone()),
         }
     }
 }
@@ -84,6 +85,10 @@ impl From<&HashFsError> for grpc::hash_fs::HashFsError {
                 nId::Unspecific
             }
             gId::GrpcMessageIncomplete => nId::GrpcMessageIncomplete,
+            gId::RawTonicTransportError(msg) => {
+                msg_out = msg.clone();
+                nId::RawTonicTransportError
+            }
         };
         let mut o = grpc::hash_fs::HashFsError::default();
         o.set_id(id);

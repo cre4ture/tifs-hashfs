@@ -232,7 +232,7 @@ impl TiFs {
         Ok(client_cfg)
     }
 
-    pub async fn construct_hash_fs(
+    pub async fn construct_hash_fs_server(
         pd_endpoints: Vec<String>,
         options: Vec<MountOption>,
     ) -> anyhow::Result<Arc<TikvBasedHashFs>> {
@@ -289,7 +289,7 @@ impl TiFs {
     }
 
     #[instrument]
-    pub async fn construct<S>(
+    pub async fn construct_direct_tikv<S>(
         pd_endpoints: Vec<S>,
         options: Vec<MountOption>,
     ) -> anyhow::Result<TiFsArc>
