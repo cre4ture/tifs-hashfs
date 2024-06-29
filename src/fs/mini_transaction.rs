@@ -483,12 +483,6 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         } else {
             self.mini.delete(key.clone()).await?;
         }
-        let full_hash_key = self.key_builder().inode_x(
-            addr.ino, super::key::InoMetadata::FullHash).buf;
-        // clear full file hash:
-        self.mini.delete(full_hash_key).await?;
-        // change change iter id:
-        self.put(&addr.ino, Arc::new(InoChangeIterationId::random())).await?;
         Ok(prev_block_hash)
     }
 

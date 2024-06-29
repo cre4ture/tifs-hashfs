@@ -679,6 +679,15 @@ impl HashFsInterface for TikvBasedHashFs {
 
             watch.sync("replace");
 
+            let full_hash_key = self.key_builder().inode_x(
+                ino, super::key::InoMetadata::FullHash).buf;
+            // clear full file hash:
+            self.f_txn.delete(full_hash_key).await?;
+            // change change iter id:
+            self.f_txn.put_json(&ino, Arc::new(InoChangeIterationId::random())).await?;
+
+            watch.sync("clear_hash");
+
             let do_size_update = true;
             if do_size_update {
                 let size_peek_arc: Arc<InoSize> = self.f_txn.fetch(&addr.ino).await?;
