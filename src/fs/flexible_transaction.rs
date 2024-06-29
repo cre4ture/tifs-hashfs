@@ -85,7 +85,10 @@ impl SpinningTxn {
 //        }
 //    }
 
-    pub async fn end_iter_b<R>(&mut self, result: TransactionResult<R>, mut mini: Transaction
+    pub async fn end_iter_b<R>(
+        &mut self, result: TransactionResult<R>,
+        mut mini: Transaction,
+        log_msg: &str,
     ) -> Option<TiFsResult<R>> {
         match result {
             Ok(val) => {
@@ -94,10 +97,10 @@ impl SpinningTxn {
                     Err(error) => {
                         if let Some(delay) = self.backoff.next_delay_duration() {
                             sleep(delay).await;
-                            tracing::info!("retry commit failed transaction. Type: {}", std::any::type_name::<R>());
+                            tracing::info!("retry commit failed transaction. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
                             return None;
                         } else {
-                            tracing::warn!("transaction failed!");
+                            tracing::warn!("transaction failed. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
                             return Some(Err(error.into()));
                         }
                     }
@@ -105,20 +108,20 @@ impl SpinningTxn {
             }
             Err(result_err) => {
                 if let Err(error) = mini.rollback().await {
-                    tracing::error!("failed to rollback mini transaction. Err: {error:?}");
+                    tracing::error!("failed to rollback mini transaction. Err: {error:?}. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
                 }
                 match result_err {
                     TransactionError::PersistentIssue(err) => {
-                        tracing::error!("cancelling transaction retry due to persistent error. Err: {err:?}");
+                        tracing::error!("cancelling transaction retry due to persistent error. Err: {err:?}. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
                         return Some(Err(err));
                     }
                     TransactionError::TemporaryIssue(err) => {
                         if let Some(delay) = self.backoff.next_delay_duration() {
                             sleep(delay).await;
-                            tracing::info!("retry rolled back transaction. Type: {}", std::any::type_name::<R>());
+                            tracing::info!("retry rolled back transaction. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
                             return None;
                         } else {
-                            tracing::warn!("transaction failed!");
+                            tracing::warn!("transaction failed. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
                             return Some(Err(err));
                         }
                     }
@@ -205,7 +208,7 @@ impl FlexibleTransaction {
                     let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.get(key.clone()).await.map_err(|e|e.into()),
-                        mini).await { break Ok(r?); }
+                        mini, "get").await { break Ok(r?); }
                 }
             } else {
                 Ok(self.raw.get(key).await?)
@@ -228,7 +231,7 @@ impl FlexibleTransaction {
                     let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.batch_get(keys.clone()).await.map_err(|e|e.into()),
-                        mini).await { break Ok(r?.into_iter().collect::<Vec<_>>()); }
+                        mini, "batch_get").await { break Ok(r?.into_iter().collect::<Vec<_>>()); }
                 }
             } else {
                 Ok(self.raw.batch_get(keys).await?)
@@ -248,7 +251,7 @@ impl FlexibleTransaction {
                     let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.put(key.clone(), value.clone()).await.map_err(|e|e.into()),
-                        mini).await { break Ok(r?); }
+                        mini, "put").await { break Ok(r?); }
                 }
             } else {
                 Ok(self.raw.put(key, value).await?)
@@ -268,7 +271,7 @@ impl FlexibleTransaction {
                     let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.batch_mutate(mutations.clone()).await.map_err(|e|e.into()),
-                        mini).await { break Ok(r?); }
+                        mini, "batch_put").await { break Ok(r?); }
                 }
             } else {
                 Ok(self.raw.batch_put(pairs).await?)
@@ -287,7 +290,7 @@ impl FlexibleTransaction {
                     let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.delete(key.clone()).await.map_err(|e|e.into()),
-                        mini).await { break Ok(r?); }
+                        mini, "delete").await { break Ok(r?); }
                 }
             } else {
                 Ok(self.raw.delete(key).await?)
@@ -306,7 +309,7 @@ impl FlexibleTransaction {
                     let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.batch_mutate(mutations.clone()).await.map_err(|e|e.into()),
-                        mini).await { break Ok(r?); }
+                        mini, "batch_mutate").await { break Ok(r?); }
                 }
             } else {
                 let mut deletes = Vec::new();
@@ -345,8 +348,8 @@ impl FlexibleTransaction {
                 loop {
                     let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
-                        mini.scan(range.clone(), limit).await.map_err(|e|e.into())
-                        , mini).await { break Ok(r?.collect::<Vec<KvPair>>()); }
+                        mini.scan(range.clone(), limit).await.map_err(|e|e.into()),
+                        mini, "scan").await { break Ok(r?.collect::<Vec<KvPair>>()); }
                 }
             } else {
                 Ok(self.raw.scan(range, limit).await?)
@@ -370,7 +373,7 @@ impl FlexibleTransaction {
                     let mut mini = self.mini_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.scan_keys(range.clone(), limit).await.map_err(|e|e.into()),
-                        mini).await { break Ok(r?.collect::<Vec<Key>>()); }
+                        mini, "scan_keys").await { break Ok(r?.collect::<Vec<Key>>()); }
                 }
             } else {
                 Ok(self.raw.scan_keys(range, limit).await?)
