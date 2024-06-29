@@ -401,6 +401,10 @@ impl Txn {
 
         watch.sync("cached");
 
+        if uncached_block_hashes.len() == 0 {
+            return Ok(result);
+        }
+
         let uncached_blocks = self.hash_fs
             .hb_get_block_data_by_hashes(&uncached_block_hashes).await?;
 
@@ -464,6 +468,7 @@ impl Txn {
         let block_range = bs.get_range();
         let ino = fh.ino();
 
+        // 1. Remote interaction: Read existing block hashes for range:
         let hash_list_prev = self.hash_fs.inode_read_block_hashes_block_range(
             ino, block_range.clone()).await?;
         let input_block_hashes = hash_list_prev.len();
@@ -471,20 +476,21 @@ impl Txn {
 
         let mut pre_data_hash_request = HashSet::<TiFsHash>::new();
         let first_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
-            self.fs_config.clone(),
+            &self.fs_config,
             bs.first_data,
             bs.first_data_start_position,
             &hash_list_prev,
             &mut pre_data_hash_request
         );
         let last_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
-            self.fs_config.clone(),
+            &self.fs_config,
             bs.last_data,
             0,
             &hash_list_prev,
             &mut pre_data_hash_request
         );
 
+        // 2. Remote interaction: Read data of first and last block (only if needed)
         let pre_data = self.clone().hb_get_block_data_by_hashes_cached(&pre_data_hash_request).await?;
         watch.sync("pd");
         let mut new_blocks = HashMap::new();

@@ -14,7 +14,7 @@ pub struct UpdateIrregularBlock<'ol> {
 
 impl<'ol> UpdateIrregularBlock<'ol> {
     pub fn get_and_add_original_block_hash(
-        fs_config: TiFsConfig,
+        fs_config: &TiFsConfig,
         block_splitter_data: BlockIndexAndData<'ol>,
         block_splitter_data_start_position: usize,
         hash_list_prev: &BTreeMap<BlockIndex, TiFsHash>,
@@ -28,7 +28,7 @@ impl<'ol> UpdateIrregularBlock<'ol> {
         } else { None };
 
         Self {
-            fs_config,
+            fs_config: fs_config.clone(),
             block_splitter_data,
             block_splitter_data_start_position,
             original_data_hash: first_data_hash.map(|x|x.to_owned()),
