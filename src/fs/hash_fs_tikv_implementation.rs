@@ -9,7 +9,6 @@ use fuser::TimeOrNow;
 use num_bigint::BigUint;
 use strum::IntoEnumIterator;
 use tikv_client::{Key, KvPair};
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
 use uuid::Uuid;
 
 use crate::fs::hash_fs_interface::GotOrMadePure;
@@ -19,7 +18,9 @@ use crate::fs::transaction::MAX_TIKV_SCAN_LIMIT;
 use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 use super::error::FsError;
+use super::index::deserialize_json;
 use super::mini_transaction::{DeletionCheckResult, MiniTransaction};
+use super::utils::lazy_lock_map::LazyLockMap;
 use super::utils::stop_watch::AutoStopWatch;
 use super::utils::txn_data_cache::{TxnFetch, TxnPut};
 use super::{
@@ -28,7 +29,7 @@ use super::{
 use super::key::{check_file_name, InoMetadata, KeyParser, ScopedKeyBuilder, ROOT_INODE};
 use super::hash_fs_interface::{
         BlockIndex, GotOrMade, HashFsError, HashFsInterface, HashFsResult};
-use super::inode::{InoAccessTime, DirectoryItem, InoDescription, InoSize, ModificationTime, ParentStorageIno, StorageDirItem, StorageDirItemKind, InoStorageFileAttr, StorageFilePermission, StorageIno};
+use super::inode::{DirectoryItem, InoAccessTime, InoChangeIterationId, InoDescription, InoInlineData, InoSize, InoStorageFileAttr, ModificationTime, ParentStorageIno, StorageDirItem, StorageDirItemKind, StorageFilePermission, StorageIno};
 
 
 fn get_time_from_time_or_now(time: TimeOrNow) -> SystemTime {
@@ -61,7 +62,8 @@ pub struct TikvBasedHashFs {
     // these locks are used to avoid unnecessary transaction spins
     // caused by conflicts the client created itself.
     // TODO: use heartbeat to cleanup this map from invalid references.
-    pub local_ino_write_locks: Arc<RwLock<HashMap<StorageIno, Weak<RwLock<()>>>>>,
+    pub local_ino_write_size_locks: LazyLockMap<StorageIno, ()>,
+    pub local_ino_locks_full_hash: LazyLockMap<StorageIno, ()>,
 }
 
 impl TikvBasedHashFs {
@@ -71,7 +73,8 @@ impl TikvBasedHashFs {
                 weak: weak.clone(),
                 f_txn,
                 fs_config,
-                local_ino_write_locks: Arc::new(RwLock::new(HashMap::new())),
+                local_ino_write_size_locks: LazyLockMap::new(),
+                local_ino_locks_full_hash: LazyLockMap::new(),
             }
         })
     }
@@ -82,24 +85,6 @@ impl TikvBasedHashFs {
 
     pub fn key_parser<'fl>(&'fl self, i: &'fl mut std::slice::Iter<'fl, u8>) -> TiFsResult<KeyParser<'fl>> {
         KeyParser::start(i, &self.fs_config.key_prefix, self.fs_config.hash_len)
-    }
-
-    pub async fn ino_lock_get(&self, ino: StorageIno) -> Arc<RwLock<()>> {
-        let mut locks = self.local_ino_write_locks.write().await;
-        let existing_lock = locks.get(&ino).and_then(|x|x.upgrade());
-        if let Some(lock) = existing_lock {
-            lock
-        } else {
-            let lock = Arc::new(RwLock::new(()));
-            locks.insert(ino, Arc::downgrade(&lock));
-            lock
-        }
-    }
-
-    pub async fn ino_lock_lock_write(&self, ino: StorageIno) -> OwnedRwLockWriteGuard<()> {
-        let lock = self.ino_lock_get(ino).await;
-        let wl = lock.write_owned().await;
-        wl
     }
 
     async fn directory_remove_child_generic(
@@ -220,7 +205,7 @@ impl TikvBasedHashFs {
         if do_size_update {
             let mut spin = MiniTransaction::new(&self.f_txn).await?;
             loop {
-                let lock = self.ino_lock_lock_write(addr.ino).await;
+                let lock = self.local_ino_write_size_locks.lock_write(&addr.ino).await;
                 let mut started = spin.start().await?;
                 let r1 = started
                     .hb_replace_block_hash_for_address_only_size_update(
@@ -306,6 +291,45 @@ impl TikvBasedHashFs {
             let r1 = started.meta_mutable_reserve_new_ino().await;
             if let Some(r) = started.finish(r1).await { break Ok(r?); }
         }
+    }
+
+    pub async fn inode_read_metadata_multi(
+        &self,
+        ino: StorageIno,
+        elements: &[InoMetadata],
+    ) -> TiFsResult<(Vec<TiFsHash>, Vec<InoChangeIterationId>, Vec<InoSize>)> {
+        let keys = elements.iter().map(|meta|{
+            Key::from(self.key_builder().inode_x(ino, *meta).buf)
+        }).collect::<Vec<_>>();
+        let data = self.f_txn.batch_get(keys).await?;
+        let mut existing_hash = Vec::new();
+        let mut change_iter_id = Vec::new();
+        let mut size = Vec::new();
+        for KvPair(k, v) in data {
+            let key_buf: Vec<u8> = k.into();
+            let mut i = key_buf.iter();
+            match self.key_parser(&mut i)?.parse_ino()?.meta {
+                InoMetadata::FullHash => {
+                    existing_hash.push(v);
+                }
+                InoMetadata::ChangeIterationId => {
+                    let _ = deserialize_json::<InoChangeIterationId>(&v)
+                        .map_err(|err| {
+                            tracing::error!("failed to parse InoChangeIteration: {err:?}");
+                        })
+                        .map(|id| change_iter_id.push(id));
+                }
+                InoMetadata::Size => {
+                    let _ = deserialize_json::<InoSize>(&v)
+                        .map_err(|err| {
+                            tracing::error!("failed to parse InoSize: {err:?}");
+                        })
+                        .map(|s| size.push(s));
+                }
+                _ => {}
+            }
+        }
+        Ok((existing_hash, change_iter_id, size))
     }
 }
 
@@ -601,8 +625,8 @@ impl HashFsInterface for TikvBasedHashFs {
     }
 
     async fn inode_read_inline_data(&self, ino: StorageIno) -> HashFsResult<Vec<u8>> {
-        let ino_size: Arc<InoSize> = self.f_txn.fetch(&ino).await?;
-        ino_size.inline_data().cloned().ok_or(HashFsError::InodeHasNoInlineData)
+        let ino_inline_data: Arc<InoInlineData> = self.f_txn.fetch(&ino).await?;
+        Ok(ino_inline_data.inlined.clone())
     }
 
     async fn inode_read_block_hashes_data_range(
@@ -657,17 +681,21 @@ impl HashFsInterface for TikvBasedHashFs {
 
             let do_size_update = true;
             if do_size_update {
-                let mut spin = MiniTransaction::new(&self.f_txn).await?;
-                loop {
-                    let lock = self.ino_lock_lock_write(addr.ino).await;
-                    let mut started = spin.start().await?;
-                    let r1 = started
-                        .hb_replace_block_hash_for_address_only_size_update(
-                            &addr, blocks_size).await;
-                    if let Some(result) = started.finish(
-                        r1).await { break result?; }
-                    drop(lock);
-                };
+                let size_peek_arc: Arc<InoSize> = self.f_txn.fetch(&addr.ino).await?;
+                let mut size_peek = size_peek_arc.deref().clone();
+                if size_peek.block_write_size_update(&addr, self.fs_config.block_size, blocks_size) {
+                    let mut spin = MiniTransaction::new(&self.f_txn).await?;
+                    loop {
+                        let lock = self.local_ino_write_size_locks.lock_write(&addr.ino).await;
+                        let mut started = spin.start().await?;
+                        let r1 = started
+                            .hb_replace_block_hash_for_address_only_size_update(
+                                &addr, blocks_size).await;
+                        if let Some(result) = started.finish(
+                            r1).await { break result?; }
+                        drop(lock);
+                    };
+                }
             }
 
             watch.sync("size_update");
@@ -697,10 +725,35 @@ impl HashFsInterface for TikvBasedHashFs {
 
     async fn file_get_hash(&self, ino: StorageIno) -> HashFsResult<Vec<u8>>
     {
-        let mut ino_size_arc: Arc<InoSize> = self.f_txn.fetch(&ino).await?;
-        while ino_size_arc.data_hash.is_none() {
-            let change_iteration = ino_size_arc.change_iteration;
-            let size_in_blocks = ino_size_arc.size().div_ceil(self.fs_config.block_size);
+        loop {
+            let (hash, _, _)
+                = self.inode_read_metadata_multi(ino, &[InoMetadata::FullHash]).await?;
+
+            if let Some(hash) = hash.into_iter().next()  {
+                return Ok(hash);
+            }
+
+            // avoid multiple times hash computation (at least on the same instance)
+            let lock = self.local_ino_locks_full_hash.lock_write(&ino).await;
+
+            let (hash, iter, size)
+                = self.inode_read_metadata_multi(ino, &[
+                    InoMetadata::FullHash,
+                    InoMetadata::ChangeIterationId,
+                    InoMetadata::Size,
+                    ]).await?;
+
+            if let Some(hash) = hash.into_iter().next() {
+                return Ok(hash);
+            }
+
+            let Some(size) = size.into_iter().next() else {
+                return Err(HashFsError::FileNotFound);
+            };
+
+            let change_iter_id = iter.into_iter().next().unwrap_or_default();
+
+            let size_in_blocks = size.size().div_ceil(self.fs_config.block_size);
             let block_range = BlockIndex(0)..BlockIndex(
                 size_in_blocks * self.fs_config.hash_len as u64);
             let hash_data = self.read_hashes_of_file(ino, block_range).await?;
@@ -711,16 +764,15 @@ impl HashFsInterface for TikvBasedHashFs {
             let result = loop {
                 let mut mini = spin.start().await?;
                 let r1 = mini.checked_write_of_file_hash(
-                    &ino, change_iteration, new_full_hash.clone()).await;
+                    &ino, &change_iter_id, new_full_hash.clone()).await;
                 if let Some(r) = mini.finish(r1).await { break r?; }
             };
+            drop(lock);
 
-            if let Some(new_ino_size) = result {
-                ino_size_arc = new_ino_size;
+            if result {
+                return Ok(new_full_hash);
             }
         }
-
-        Ok(ino_size_arc.data_hash.to_owned().unwrap())
     }
 
     async fn file_read_block_hashes(&self, ino: StorageIno, block_range: Range<BlockIndex>

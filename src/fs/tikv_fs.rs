@@ -37,6 +37,7 @@ use super::reply::{
 };
 use super::transaction::{Txn, TxnArc};
 use super::transaction_client_mux::TransactionClientMux;
+use super::utils::lazy_lock_map::LazyLockMap;
 use super::utils::txn_data_cache::TxnDataCache;
 
 pub type TiFsBlockCache = Cache<TiFsHash, Arc<Vec<u8>>>;
@@ -112,21 +113,7 @@ pub struct TiFsCaches {
     pub inode_atime: TxnDataCache<StorageIno, InoAccessTime>,
     pub inode_mtime: TxnDataCache<StorageIno, ModificationTime>,
     pub inode_attr: TxnDataCache<StorageIno, InoStorageFileAttr>,
-    pub ino_locks: Arc<RwLock<HashMap<StorageIno, Weak<RwLock<()>>>>>,
-}
-
-impl TiFsCaches {
-    pub async fn get_or_create_ino_lock(&self, ino: StorageIno) -> Arc<RwLock<()>> {
-        let mut locks = self.ino_locks.write().await;
-        let existing_lock = locks.get(&ino).and_then(|x|x.upgrade());
-        if let Some(lock) = existing_lock {
-            lock
-        } else {
-            let lock = Arc::new(RwLock::new(()));
-            locks.insert(ino, Arc::downgrade(&lock));
-            lock
-        }
-    }
+    pub ino_locks: Arc<LazyLockMap<StorageIno, ()>>,
 }
 
 pub struct TiFsMutable {
@@ -154,7 +141,7 @@ impl TiFsMutable {
                 inode_mtime: TxnDataCache::new(ino_cache_size, Duration::from_secs(5)),
                 inode_attr: TxnDataCache::new(ino_cache_size, Duration::from_secs(30)),
                 inode_lock_state: TxnDataCache::new(ino_cache_size, Duration::from_secs(2)),
-                ino_locks: Arc::new(RwLock::new(HashMap::new())),
+                ino_locks: Arc::new(LazyLockMap::new()),
             }
         }
     }
@@ -336,8 +323,7 @@ impl TiFs {
         let active_file_handlers = mut_data.file_handlers.len();
         let opened_inos = mut_data.opened_ino.len();
         drop(mut_data);
-        let ino_locks = caches.ino_locks.try_read()?;
-        trace!("ino locks({}): {:?}", ino_locks.len(), ino_locks);
+        caches.ino_locks.print_statistics();
         trace!("active file handlers, inos: {}, {}", active_file_handlers, opened_inos);
         Ok(())
     }
@@ -349,10 +335,7 @@ impl TiFs {
             w.upgrade().is_some()
         });
         drop(mut_data);
-        let mut ino_locks = caches.ino_locks.try_write()?;
-        ino_locks.retain(|_k,w|{
-            w.upgrade().is_some()
-        });
+        caches.ino_locks.cleanup();
         Ok(())
     }
 

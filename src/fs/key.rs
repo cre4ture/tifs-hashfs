@@ -10,7 +10,7 @@ use strum::{EnumIter, IntoEnumIterator};
 
 use super::error::TiFsResult;
 use super::hash_fs_interface::BlockIndex;
-use super::inode::{InoAccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItem, InoStorageFileAttr, StorageIno};
+use super::inode::{InoAccessTime, InoChangeIterationId, InoDescription, InoFullHash, InoInlineData, InoLockState, InoSize, InoStorageFileAttr, ModificationTime, ParentStorageIno, StorageDirItem, StorageIno};
 use super::meta::{MetaMutable, MetaStatic};
 use super::reply::LogicalIno;
 use super::tikv_fs::InoUse;
@@ -85,6 +85,9 @@ pub enum InoMetadata {
     AccessTime,
     ModificationTime,
     Opened,
+    FullHash,
+    ChangeIterationId, // uuid, not counter
+    InlineData,
 }
 
 lazy_static!{
@@ -659,6 +662,24 @@ impl KeyGenerator<StorageIno, InoUse> for ScopedKeyBuilder {
 impl KeyGenerator<StorageIno, InoStorageFileAttr> for ScopedKeyBuilder {
     fn generate_key(self, k: &StorageIno) -> KeyBuffer {
         self.inode_x(*k, InoMetadata::UnixAttributes).buf
+    }
+}
+
+impl KeyGenerator<StorageIno, InoChangeIterationId> for ScopedKeyBuilder {
+    fn generate_key(self, k: &StorageIno) -> KeyBuffer {
+        self.inode_x(*k, InoMetadata::ChangeIterationId).buf
+    }
+}
+
+impl KeyGenerator<StorageIno, InoFullHash> for ScopedKeyBuilder {
+    fn generate_key(self, k: &StorageIno) -> KeyBuffer {
+        self.inode_x(*k, InoMetadata::FullHash).buf
+    }
+}
+
+impl KeyGenerator<StorageIno, InoInlineData> for ScopedKeyBuilder {
+    fn generate_key(self, k: &StorageIno) -> KeyBuffer {
+        self.inode_x(*k, InoMetadata::InlineData).buf
     }
 }
 

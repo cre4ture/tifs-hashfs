@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::fs::{inode::ParentStorageIno, meta::MetaMutable};
 
-use super::{dir::StorageDirectory, error::{FsError, TiFsResult}, hash_fs_interface::GotOrMade, inode::{DirectoryItem, TiFsHash}, key::{BlockAddress, HashedBlockMeta, OPENED_INODE_PARENT_INODE}, transaction::MAX_TIKV_SCAN_LIMIT, utils::txn_data_cache::{TxnDeleteMut, TxnFetchMut, TxnPutMut}};
+use super::{dir::StorageDirectory, error::{FsError, TiFsResult}, hash_fs_interface::GotOrMade, inode::{DirectoryItem, InoChangeIterationId, InoFullHash, InoInlineData, TiFsHash}, key::{BlockAddress, HashedBlockMeta, OPENED_INODE_PARENT_INODE}, transaction::MAX_TIKV_SCAN_LIMIT, utils::txn_data_cache::{TxnDeleteMut, TxnFetchMut, TxnPutMut}};
 use super::index::{deserialize_json, serialize_json};
 use super::fs_config::TiFsConfig;
 use super::flexible_transaction::{FlexibleTransaction, SpinningTxn, TransactionError, TransactionResult};
@@ -257,8 +257,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
             creation_time: SystemTime::now(),
             typ,
         });
-        let mut i_size = InoSize::new();
-        inline_data.map(|data| i_size.set_inline_data(data));
+        let i_size = InoSize::new();
         let ino_size = Arc::new(i_size);
         let ino_attr = Arc::new(InoStorageFileAttr{
             perm,
@@ -276,6 +275,14 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         let item = Arc::new(StorageDirItem { ino: new_ino, typ });
         self.put(&(parent, name.as_bytes().deref()), item.clone()).await?;
         self.put(&(new_ino, parent, name.as_bytes().deref()), Arc::new(())).await?;
+
+        if let Some(data) = inline_data {
+            self.put(&new_ino, Arc::new(InoInlineData{
+                inlined: data,
+                last_change: SystemTime::now(),
+            })).await?;
+        }
+
         Ok(GotOrMade::NewlyCreated(item.deref().clone()))
     }
 
@@ -417,18 +424,18 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
     }
 
     pub async fn checked_write_of_file_hash(
-        &mut self, ino: &StorageIno, change_iteration: u64, new_full_hash: TiFsHash
-    ) -> TiFsResult<Option<Arc<InoSize>>> {
-        let mut ino_size_arc: Arc<InoSize> = self.fetch(ino).await?;
+        &mut self,
+        ino: &StorageIno,
+        change_iteration: &InoChangeIterationId,
+        new_full_hash: TiFsHash,
+    ) -> TiFsResult<bool> {
+        let ino_change_id: Arc<InoChangeIterationId> = self.fetch(ino).await?;
         // was data changed in the meantime?
-        if ino_size_arc.change_iteration == change_iteration {
-            let mut ino_data_mut = ino_size_arc.deref().clone();
-            ino_data_mut.data_hash = Some(new_full_hash);
-            ino_size_arc = Arc::new(ino_data_mut);
-            self.put(ino, ino_size_arc.clone()).await?;
-            Ok(Some(ino_size_arc))
+        if ino_change_id.as_ref() == change_iteration {
+            self.put(ino, Arc::new(InoFullHash(new_full_hash))).await?;
+            Ok(true)
         } else {
-            Ok(None)
+            Ok(false)
         }
     }
 
@@ -443,10 +450,6 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         let target_size = (offset + length) as u64;
         if target_size <= ino_size.size() {
             return Ok(());
-        }
-
-        if ino_size.inline_data().is_some() {
-            return Err(FsError::WrongFileType);
         }
 
         ino_size.set_size(target_size, self.fs_config().block_size);
@@ -480,6 +483,12 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         } else {
             self.mini.delete(key.clone()).await?;
         }
+        let full_hash_key = self.key_builder().inode_x(
+            addr.ino, super::key::InoMetadata::FullHash).buf;
+        // clear full file hash:
+        self.mini.delete(full_hash_key).await?;
+        // change change iter id:
+        self.put(&addr.ino, Arc::new(InoChangeIterationId::random())).await?;
         Ok(prev_block_hash)
     }
 
@@ -488,19 +497,11 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         addr: &BlockAddress,
         new_blocks_actual_size: u64
     ) -> TiFsResult<()> {
-        let mut changed = false;
         let ino_size_arc: Arc<InoSize> = self.fetch(&addr.ino).await?;
         let mut ino_size = ino_size_arc.deref().clone();
-        let target_size = addr.index.0 * self.fs_config().block_size + new_blocks_actual_size;
-        if target_size > ino_size.size() {
-            ino_size.set_size(target_size, self.fs_config().block_size);
-            changed = true;
-        }
-        if let Some(_prev_full_data_hash) = ino_size.data_hash.take() {
-            changed = true;
-        }
-        if changed {
-            ino_size.change_iteration += 1;
+        let was_changed = ino_size.block_write_size_update(
+            addr, self.fs_config().block_size, new_blocks_actual_size);
+        if was_changed {
             self.put(&addr.ino, Arc::new(ino_size)).await?;
         }
         Ok(())

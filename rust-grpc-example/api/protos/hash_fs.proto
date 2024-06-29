@@ -120,10 +120,10 @@ message InoStorageFileAttr {
 message InoSize {
   uint64 size = 1;
   uint64 blocks = 2;
-  bytes inline_data = 3;
-  bytes data_hash = 4;
+  // bytes inline_data = 3;
+  // bytes data_hash = 4;
   google.protobuf.Timestamp last_change = 5;
-  uint64 change_iteration = 6;
+  // uint64 change_iteration = 6;
 }
 
 message InoAccessTime {

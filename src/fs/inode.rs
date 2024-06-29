@@ -4,6 +4,9 @@ use std::time::SystemTime;
 
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::key::BlockAddress;
 
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -98,14 +101,63 @@ impl InoDescription {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct InoChangeIterationId(pub Uuid);
+
+impl InoChangeIterationId {
+    pub fn random() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InoFullHash(pub TiFsHash);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InoInlineData{
+    pub inlined: Vec<u8>,
+    pub last_change: SystemTime,
+}
+
+impl InoInlineData {
+    pub async fn write_into_inline_data(
+        &mut self,
+        start: u64,
+        data: &[u8],
+    ) -> () {
+        let size = data.len();
+        let start = start as usize;
+
+        if start + size > self.inlined.len() {
+            self.inlined.resize(start + size, 0);
+        }
+        self.inlined[start..start + size].copy_from_slice(data);
+
+        self.last_change = SystemTime::now();
+    }
+
+    pub async fn read_from_inline_data(
+        &mut self,
+        start: u64,
+        size: u64,
+    ) -> Vec<u8> {
+        let start = start as usize;
+        let size = size as usize;
+
+        let mut data = Vec::with_capacity(size);
+        if self.inlined.len() > start {
+            let to_copy = size.min(self.inlined.len() - start);
+            data.extend_from_slice(&self.inlined[start..start + to_copy]);
+        }
+        data
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InoSize {
     pub size: u64,
     pub blocks: u64,
-    pub inline_data: Option<Vec<u8>>,
-    pub data_hash: Option<TiFsHash>,
     pub last_change: SystemTime,
-    pub change_iteration: u64,
 }
 
 impl InoSize {
@@ -113,10 +165,7 @@ impl InoSize {
         Self {
             size: 0,
             blocks: 0,
-            inline_data: None,
-            data_hash: None,
             last_change: SystemTime::now(),
-            change_iteration: 0,
         }
     }
 
@@ -136,61 +185,25 @@ impl InoSize {
         if self.size != size {
             self.size = size;
             self.update_blocks(block_size);
-            self.data_hash = None;
+            self.last_change = SystemTime::now();
         }
     }
 
-    pub fn inline_data(&self) -> Option<&Vec<u8>> {
-        self.inline_data.as_ref()
-    }
-
-    pub fn take_inline_data(&mut self) -> Option<Vec<u8>> {
-        self.data_hash = None;
-        self.inline_data.take()
-    }
-
-    pub fn set_inline_data(&mut self, data: Vec<u8>) {
-        self.inline_data = Some(data);
-        self.data_hash = None;
-    }
-
-    pub async fn write_into_inline_data(
+    pub fn block_write_size_update(
         &mut self,
-        start: u64,
-        data: &[u8],
-        block_size: u64,
-    ) -> () {
-        let size = data.len();
-        let start = start as usize;
-
-        let mut inlined = self.take_inline_data().unwrap_or_else(Vec::new);
-        if start + size > inlined.len() {
-            inlined.resize(start + size, 0);
+        addr: &BlockAddress,
+        fs_block_size: u64,
+        new_blocks_actual_size: u64
+    ) -> bool {
+        let target_size = addr.index.0 * fs_block_size + new_blocks_actual_size;
+        if target_size <= self.size() {
+            return false;
         }
-        inlined[start..start + size].copy_from_slice(data);
 
+        self.set_size(target_size, fs_block_size);
         self.last_change = SystemTime::now();
-        self.set_size(inlined.len() as u64, block_size);
-        self.set_inline_data(inlined);
-    }
 
-    pub async fn read_from_inline_data(
-        &mut self,
-        start: u64,
-        size: u64,
-    ) -> Vec<u8> {
-        let start = start as usize;
-        let size = size as usize;
-
-        let inlined = self.inline_data().unwrap();
-        debug_assert!(self.size() as usize == inlined.len());
-
-        let mut data = Vec::with_capacity(size);
-        if inlined.len() > start {
-            let to_copy = size.min(inlined.len() - start);
-            data.extend_from_slice(&inlined[start..start + to_copy]);
-        }
-        data
+        true
     }
 
 }

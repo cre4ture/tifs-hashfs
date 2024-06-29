@@ -1,7 +1,7 @@
 #![feature(duration_constructors)]
 
 use std::ops::Range;
-use std::{convert::TryInto, mem, time::SystemTime};
+use std::{convert::TryInto, time::SystemTime};
 
 use fuser::TimeOrNow;
 use num_bigint::BigUint;
@@ -267,19 +267,12 @@ impl From<InoStorageFileAttr> for grpc::hash_fs::InoStorageFileAttr {
 }
 
 impl From<grpc::hash_fs::InoSize> for InoSize {
-    fn from(mut val: grpc::hash_fs::InoSize) -> Self {
-        let inline_data = (val.inline_data.len() > 0)
-            .then(||mem::take(&mut val.inline_data));
-        let data_hash = (val.data_hash.len() > 0)
-            .then(||mem::take(&mut val.data_hash));
+    fn from(val: grpc::hash_fs::InoSize) -> Self {
         InoSize{
             size: val.size,
             blocks: val.blocks,
-            inline_data,
-            data_hash,
             last_change: grpc_time_opt_to_system_time(
                 &val.last_change),
-            change_iteration: val.change_iteration,
         }
     }
 }
@@ -289,10 +282,7 @@ impl From<InoSize> for grpc::hash_fs::InoSize {
         let mut o = Self::default();
         o.size = val.size();
         o.blocks = val.blocks();
-        o.inline_data = val.inline_data.unwrap_or_default();
-        o.data_hash = val.data_hash.unwrap_or_default();
         o.last_change = Some(val.last_change.into());
-        o.change_iteration = val.change_iteration;
         o
     }
 }

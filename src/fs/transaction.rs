@@ -574,14 +574,6 @@ impl Txn {
         Ok(size)
     }
 
-    pub fn set_fresh_inode_to_link(
-        block_size: u64,
-        ino_size: &mut InoSize,
-        data: Bytes) {
-        ino_size.set_inline_data(data.to_vec());
-        ino_size.set_size(data.len() as u64, block_size);
-    }
-
     pub async fn read_link(self: TxnArc, ino: StorageIno) -> TiFsResult<Vec<u8>> {
         Ok(self.hash_fs.inode_read_inline_data(ino).await?)
     }
