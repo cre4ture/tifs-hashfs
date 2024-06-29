@@ -645,14 +645,12 @@ impl HashFsInterface for TikvBasedHashFs {
             let addr = BlockAddress{ ino, index };
             let mut spin = MiniTransaction::new(&self.f_txn).await?;
             let prev_hash = loop {
-                let lock = self.ino_lock_lock_write(ino).await;
                 let mut started = spin.start().await?;
                 let r1 = started
                     .hb_replace_block_hash_for_address_no_size_update(
                         &addr, Some(&block_hash)).await;
                 if let Some(result) = started.finish(r1).await
                 { break result?; }
-                drop(lock);
             };
 
             watch.sync("replace");
