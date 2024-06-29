@@ -43,7 +43,7 @@ impl AsyncFileSystem for TiFs {
 
         let _r = arc.spin_no_delay(format!("init"), move |_fs, txn| {
                 Box::pin(async move {
-                    Ok(txn.f_txn.init(gid, uid).await?)
+                    Ok(txn.hash_fs.init(gid, uid).await?)
                 })
             })
             .await?;
@@ -457,7 +457,7 @@ impl AsyncFileSystem for TiFs {
             let name = raw_name.clone();
             let new_name = new_raw_name.clone();
             Box::pin(async move {
-                txn.f_txn.directory_rename_child(
+                txn.hash_fs.directory_rename_child(
                     ParentStorageIno(p_ino.storage_ino()),
                     name,
                     ParentStorageIno(np_ino.storage_ino()),
@@ -484,7 +484,7 @@ impl AsyncFileSystem for TiFs {
             let name = name_clone1.clone();
             let link_data_vec = link.clone();
             Box::pin(async move {
-                Ok(txn.f_txn.directory_add_new_symlink(
+                Ok(txn.hash_fs.directory_add_new_symlink(
                     gid, uid, ParentStorageIno(p_ino.storage_ino()), name, link_data_vec.clone()).await?)
             })
         }).await?;

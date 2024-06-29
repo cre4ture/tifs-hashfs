@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let matches = clap::builder::Command::new("hashfs-tikv-server")
         .version(crate_version!())
-        .author("Hexi Lee")
+        .author("Hexi Lee, Ulrich Hornung")
         .arg(
             Arg::new("device")
                 .value_name("ENDPOINTS")

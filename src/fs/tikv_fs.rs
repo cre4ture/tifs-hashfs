@@ -653,7 +653,7 @@ impl TiFs {
             move |_, txn| {
                 let name = name.clone();
                 Box::pin(async move {
-                    Ok(txn.f_txn.directory_child_get_all_attributes(parent, name).await?)
+                    Ok(txn.hash_fs.directory_child_get_all_attributes(parent, name).await?)
                 })
             }).await?;
         let stat = self.map_storage_attr_to_fuser(
@@ -672,7 +672,7 @@ impl TiFs {
             move |_, txn| {
                 let name = name.clone();
                 Box::pin(async move {
-                    Ok(txn.f_txn.directory_child_get_all_attributes(parent, name).await?)
+                    Ok(txn.hash_fs.directory_child_get_all_attributes(parent, name).await?)
                 })
             }).await?;
         let stat = self.map_storage_attr_to_fuser(

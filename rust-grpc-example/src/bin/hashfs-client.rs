@@ -12,14 +12,14 @@ async fn main() -> anyhow::Result<()> {
                 .try_init()
                 .map_err(|err| anyhow::anyhow!("fail to init tracing subscriber: {}", err))?;
 
-    let matches = clap::builder::Command::new("hashfs-tikv-server")
+    let matches = clap::builder::Command::new("hashfs-client")
         .version(clap::crate_version!())
-        .author("Hexi Lee")
+        .author("Hexi Lee, Ulrich Hornung")
         .arg(
             Arg::new("device")
                 .value_name("ENDPOINTS")
                 .required(true)
-                .help("all pd endpoints of the tikv cluster, separated by commas (e.g. tifs:127.0.0.1:2379)")
+                .help("all pd endpoints of the tikv cluster, separated by commas (e.g. hash-fs:http://127.0.0.1:50051)")
                 .index(1)
                 .action(ArgAction::Append)
         )

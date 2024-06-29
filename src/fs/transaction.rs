@@ -78,7 +78,7 @@ impl HashedBlockMetaData {
 pub struct Txn {
     pub weak: Weak<Self>,
     _instance_id: Uuid,
-    pub f_txn: Arc<dyn HashFsInterface>,
+    pub hash_fs: Arc<dyn HashFsInterface>,
     fs_config: TiFsConfig,
     block_size: u64,            // duplicate of fs_config.block_size. Keep it to avoid refactoring efforts.
     caches: TiFsCaches,
@@ -113,7 +113,7 @@ impl Txn {
         Ok(TxnArc::new_cyclic(|weak| { Self {
                 weak: weak.clone(),
                 _instance_id: instance_id,
-                f_txn: hash_fs,
+                hash_fs,
                 fs_config: fs_config.clone(),
                 block_size: fs_config.block_size,
                 caches,
@@ -172,11 +172,11 @@ impl Txn {
 //    }
 
     pub async fn open(self: Arc<Self>, ino: StorageIno) -> TiFsResult<Uuid> {
-        Ok(self.f_txn.inode_open(ino).await?)
+        Ok(self.hash_fs.inode_open(ino).await?)
     }
 
     pub async fn close(self: Arc<Self>, ino: StorageIno, use_id: Uuid) -> TiFsResult<()> {
-       Ok(self.f_txn.inode_close(ino, use_id).await?)
+       Ok(self.hash_fs.inode_close(ino, use_id).await?)
     }
 
     #[instrument(skip(self))]
@@ -191,7 +191,7 @@ impl Txn {
             return Ok(vec![]);
         }
 
-        let the_hash = self.f_txn.file_get_hash(ino).await?;
+        let the_hash = self.hash_fs.file_get_hash(ino).await?;
 
         trace!("precalculated_hash: {the_hash:x?}");
         let mut result = Vec::with_capacity(self.fs_config.hash_len);
@@ -209,7 +209,7 @@ impl Txn {
         name: &ByteString,
         ino: &StorageIno
     ) -> TiFsResult<()> {
-        self.f_txn.directory_add_child_checked_existing_inode(
+        self.hash_fs.directory_add_child_checked_existing_inode(
             parent,
             name.clone(),
             *ino,
@@ -228,23 +228,23 @@ impl Txn {
         rdev: u32,
         inline_data: Option<Vec<u8>>,
     ) -> TiFsResult<GotOrMade<StorageDirItem>> {
-        self.f_txn.directory_add_child_checked_new_inode(
+        self.hash_fs.directory_add_child_checked_new_inode(
             parent, name, typ, perm, gid, uid, rdev, inline_data).await.map_err(|e|e.into())
     }
 
     #[tracing::instrument(skip(self))]
     pub async fn directory_remove_child(self: TxnArc, parent: ParentStorageIno, name: ByteString) -> TiFsResult<()> {
-        Ok(self.f_txn.directory_remove_child_file(parent, name).await?)
+        Ok(self.hash_fs.directory_remove_child_file(parent, name).await?)
     }
 
     pub async fn read_static_meta(self: TxnArc) -> TiFsResult<Option<MetaStatic>> {
-        Ok(Some(self.f_txn.as_ref().meta_static_read().await?))
+        Ok(Some(self.hash_fs.as_ref().meta_static_read().await?))
     }
 
     async fn hb_read_data(self: TxnArc, ino: StorageIno, start: u64, chunk_size: Option<u64>) -> TiFsResult<Vec<u8>> {
 
         let size = chunk_size.unwrap_or(self.fs_config.block_size);
-        let block_hashes = self.f_txn.inode_read_block_hashes_data_range(ino, start, size).await?;
+        let block_hashes = self.hash_fs.inode_read_block_hashes_data_range(ino, start, size).await?;
 
         //tracing::debug!("block_hashes(count: {}): {:?}", block_hashes.len(), block_hashes);
         let block_hashes_set = HashSet::from_iter(block_hashes.values().cloned());
@@ -401,7 +401,7 @@ impl Txn {
 
         watch.sync("cached");
 
-        let uncached_blocks = self.f_txn
+        let uncached_blocks = self.hash_fs
             .hb_get_block_data_by_hashes(&uncached_block_hashes).await?;
 
         for (hash, value) in &uncached_blocks {
@@ -436,17 +436,17 @@ impl Txn {
         data: Vec<u8>,
         block_ids: Vec<BlockIndex>,
     ) -> TiFsResult<()> {
-        let previous_reference_count = self.f_txn.hb_increment_reference_count(
+        let previous_reference_count = self.hash_fs.hb_increment_reference_count(
             &block_hash, ref_count_delta).await?;
 
         let block_len = data.len() as u64;
 
         // Upload block if new
         if previous_reference_count == BigUint::from_u8(0).unwrap() {
-            self.f_txn.hb_upload_new_block(block_hash.clone(), data).await?;
+            self.hash_fs.hb_upload_new_block(block_hash.clone(), data).await?;
         }
 
-        self.f_txn.inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
+        self.hash_fs.inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
             ino, block_hash, block_len, block_ids).await?;
 
         Ok(())
@@ -464,7 +464,7 @@ impl Txn {
         let block_range = bs.get_range();
         let ino = fh.ino();
 
-        let hash_list_prev = self.f_txn.inode_read_block_hashes_block_range(
+        let hash_list_prev = self.hash_fs.inode_read_block_hashes_block_range(
             ino, block_range.clone()).await?;
         let input_block_hashes = hash_list_prev.len();
         watch.sync("hp");
@@ -570,7 +570,7 @@ impl Txn {
     }
 
     pub async fn read_link(self: TxnArc, ino: StorageIno) -> TiFsResult<Vec<u8>> {
-        Ok(self.f_txn.inode_read_inline_data(ino).await?)
+        Ok(self.hash_fs.inode_read_inline_data(ino).await?)
     }
 
     pub async fn add_hard_link(
@@ -579,7 +579,7 @@ impl Txn {
         further_parent: ParentStorageIno,
         new_name: ByteString,
     ) -> TiFsResult<()> {
-        Ok(self.f_txn.directory_add_child_checked_existing_inode(
+        Ok(self.hash_fs.directory_add_child_checked_existing_inode(
             further_parent, new_name, ino).await?)
     }
 
@@ -595,12 +595,12 @@ impl Txn {
     }
 
     pub async fn rmdir(self: TxnArc, parent: ParentStorageIno, name: ByteString) -> TiFsResult<()> {
-        Ok(self.f_txn.directory_remove_child_directory(parent, name).await?)
+        Ok(self.hash_fs.directory_remove_child_directory(parent, name).await?)
     }
 
     pub async fn get_all_ino_data(self: TxnArc, ino: StorageIno,
     ) -> TiFsResult<(Arc<InoDescription>, Arc<InoStorageFileAttr>, Arc<InoSize>, InoAccessTime)> {
-        Ok(self.f_txn.inode_get_all_attributes(ino).await?)
+        Ok(self.hash_fs.inode_get_all_attributes(ino).await?)
     }
 
     pub async fn set_attributes(
@@ -621,7 +621,7 @@ impl Txn {
     ) -> TiFsResult<()> {
         let mode_conv = mode.map(|m| StorageFilePermission(
             as_file_perm(m)));
-        Ok(self.f_txn.inode_set_all_attributes(
+        Ok(self.hash_fs.inode_set_all_attributes(
             ino, mode_conv, uid, gid, size, atime, mtime, ctime,
             crtime, chgtime, bkuptime, flags).await?)
     }
@@ -633,7 +633,7 @@ impl Txn {
         offset: i64,
         length: i64
     ) -> TiFsResult<()> {
-        Ok(self.f_txn.inode_allocate_size(ino, offset, length).await?)
+        Ok(self.hash_fs.inode_allocate_size(ino, offset, length).await?)
     }
 
     pub async fn mkdir(
@@ -656,7 +656,7 @@ impl Txn {
     }
 
     pub async fn read_dir(self: Arc<Self>, ino: StorageIno) -> TiFsResult<StorageDirectory> {
-        Ok(self.f_txn.directory_read_children(ino).await?)
+        Ok(self.hash_fs.directory_read_children(ino).await?)
     }
 
     pub async fn statfs(self: TxnArc) -> TiFsResult<StatFs> {
@@ -770,7 +770,7 @@ impl Txn {
         ino: StorageIno,
         block_range: Range<BlockIndex>
     ) -> TiFsResult<Vec<u8>> {
-        Ok(self.f_txn.file_read_block_hashes(ino, block_range).await?)
+        Ok(self.hash_fs.file_read_block_hashes(ino, block_range).await?)
     }
 }
 
