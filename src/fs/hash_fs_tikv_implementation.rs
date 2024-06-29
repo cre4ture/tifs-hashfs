@@ -20,6 +20,7 @@ use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 use super::error::FsError;
 use super::mini_transaction::{DeletionCheckResult, MiniTransaction};
+use super::utils::stop_watch::AutoStopWatch;
 use super::utils::txn_data_cache::{TxnFetch, TxnPut};
 use super::{
     error::TiFsResult, flexible_transaction::FlexibleTransaction, fs_config::TiFsConfig, meta::MetaStatic
@@ -637,6 +638,8 @@ impl HashFsInterface for TikvBasedHashFs {
         blocks_size: u64,
         addresses: Vec<BlockIndex>,
     ) -> HashFsResult<()> {
+        let mut watch = AutoStopWatch::start("pm_register");
+
         let mut decrement_cnts = HashMap::<TiFsHash, u64>::new();
         for index in addresses {
             let addr = BlockAddress{ ino, index };
@@ -652,6 +655,8 @@ impl HashFsInterface for TikvBasedHashFs {
                 drop(lock);
             };
 
+            watch.sync("replace");
+
             let do_size_update = true;
             if do_size_update {
                 let mut spin = MiniTransaction::new(&self.f_txn).await?;
@@ -666,6 +671,8 @@ impl HashFsInterface for TikvBasedHashFs {
                     drop(lock);
                 };
             }
+
+            watch.sync("size_update");
 
             if let Some(pre_hash) = prev_hash {
                 decrement_cnts.insert(pre_hash.clone(),
@@ -683,6 +690,8 @@ impl HashFsInterface for TikvBasedHashFs {
                 if let Some(result) = started.finish(r1).await
                 { break result?; }
             }
+
+            watch.sync("dec");
         }
 
         Ok(())

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 pub mod grpc;
 pub mod hash_fs;
+pub mod utils;
 
 impl From<StorageIno> for grpc::hash_fs::StorageIno {
     fn from(value: StorageIno) -> Self {

@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
-use std::ops::{Deref, DerefMut, Range};
-use std::sync::{Arc, RwLock};
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytestring::ByteString;
@@ -9,6 +9,7 @@ use fuser::TimeOrNow;
 use num_bigint::BigUint;
 
 use crate::grpc::hash_fs::{self as grpc_fs, InitRq, MetaStaticReadRq};
+use crate::utils::object_pool::{HandedOutPoolElement, Pool};
 use tifs::fs::hash_fs_interface::{BlockIndex, GotOrMade, HashFsError, HashFsInterface, HashFsResult};
 use tifs::fs::inode::{DirectoryItem, InoAccessTime, InoDescription, InoSize, InoStorageFileAttr, ParentStorageIno, StorageDirItem, StorageDirItemKind, StorageFilePermission, StorageIno, TiFsHash};
 use tifs::fs::meta::MetaStatic;
@@ -52,72 +53,6 @@ fn parse_all_attrs(
         Arc::new(size.into()),
         atime.into(),
     ))
-}
-
-pub struct Pool<T> {
-    free: std::sync::RwLock<VecDeque<T>>,
-    counter: RwLock<u64>,
-}
-
-pub struct HandedOutPoolElement<'pool, T> {
-    pool: &'pool Pool<T>,
-    element: Option<T>,
-}
-
-impl<'pool, T> HandedOutPoolElement<'pool, T> {
-    pub fn new(pool: &'pool Pool<T>, element: T) -> Self {
-        Self {
-            pool,
-            element: Some(element),
-        }
-    }
-}
-
-impl<'pool, T> Drop for HandedOutPoolElement<'pool, T> {
-    fn drop(&mut self) {
-        if let Some(element) = self.element.take() {
-            self.pool.free.write().unwrap().push_back(element);
-        }
-    }
-}
-
-impl<'pool, T> Deref for HandedOutPoolElement<'pool, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        self.element.as_ref().unwrap()
-    }
-}
-
-impl<'pool, T> DerefMut for HandedOutPoolElement<'pool, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.element.as_mut().unwrap()
-    }
-}
-
-impl<T> Pool<T> {
-    pub fn new() -> Self {
-        Self {
-            free: VecDeque::new().into(),
-            counter: RwLock::new(0),
-        }
-    }
-
-    pub fn add_new_busy_to_pool<'pool>(&'pool self, new_busy_element: T) -> HandedOutPoolElement<'pool, T> {
-        let mut counter_lock = self.counter.write().unwrap();
-        *counter_lock.deref_mut() += 1;
-        let new_count = *counter_lock.deref();
-        drop(counter_lock);
-        tracing::info!("adding element to pool. new count: {}", new_count);
-        return HandedOutPoolElement::<'pool, T>::new(self, new_busy_element);
-    }
-
-    pub fn get_one_free<'pool>(&'pool self) -> Option<HandedOutPoolElement<'pool, T>> {
-        let one_free = self.free.write().unwrap().pop_front();
-        one_free.map(|free|{
-            HandedOutPoolElement::<'pool, T>::new(self, free)
-        })
-    }
 }
 
 pub struct HashFsClient {
