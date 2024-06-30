@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -472,12 +472,15 @@ impl HashFsInterface for HashFsClient {
 
     async fn hb_upload_new_block(
         &self,
-        block_hash: TiFsHash,
-        data: Vec<u8>
+        blocks: &[(&TiFsHash, Arc<Vec<u8>>)],
     ) -> HashFsResult<()> {
         let mut rq = grpc_fs::HbUploadNewBlockRq::default();
-        rq.block_hash = Some(grpc_fs::Hash { data: block_hash });
-        rq.data = data;
+        rq.blocks = blocks.iter().map(|(h, data)|{
+            grpc_fs::HashBlockData {
+                hash: Some(grpc_fs::Hash{data: (*h).clone()}),
+                data: data.deref().clone()
+            }
+        }).collect();
         let rs = self.lock_grpc().await?
             .hb_upload_new_block(rq).await?.into_inner();
         handle_error(&rs.error)?;
@@ -487,15 +490,17 @@ impl HashFsInterface for HashFsClient {
     async fn inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
         &self,
         ino: StorageIno,
-        block_hash: TiFsHash,
-        blocks_size: u64,
-        block_ids: Vec<BlockIndex>,
+        blocks: &[(&TiFsHash, u64, Vec<BlockIndex>)],
     ) -> HashFsResult<()> {
         let mut rq = grpc_fs::InodeWriteHashBlockToAddressesUpdateInoSizeAndCleaningPreviousBlockHashesRq::default();
         rq.ino = Some(ino.into());
-        rq.block_hash = Some(grpc_fs::Hash { data: block_hash });
-        rq.blocks_size = blocks_size;
-        rq.block_ids = block_ids.into_iter().map(Into::into).collect::<Vec<_>>();
+        rq.blocks = blocks.iter().map(|(h,l,ids)|{
+            grpc_fs::HashBlockAddresses {
+                hash: Some(grpc_fs::Hash { data: (*h).clone() }),
+                block_actual_length: *l,
+                block_ids: ids.iter().cloned().map(Into::into).collect(),
+            }
+        }).collect();
         let rs = self.lock_grpc().await?
             .inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(rq)
             .await?.into_inner();

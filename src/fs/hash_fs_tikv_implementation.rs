@@ -9,6 +9,7 @@ use fuser::TimeOrNow;
 use num_bigint::BigUint;
 use strum::IntoEnumIterator;
 use tikv_client::{Key, KvPair};
+use tikv_client::transaction::Mutation;
 use uuid::Uuid;
 
 use crate::fs::hash_fs_interface::GotOrMadePure;
@@ -191,7 +192,7 @@ impl TikvBasedHashFs {
             let mut started = spin.start().await?;
             let r1 = started
                 .hb_replace_block_hash_for_address_no_size_update(
-                    &addr, None).await;
+                    &[(addr, None)]).await;
             if let Some(result) = started.finish(
                 r1).await { break result?; }
         };
@@ -210,7 +211,7 @@ impl TikvBasedHashFs {
             };
         }
 
-        let Some(prev_h) = prev_hash else {
+        let Some((prev_h, _prev_cnt)) = prev_hash.into_iter().next() else {
             return Ok(());
         };
 
@@ -218,7 +219,7 @@ impl TikvBasedHashFs {
         loop {
             let mut started = spin.start().await?;
             let r1 = started.hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
-                &prev_h, 1).await;
+                &HashMap::from([(&prev_h, 1u64)])).await;
             if let Some(result) = started.finish(
                 r1).await { break result?; }
         }
@@ -650,101 +651,105 @@ impl HashFsInterface for TikvBasedHashFs {
     async fn inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
         &self,
         ino: StorageIno,
-        block_hash: TiFsHash,
-        blocks_size: u64,
-        addresses: Vec<BlockIndex>,
+        blocks: &[(&TiFsHash, u64, Vec<BlockIndex>)],
     ) -> HashFsResult<()> {
         let mut watch = AutoStopWatch::start("pm_register");
 
-        let mut decrement_cnts = HashMap::<TiFsHash, u64>::new();
-        for index in addresses {
-            let addr = BlockAddress{ ino, index };
+        let mut max_file_size = 0;
+        let mut addresses_to_modify = Vec::new();
+        let _ = blocks.iter().map(|(h,l,ids)| {
+            for id in ids {
+                let addr = BlockAddress{
+                    ino, index: *id,
+                };
+                addresses_to_modify.push((addr, Some(*h)));
+                max_file_size = max_file_size.max(id.0 * self.fs_config.block_size + l);
+            }
+            ()
+        }).collect::<Vec<()>>();
+
+        let mut spin = MiniTransaction::new(&self.f_txn).await?;
+        let prev_hash_decrements = loop {
+            let mut started = spin.start().await?;
+            let r1 = started
+                .hb_replace_block_hash_for_address_no_size_update(
+                    &addresses_to_modify).await;
+            if let Some(result) = started.finish(r1).await
+            { break result?; }
+        };
+        drop(spin);
+
+        watch.sync("replace");
+
+        // clear full file hash:
+        {
+            let full_hash_key = self.fs_config.key_builder().inode_x(
+                ino, super::key::InoMetadata::FullHash).buf;
             let mut spin = MiniTransaction::new(&self.f_txn).await?;
-            let prev_hash = loop {
-                let mut started = spin.start().await?;
-                let r1 = started
-                    .hb_replace_block_hash_for_address_no_size_update(
-                        &addr, Some(&block_hash)).await;
-                if let Some(result) = started.finish(r1).await
-                { break result?; }
-            };
-            drop(spin);
-
-            watch.sync("replace");
-
-            // clear full file hash:
-            {
-                let full_hash_key = self.fs_config.key_builder().inode_x(
-                    ino, super::key::InoMetadata::FullHash).buf;
-                let mut spin = MiniTransaction::new(&self.f_txn).await?;
-                loop {
-                    let lock = self.local_ino_locks_clear_full_hash
-                        .lock_write(&addr.ino).await;
-                    let mut started = spin.start().await?;
-                    let r1 = started.mini.delete(full_hash_key.clone()).await;
-                    if let Some(result) = started.finish(
-                        r1).await { break result?; }
-                    drop(lock);
-                };
-            }
-
-            // change change iter id:
-            {
-                let mut spin = MiniTransaction::new(&self.f_txn).await?;
-                loop {
-                    let lock = self.local_ino_locks_update_change_iter
-                        .lock_write(&addr.ino).await;
-                    let mut started = spin.start().await?;
-                    let r1 = started.put(
-                        &ino, Arc::new(InoChangeIterationId::random())).await;
-                    if let Some(result) = started.finish(
-                        r1).await { break result?; }
-                    drop(lock);
-                };
-            }
-
-            watch.sync("clear_hash");
-
-            let do_size_update = true;
-            if do_size_update {
-                let size_peek_arc: Arc<InoSize> = self.f_txn.fetch(&addr.ino).await?;
-                let mut size_peek = size_peek_arc.deref().clone();
-                if size_peek.block_write_size_update(&addr, self.fs_config.block_size, blocks_size) {
-                    let mut spin = MiniTransaction::new(&self.f_txn).await?;
-                    loop {
-                        let lock = self.local_ino_write_size_locks.lock_write(&addr.ino).await;
-                        let mut started = spin.start().await?;
-                        let r1 = started
-                            .hb_replace_block_hash_for_address_only_size_update(
-                                &addr, blocks_size).await;
-                        if let Some(result) = started.finish(
-                            r1).await { break result?; }
-                        drop(lock);
-                    };
-                }
-            }
-
-            watch.sync("size_update");
-
-            if let Some(pre_hash) = prev_hash {
-                decrement_cnts.insert(pre_hash.clone(),
-                    1 + decrement_cnts.get(&pre_hash).copied().unwrap_or(0));
-            }
-        }
-
-        for (prev_hash, dec_cnt) in decrement_cnts {
-            let mut spin = self.f_txn.spinning_mini_txn().await?;
             loop {
+                let lock = self.local_ino_locks_clear_full_hash
+                    .lock_write(&ino).await;
                 let mut started = spin.start().await?;
-                let r1 = started
-                    .hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
-                        &prev_hash, dec_cnt).await;
-                if let Some(result) = started.finish(r1).await
-                { break result?; }
-            }
-
-            watch.sync("dec");
+                let r1 = started.mini.delete(full_hash_key.clone()).await;
+                if let Some(result) = started.finish(
+                    r1).await { break result?; }
+                drop(lock);
+            };
         }
+
+        // change change iter id:
+        {
+            let mut spin = MiniTransaction::new(&self.f_txn).await?;
+            loop {
+                let lock = self.local_ino_locks_update_change_iter
+                    .lock_write(&ino).await;
+                let mut started = spin.start().await?;
+                let r1 = started.put(
+                    &ino, Arc::new(InoChangeIterationId::random())).await;
+                if let Some(result) = started.finish(
+                    r1).await { break result?; }
+                drop(lock);
+            };
+        }
+
+        watch.sync("clear_hash");
+
+        let do_size_update = true;
+        if do_size_update {
+            let size_peek_arc: Arc<InoSize> = self.f_txn.fetch(&ino).await?;
+            let mut size_peek = size_peek_arc.deref().clone();
+            if max_file_size > size_peek.size {
+                size_peek.set_size(max_file_size, self.fs_config.block_size);
+                let mut spin = MiniTransaction::new(&self.f_txn).await?;
+                loop {
+                    let lock = self.local_ino_write_size_locks.lock_write(&ino).await;
+                    let mut started = spin.start().await?;
+                    let r1 = started
+                        .hb_replace_block_hash_for_address_only_size_update_b(
+                            ino, max_file_size).await;
+                    if let Some(result) = started.finish(
+                        r1).await { break result?; }
+                    drop(lock);
+                };
+            }
+        }
+
+        watch.sync("size_update");
+
+        let prev_hash_decrements_ref = prev_hash_decrements.iter().map(|(h,dec)|{
+            (h, *dec)
+        }).collect::<HashMap<_,_>>();
+        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        loop {
+            let mut started = spin.start().await?;
+            let r1 = started
+                .hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
+                    &prev_hash_decrements_ref).await;
+            if let Some(result) = started.finish(r1).await
+            { break result?; }
+        }
+
+        watch.sync("dec");
 
         Ok(())
     }
@@ -841,9 +846,13 @@ impl HashFsInterface for TikvBasedHashFs {
         Ok(prev_cnt)
     }
 
-    async fn hb_upload_new_block(&self, block_hash: TiFsHash, data: Vec<u8>) -> HashFsResult<()> {
-        let key = self.fs_config.key_builder().hashed_block(&block_hash);
-        self.f_txn.put(key, data).await?;
+    async fn hb_upload_new_block(&self, blocks: &[(&TiFsHash, Arc<Vec<u8>>)]) -> HashFsResult<()> {
+        let mutations = blocks.iter().map(|(h,d)|{
+            let key = self.fs_config.key_builder().hashed_block(h);
+            Mutation::Put(key.into(), d.deref().clone())
+        }).collect::<Vec<_>>();
+
+        self.f_txn.batch_mutate(mutations).await?;
         Ok(())
     }
 } // interface impl end

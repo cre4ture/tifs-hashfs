@@ -306,6 +306,7 @@ pub struct TiFsConfig {
     pub read_ahead_size: u64,
     pub read_ahead_in_progress_limit: usize,
     pub small_transactions: bool,
+    pub chunked_block_upload: bool,
 }
 
 impl TiFsConfig {
@@ -323,6 +324,7 @@ impl TiFsConfig {
         let mut small_transactions = false;
         let mut parallel_jobs = 0;
         let mut parallel_jobs_delete = 0;
+        let chunked_block_upload = true;
 
         // iterate over options and overwrite defaults
         for option in options {
@@ -456,6 +458,7 @@ impl TiFsConfig {
                 } else { None }
             }).unwrap_or(10),
             small_transactions,
+            chunked_block_upload,
         };
         Ok(cfg)
     }

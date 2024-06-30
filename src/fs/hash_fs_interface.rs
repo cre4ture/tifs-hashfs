@@ -196,15 +196,12 @@ pub trait HashFsInterface: Send + Sync  {
     // Will also succeed when the block already existed.
     async fn hb_upload_new_block(
         &self,
-        block_hash: TiFsHash,
-        data: Vec<u8>
+        blocks: &[(&TiFsHash, Arc<Vec<u8>>)],
     ) -> HashFsResult<()>;
     async fn inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
         &self,
         ino: StorageIno,
-        block_hash: TiFsHash,
-        blocks_size: u64,
-        block_ids: Vec<BlockIndex>,
+        blocks: &[(&TiFsHash, u64, Vec<BlockIndex>)],
     ) -> HashFsResult<()>;
 }
 

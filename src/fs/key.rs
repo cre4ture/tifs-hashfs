@@ -109,7 +109,7 @@ lazy_static!{
 
 pub type KeyBuffer = Vec<u8>;
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct BlockAddress {
     pub ino: StorageIno,
     pub index: BlockIndex,

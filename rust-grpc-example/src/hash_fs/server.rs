@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::grpc_time_to_system_time;
 use tifs::fs::fs_config::{self};
-use tifs::fs::hash_fs_interface::HashFsInterface;
+use tifs::fs::hash_fs_interface::{BlockIndex, HashFsInterface};
 use tonic::{Request, Response, Status};
 
 use crate::grpc::greeter::greeter_server::Greeter;
@@ -588,12 +589,16 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         tonic::Response<grpc_fs::HbUploadNewBlockRs>,
         tonic::Status,
     >{
-        let rq = request.into_inner();
-        let Some(block_hash) = rq.block_hash else {
-            return Err(tonic::Status::invalid_argument("block_hash parameter is required!"));
+        let mut rq = request.into_inner();
+        if rq.blocks.len() == 0 {
+            return Err(tonic::Status::invalid_argument("blocks parameter is required!"));
         };
+        let blocks = rq.blocks.iter_mut().filter_map(|d|{
+            let hash = &d.hash.as_ref()?.data;
+            Some((hash, Arc::new(mem::take(&mut d.data))))
+        }).collect::<Vec<_>>();
         let r = self.fs_impl
-            .hb_upload_new_block(block_hash.data, rq.data).await;
+            .hb_upload_new_block(&blocks).await;
         let mut rsp = grpc_fs::HbUploadNewBlockRs::default();
         match r {
             Err(err) => rsp.error = Some(err.into()),
@@ -612,19 +617,24 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         >,
         tonic::Status,
     >{
-        let rq = request.into_inner();
+        let mut rq = request.into_inner();
         let Some(ino) = rq.ino else {
             return Err(tonic::Status::invalid_argument("ino parameter is required!"));
         };
-        let Some(block_hash) = rq.block_hash else {
-            return Err(tonic::Status::invalid_argument("block_hash parameter is required!"));
+        if rq.blocks.len() == 0 {
+            return Err(tonic::Status::invalid_argument("blocks parameter is required!"));
         };
+        let blocks = rq.blocks.iter_mut().filter_map(|d|{
+            Some((
+                &d.hash.as_ref()?.data,
+                d.block_actual_length,
+                mem::take(&mut d.block_ids).into_iter().map(|id|id.into()).collect::<Vec<BlockIndex>>()
+            ))
+        }).collect::<Vec<_>>();
         let r = self.fs_impl
             .inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
                 ino.into(),
-                block_hash.data,
-                rq.blocks_size,
-                rq.block_ids.into_iter().map(|id|id.into()).collect::<Vec<_>>(),
+                &blocks,
             ).await;
         let mut rsp = grpc_fs::InodeWriteHashBlockToAddressesUpdateInoSizeAndCleaningPreviousBlockHashesRs::default();
         match r {

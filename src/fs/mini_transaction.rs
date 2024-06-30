@@ -484,17 +484,36 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
 
     pub async fn hb_replace_block_hash_for_address_no_size_update(
         &mut self,
-        addr: &BlockAddress,
-        new_hash: Option<&TiFsHash>,
-    ) -> TiFsResult<Option<TiFsHash>> {
-        let key = Key::from(self.fs_config().key_builder().block_hash(addr.clone()));
-        let prev_block_hash = self.mini.get(key.clone()).await?;
-        if let Some(new_hash) = new_hash {
-            self.mini.put(key.clone(), new_hash.clone()).await?;
-        } else {
-            self.mini.delete(key.clone()).await?;
+        addresses: &[(BlockAddress, Option<&TiFsHash>)],
+    ) -> TiFsResult<HashMap<TiFsHash, u64>> {
+        if addresses.len() == 0 {
+            return Ok(HashMap::new());
         }
-        Ok(prev_block_hash)
+
+        let mut mutations = Vec::new();
+        let keys = addresses.iter().map(|(addr, new_hash)|{
+            let key = Key::from(self.fs_config().key_builder().block_hash(*addr));
+            if let Some(hash) = new_hash {
+                mutations.push(Mutation::Put(key.clone(), hash.to_vec()));
+            } else {
+                mutations.push(Mutation::Delete(key.clone()));
+            }
+            key
+        }).collect::<Vec<_>>();
+        let prev_block_hash = self.mini.batch_get(keys).await?;
+        self.mini.batch_mutate(mutations).await?;
+
+        let mut decrements = HashMap::new();
+        for KvPair(_k,hash) in prev_block_hash {
+            if hash.len() != self.fs_config().hash_len {
+                return Err(FsError::Serialize { target: "hash", typ: "BIN", msg: format!("hash length mismatch.")});
+            }
+            let mut dec: u64 = decrements.get(&hash).cloned().unwrap_or(0u64);
+            dec += 1;
+            decrements.insert(hash, dec);
+        }
+
+        Ok(decrements)
     }
 
     pub async fn hb_replace_block_hash_for_address_only_size_update(
@@ -512,33 +531,61 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         Ok(())
     }
 
+    pub async fn hb_replace_block_hash_for_address_only_size_update_b(
+        &mut self,
+        ino: StorageIno,
+        new_target_size: u64
+    ) -> TiFsResult<()> {
+        let ino_size_arc: Arc<InoSize> = self.fetch(&ino).await?;
+        let mut ino_size = ino_size_arc.deref().clone();
+        if new_target_size > ino_size.size {
+            ino_size.set_size(new_target_size, self.fs_config().block_size);
+            self.put(&ino, Arc::new(ino_size)).await?;
+        }
+        Ok(())
+    }
+
     pub async fn hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
         &mut self,
-        hash: &Vec<u8>,
-        cnt: u64,
+        decrements: &HashMap<&TiFsHash, u64>,
     ) -> TiFsResult<()> {
-        let block_ref_cnt_key = self.fs_config().key_builder().named_hashed_block_x(
-            hash, Some(HashedBlockMeta::CCountedNamedUsages), None);
+        let block_ref_cnt_keys = decrements.iter().map(|(h, _dec)|{
+            let key = Key::from(self.fs_config().key_builder().named_hashed_block_x(
+                h, Some(HashedBlockMeta::CCountedNamedUsages), None));
+            key
+        }).collect::<Vec<_>>();
 
-        let prev_counter_value = self.mini.get(block_ref_cnt_key.clone()).await?
-            .map(|vec|BigUint::from_bytes_be(&vec))
-            .unwrap_or(BigUint::from_u8(0u8).unwrap());
-        let mut actual_dec = BigUint::from_u64(cnt).unwrap();
-        if prev_counter_value < actual_dec {
-            tracing::error!("full decrement by {cnt} of block reference counter not possible with value {prev_counter_value}.");
-            actual_dec = prev_counter_value.clone();
+        let prev_counter_values = self.mini.batch_get(block_ref_cnt_keys.clone()).await?
+            .filter_map(|KvPair(key, value)|{
+                let cnt = BigUint::from_bytes_be(&value);
+                let hash = self.fs_config().key_parser_b(key).ok()?.parse_hash().ok()?.1;
+                Some((hash, cnt))
+            }).collect::<HashMap<_,_>>();
+
+        let mut mutations = Vec::new();
+        for (h, dec) in decrements {
+            let mut actual_dec = BigUint::from_u64(*dec).unwrap();
+            let prev_counter_value = prev_counter_values.get(*h).cloned().unwrap_or(BigUint::ZERO);
+            if prev_counter_value < actual_dec {
+                tracing::error!("full decrement by {actual_dec} of block reference counter not possible with value {prev_counter_value}.");
+                actual_dec = prev_counter_value.clone();
+            }
+            let new_counter_value = prev_counter_value.clone() - actual_dec;
+
+            let key = Key::from(self.fs_config().key_builder().named_hashed_block_x(
+                h, Some(HashedBlockMeta::CCountedNamedUsages), None));
+
+            if new_counter_value == BigUint::from_u8(0).unwrap() {
+                let block_key = self.fs_config().key_builder().hashed_block(h);
+                mutations.push(Mutation::Delete(Key::from(key)));
+                mutations.push(Mutation::Delete(Key::from(block_key)));
+                tracing::warn!("deleting block with hash: {h:?}");
+            } else {
+                mutations.push(Mutation::Put(key.clone(), new_counter_value.to_bytes_be()));
+            }
         }
-        let new_counter_value = prev_counter_value.clone() - actual_dec;
-        if new_counter_value == BigUint::from_u8(0).unwrap() {
-            let block_key = self.fs_config().key_builder().hashed_block(hash);
-            let mut deletes = Vec::with_capacity(2);
-            deletes.push(Mutation::Delete(Key::from(block_ref_cnt_key)));
-            deletes.push(Mutation::Delete(Key::from(block_key)));
-            self.mini.batch_mutate(deletes).await?;
-            tracing::warn!("deleting block with hash: {hash:?}");
-        } else {
-            self.mini.put(block_ref_cnt_key.clone(), new_counter_value.to_bytes_be()).await?;
-        }
+        self.mini.batch_mutate(mutations).await?;
+
         Ok(())
     }
 }

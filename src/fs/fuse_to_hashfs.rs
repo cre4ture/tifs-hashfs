@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
-use std::ops::{Deref, Range};
+use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
@@ -437,7 +437,7 @@ impl Txn {
         ino: StorageIno,
         block_hash: TiFsHash,
         ref_count_delta: u64,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
         block_ids: Vec<BlockIndex>,
     ) -> TiFsResult<()> {
         let mut watch = AutoStopWatch::start("pm_details");
@@ -450,13 +450,13 @@ impl Txn {
 
         // Upload block if new
         if previous_reference_count == BigUint::from_u8(0).unwrap() {
-            self.hash_fs.hb_upload_new_block(block_hash.clone(), data).await?;
+            self.hash_fs.hb_upload_new_block(&[(&block_hash, data)]).await?;
 
             watch.sync("upload");
         }
 
         self.hash_fs.inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
-            ino, block_hash, block_len, block_ids).await?;
+            ino, &[(&block_hash, block_len, block_ids)]).await?;
 
         watch.sync("register");
 
@@ -518,8 +518,6 @@ impl Txn {
         }
         watch.sync("add_cache");
 
-        let mut parallel_executor = AsyncParallelPipeStage::new(self.fs_config.parallel_jobs);
-
         // filter out unchanged blocks:
         let mut skipped_new_block_hashes = 0;
         for (block_index, prev_block_hash) in hash_list_prev.iter() {
@@ -535,19 +533,51 @@ impl Txn {
         let mm = new_block_hashes.into_iter()
             .map(|(k,v)| (v,k)).collect::<MultiMap<_,_>>();
 
-        for (hash, block_ids) in mm {
+        let mut parallel_executor = AsyncParallelPipeStage::new(self.fs_config.parallel_jobs);
 
-            let data = new_blocks.get(&hash).unwrap();
-            let fut = self.clone()
-                .inode_write_upload_block_reference_counting_and_write_addresses(
-                ino,
-                hash,
-                block_ids.len() as u64,
-                data.deref().clone(),
-                block_ids,
-            );
+        if self.fs_config.chunked_block_upload {
+            let increments = mm.iter_all().map(|(h,ids)|{
+                (h, ids.len() as u64)
+            }).collect::<Vec<_>>();
 
-            parallel_executor.push(fut).await;
+            let prev_ref_counts = self.hash_fs
+                .hb_increment_reference_count(&increments).await?;
+
+            let mut blocks_to_upload = Vec::new();
+            for (h, _c) in increments {
+                let prev_ref_cnt = prev_ref_counts.get(h)
+                    .cloned().unwrap_or(BigUint::ZERO);
+                if prev_ref_cnt == BigUint::ZERO {
+                    blocks_to_upload.push((h, new_blocks.get(h).unwrap().clone()));
+                }
+            }
+
+            self.hash_fs.hb_upload_new_block(&blocks_to_upload).await?;
+
+            self.hash_fs
+                .inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
+                    ino,
+                    &mm.iter_all().map(|(h, ids)|{
+                        let data = new_blocks.get(h).unwrap().clone();
+                        (h, data.len() as u64, ids.to_vec())
+                    }).collect::<Vec<_>>()
+                ).await?;
+
+        } else {
+            for (hash, block_ids) in mm {
+
+                let data = new_blocks.get(&hash).unwrap().clone();
+                let fut = self.clone()
+                    .inode_write_upload_block_reference_counting_and_write_addresses(
+                    ino,
+                    hash,
+                    block_ids.len() as u64,
+                    data,
+                    block_ids,
+                );
+
+                parallel_executor.push(fut).await;
+            }
         }
 
         parallel_executor.wait_finish_all().await;
