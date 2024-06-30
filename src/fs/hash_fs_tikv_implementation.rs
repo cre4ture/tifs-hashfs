@@ -64,6 +64,8 @@ pub struct TikvBasedHashFs {
     // TODO: use heartbeat to cleanup this map from invalid references.
     pub local_ino_write_size_locks: LazyLockMap<StorageIno, ()>,
     pub local_ino_locks_full_hash: LazyLockMap<StorageIno, ()>,
+    pub local_ino_locks_clear_full_hash: LazyLockMap<StorageIno, ()>,
+    pub local_ino_locks_update_change_iter: LazyLockMap<StorageIno, ()>,
 }
 
 impl TikvBasedHashFs {
@@ -75,6 +77,8 @@ impl TikvBasedHashFs {
                 fs_config,
                 local_ino_write_size_locks: LazyLockMap::new(),
                 local_ino_locks_full_hash: LazyLockMap::new(),
+                local_ino_locks_clear_full_hash: LazyLockMap::new(),
+                local_ino_locks_update_change_iter: LazyLockMap::new(),
             }
         })
     }
@@ -679,12 +683,18 @@ impl HashFsInterface for TikvBasedHashFs {
 
             watch.sync("replace");
 
+            let lock = self.local_ino_locks_clear_full_hash
+                .lock_write(&addr.ino).await;
             let full_hash_key = self.key_builder().inode_x(
                 ino, super::key::InoMetadata::FullHash).buf;
             // clear full file hash:
             self.f_txn.delete(full_hash_key).await?;
+            drop(lock);
+            let lock = self.local_ino_locks_clear_full_hash
+                .lock_write(&addr.ino).await;
             // change change iter id:
             self.f_txn.put_json(&ino, Arc::new(InoChangeIterationId::random())).await?;
+            drop(lock);
 
             watch.sync("clear_hash");
 
