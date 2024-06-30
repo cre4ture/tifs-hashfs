@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::fs::{inode::ParentStorageIno, meta::MetaMutable};
 
-use super::{dir::StorageDirectory, error::{FsError, TiFsResult}, hash_fs_interface::GotOrMade, inode::{DirectoryItem, InoChangeIterationId, InoFullHash, InoInlineData, TiFsHash}, key::{BlockAddress, HashedBlockMeta, OPENED_INODE_PARENT_INODE}, transaction::MAX_TIKV_SCAN_LIMIT, utils::txn_data_cache::{TxnDeleteMut, TxnFetchMut, TxnPutMut}};
+use super::{dir::StorageDirectory, error::{FsError, TiFsResult}, hash_fs_interface::GotOrMade, inode::{DirectoryItem, InoChangeIterationId, InoFullHash, InoInlineData, TiFsHash}, key::{BlockAddress, HashedBlockMeta, OPENED_INODE_PARENT_INODE}, fuse_to_hashfs::MAX_TIKV_SCAN_LIMIT, utils::txn_data_cache::{TxnDeleteMut, TxnFetchMut, TxnPutMut}};
 use super::index::{deserialize_json, serialize_json};
 use super::fs_config::TiFsConfig;
 use super::flexible_transaction::{FlexibleTransaction, SpinningTxn, TransactionError, TransactionResult};

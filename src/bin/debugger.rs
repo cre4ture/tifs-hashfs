@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use clap::{crate_version, App, Arg};
 use tifs::fs::key::{ScopedKey, ROOT_INODE};
 use tifs::fs::tikv_fs::TiFs;
-use tifs::fs::transaction::Txn;
+use tifs::fs::fuse_to_hashfs::Txn;
 use tikv_client::TransactionClient;
 use tracing_subscriber::EnvFilter;
 

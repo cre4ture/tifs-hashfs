@@ -35,7 +35,7 @@ use super::inode::{InoAccessTime, InoDescription, InoLockState, InoSize, Modific
 use super::reply::{
     Data, Directory, LogicalIno
 };
-use super::transaction::{Txn, TxnArc};
+use super::fuse_to_hashfs::{Txn, TxnArc};
 use super::transaction_client_mux::TransactionClientMux;
 use super::utils::lazy_lock_map::LazyLockMap;
 use super::utils::txn_data_cache::TxnDataCache;

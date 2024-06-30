@@ -15,7 +15,7 @@ pub mod mode;
 pub mod reply;
 pub mod serialize;
 pub mod tikv_fs;
-pub mod transaction;
+pub mod fuse_to_hashfs;
 pub mod transaction_client_mux;
 pub mod parsers;
 pub mod fs_config;

@@ -5,7 +5,7 @@ use strum::{EnumIter, IntoEnumIterator};
 use tikv_client::{BoundRange, Key, KvPair};
 use uuid::Uuid;
 
-use super::{error::TiFsResult, flexible_transaction::FlexibleTransaction, key::ScopedKeyBuilder, transaction::MAX_TIKV_SCAN_LIMIT};
+use super::{error::TiFsResult, flexible_transaction::FlexibleTransaction, key::ScopedKeyBuilder, fuse_to_hashfs::MAX_TIKV_SCAN_LIMIT};
 
 type MyTxn = FlexibleTransaction;
 

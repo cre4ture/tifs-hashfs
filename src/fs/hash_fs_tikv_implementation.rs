@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::fs::hash_fs_interface::GotOrMadePure;
 use crate::fs::inode::TiFsHash;
 use crate::fs::key::{BlockAddress, PARENT_OF_ROOT_INODE};
-use crate::fs::transaction::MAX_TIKV_SCAN_LIMIT;
+use crate::fs::fuse_to_hashfs::MAX_TIKV_SCAN_LIMIT;
 use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 use super::error::FsError;

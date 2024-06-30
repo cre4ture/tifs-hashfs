@@ -13,7 +13,7 @@ use super::index::{deserialize_json, serialize_json};
 use super::key::{KeyGenerator, ScopedKeyBuilder};
 use super::mini_transaction::MiniTransaction;
 use super::utils::txn_data_cache::{TxnDelete, TxnFetch, TxnPut};
-use super::{error::TiFsResult, transaction::{DEFAULT_REGION_BACKOFF, OPTIMISTIC_BACKOFF}, transaction_client_mux::TransactionClientMux};
+use super::{error::TiFsResult, fuse_to_hashfs::{DEFAULT_REGION_BACKOFF, OPTIMISTIC_BACKOFF}, transaction_client_mux::TransactionClientMux};
 
 use tikv_client::Result as TiKvResult;
 
