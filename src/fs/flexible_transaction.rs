@@ -97,10 +97,10 @@ impl SpinningTxn {
                     Err(error) => {
                         if let Some(delay) = self.backoff.next_delay_duration() {
                             sleep(delay).await;
-                            tracing::info!("retry commit failed transaction. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
+                            tracing::info!("retry commit failed transaction. Type: {}, Msg: {log_msg}, Reason: {error:?}", std::any::type_name::<R>());
                             return None;
                         } else {
-                            tracing::warn!("transaction failed. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
+                            tracing::warn!("transaction failed. Type: {}, Msg: {log_msg}, Reason: {error:?}", std::any::type_name::<R>());
                             return Some(Err(error.into()));
                         }
                     }
@@ -118,10 +118,10 @@ impl SpinningTxn {
                     TransactionError::TemporaryIssue(err) => {
                         if let Some(delay) = self.backoff.next_delay_duration() {
                             sleep(delay).await;
-                            tracing::info!("retry rolled back transaction. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
+                            tracing::info!("retry rolled back transaction. Type: {}, Msg: {log_msg}, Reason: {err:?}", std::any::type_name::<R>());
                             return None;
                         } else {
-                            tracing::warn!("transaction failed. Type: {}, Msg: {log_msg}", std::any::type_name::<R>());
+                            tracing::warn!("transaction failed. Type: {}, Msg: {log_msg}, Reason: {err:?}", std::any::type_name::<R>());
                             return Some(Err(err));
                         }
                     }
@@ -159,11 +159,13 @@ impl FlexibleTransaction {
     async fn begin_optimistic_small(
         client_mux: Arc<TransactionClientMux>,
     ) -> Result<Transaction> {
-        let options = TransactionOptions::new_optimistic().use_async_commit();
+        let options = TransactionOptions::new_optimistic()
+            .use_async_commit();
         let options = options.retry_options(RetryOptions {
-            region_backoff: DEFAULT_REGION_BACKOFF,
-            lock_backoff: OPTIMISTIC_BACKOFF,
-        }).try_one_pc();
+                region_backoff: DEFAULT_REGION_BACKOFF,
+                lock_backoff: OPTIMISTIC_BACKOFF,
+            })
+            .try_one_pc();
         Ok(client_mux.give_one_transaction(&options).await?)
     }
 
