@@ -88,10 +88,10 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
                     Err(error) => {
                         if let Some(delay) = self.parent.spin.backoff.next_delay_duration() {
                             sleep(delay).await;
-                            tracing::info!("retry commit failed transaction");
+                            tracing::info!("retry commit failed transaction. Type: {}, Reason: {error:?}", std::any::type_name::<R>());
                             return None;
                         } else {
-                            tracing::warn!("transaction failed!");
+                            tracing::warn!("transaction failed. Type: {}, Reason: {error:?}", std::any::type_name::<R>());
                             return Some(Err(error.into()));
                         }
                     }
@@ -99,20 +99,20 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
             }
             Err(result_err) => {
                 if let Err(error) = self.mini.rollback().await {
-                    tracing::error!("failed to rollback mini transaction. Err: {error:?}");
+                    tracing::error!("failed to rollback mini transaction. Type: {}, Reason: {error:?}", std::any::type_name::<R>());
                 }
                 match result_err.into() {
                     TransactionError::PersistentIssue(err) => {
-                        tracing::error!("cancelling transaction retry due to persistent error. Err: {err:?}");
+                        tracing::error!("cancelling transaction retry due to persistent error. Type: {}, Reason: {err:?}", std::any::type_name::<R>());
                         return Some(Err(err));
                     }
                     TransactionError::TemporaryIssue(err) => {
                         if let Some(delay) = self.parent.spin.backoff.next_delay_duration() {
                             sleep(delay).await;
-                            tracing::info!("retry rolled back transaction");
+                            tracing::info!("retry rolled back transaction. Type: {}, Reason: {err:?}", std::any::type_name::<R>());
                             return None;
                         } else {
-                            tracing::warn!("transaction failed!");
+                            tracing::warn!("transaction failed. Type: {}, Reason: {err:?}", std::any::type_name::<R>());
                             return Some(Err(err));
                         }
                     }

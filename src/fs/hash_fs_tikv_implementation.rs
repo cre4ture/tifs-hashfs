@@ -22,7 +22,7 @@ use super::index::deserialize_json;
 use super::mini_transaction::{DeletionCheckResult, MiniTransaction};
 use super::utils::lazy_lock_map::LazyLockMap;
 use super::utils::stop_watch::AutoStopWatch;
-use super::utils::txn_data_cache::{TxnFetch, TxnPut};
+use super::utils::txn_data_cache::{TxnFetch, TxnPut, TxnPutMut};
 use super::{
     error::TiFsResult, flexible_transaction::FlexibleTransaction, fs_config::TiFsConfig, meta::MetaStatic
     };
@@ -680,21 +680,40 @@ impl HashFsInterface for TikvBasedHashFs {
                 if let Some(result) = started.finish(r1).await
                 { break result?; }
             };
+            drop(spin);
 
             watch.sync("replace");
 
-            let lock = self.local_ino_locks_clear_full_hash
-                .lock_write(&addr.ino).await;
-            let full_hash_key = self.key_builder().inode_x(
-                ino, super::key::InoMetadata::FullHash).buf;
             // clear full file hash:
-            self.f_txn.delete(full_hash_key).await?;
-            drop(lock);
-            let lock = self.local_ino_locks_clear_full_hash
-                .lock_write(&addr.ino).await;
+            {
+                let full_hash_key = self.key_builder().inode_x(
+                    ino, super::key::InoMetadata::FullHash).buf;
+                let mut spin = MiniTransaction::new(&self.f_txn).await?;
+                loop {
+                    let lock = self.local_ino_locks_clear_full_hash
+                        .lock_write(&addr.ino).await;
+                    let mut started = spin.start().await?;
+                    let r1 = started.mini.delete(full_hash_key.clone()).await;
+                    if let Some(result) = started.finish(
+                        r1).await { break result?; }
+                    drop(lock);
+                };
+            }
+
             // change change iter id:
-            self.f_txn.put_json(&ino, Arc::new(InoChangeIterationId::random())).await?;
-            drop(lock);
+            {
+                let mut spin = MiniTransaction::new(&self.f_txn).await?;
+                loop {
+                    let lock = self.local_ino_locks_update_change_iter
+                        .lock_write(&addr.ino).await;
+                    let mut started = spin.start().await?;
+                    let r1 = started.put(
+                        &ino, Arc::new(InoChangeIterationId::random())).await;
+                    if let Some(result) = started.finish(
+                        r1).await { break result?; }
+                    drop(lock);
+                };
+            }
 
             watch.sync("clear_hash");
 
