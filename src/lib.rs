@@ -5,7 +5,6 @@
 #![feature(async_fn_traits)]
 #![feature(iter_array_chunks)]
 #![feature(int_roundings)]
-#![feature(iter_advance_by)]
 #![feature(try_trait_v2)]
 #![feature(closure_lifetime_binder)]
 #![feature(step_trait)]

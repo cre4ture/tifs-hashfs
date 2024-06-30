@@ -507,7 +507,7 @@ mod test {
         assert_eq!(ROOT_LOGICAL_INODE.kind, InoKind::Regular);
         assert_eq!(ROOT_LOGICAL_INODE.to_raw(), 1);
         assert_eq!(ROOT_LOGICAL_INODE.storage_ino().0, 1);
-        assert_eq!(ROOT_INODE.0, 1);
+        assert_eq!(ROOT_INODE.0.0, 1);
     }
 
     #[test]

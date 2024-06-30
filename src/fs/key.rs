@@ -121,7 +121,6 @@ pub fn read_big_endian<const N: usize, T: num_traits::FromBytes<Bytes = [u8; N]>
     let bytes = i.array_chunks::<N>().next()
         .ok_or(FsError::UnknownError(format!("deserialization failed!")))?.clone();
     let r: T = FromBytes::from_be_bytes(&bytes);
-    i.advance_by(N).unwrap();
     Ok(r)
 }
 
@@ -177,7 +176,6 @@ pub fn parse_uuid(i: &mut impl Iterator<Item = u8>) -> TiFsResult<Uuid> {
             msg: format!("parse_lock_key(): key length too small")
         });
     };
-    i.advance_by(UUID_LEN).unwrap();
     Ok(Uuid::from_bytes_ref(&chunk).clone())
 }
 
@@ -207,7 +205,6 @@ where I: Iterator<Item = u8>
         if act_prefix != prefix {
             return Err(FsError::UnknownError(format!("key prefix mismatch: {:?}", act_prefix)));
         }
-        i.advance_by(prefix.len()).unwrap();
         let kind_id = i.next().unwrap_or(0xFF);
         let kind = *KEY_KIND_IDS.get_by_left(&kind_id).ok_or(
             FsError::UnknownError(format!("key with unknown kind_i: {}", kind_id)))?;
@@ -692,7 +689,7 @@ impl KeyGenerator<StorageIno, InoInlineData> for ScopedKeyBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::fs::{inode::StorageIno, key::{BlockAddress, InoMetadata, KeyKind, KeyParser}, utils::hash_algorithm::HashAlgorithm};
+    use crate::fs::{hash_fs_interface::BlockIndex, inode::StorageIno, key::{parse_uuid, read_big_endian, write_big_endian, BlockAddress, InoMetadata, KeyBuffer, KeyKind, KeyParser}, utils::hash_algorithm::HashAlgorithm};
 
     use super::ScopedKeyBuilder;
 
@@ -703,7 +700,7 @@ mod tests {
         let kb = ScopedKeyBuilder::new(TEST_PREFIX);
         assert_eq!(kb.buf, TEST_PREFIX);
         let buf = kb.meta();
-        let mut i = buf.iter();
+        let mut i = buf.iter().cloned();
         let kp = KeyParser::start(&mut i, TEST_PREFIX, 16).unwrap();
         assert_eq!(kp.kind, KeyKind::FsMetadata);
     }
@@ -711,7 +708,7 @@ mod tests {
     #[test]
     fn serialize_deserialize_ino_meta_access_time() {
         let kb = ScopedKeyBuilder::new(TEST_PREFIX).inode_atime(StorageIno(5));
-        let mut i = kb.iter();
+        let mut i = kb.iter().cloned();
         let kp = KeyParser::start(&mut i, TEST_PREFIX, 16).unwrap();
         assert_eq!(kp.kind, KeyKind::InoMetadata);
         let kp_ino = kp.parse_ino().unwrap();
@@ -723,7 +720,7 @@ mod tests {
     fn serialize_deserialize_hashed_block() {
         let hash = HashAlgorithm::Blake3.calculate_hash(&[1,2,3]);
         let kb = ScopedKeyBuilder::new(TEST_PREFIX).hashed_block(&hash);
-        let mut i = kb.iter();
+        let mut i = kb.iter().cloned();
         let kp = KeyParser::start(&mut i, TEST_PREFIX, 32).unwrap();
         assert_eq!(kp.kind, KeyKind::HashedBlock);
         let read_hash = kp.parse_key_hashed_block().unwrap();
@@ -734,7 +731,7 @@ mod tests {
     fn serialize_deserialize_hashed_block_exists() {
         let hash = HashAlgorithm::Blake3.calculate_hash(&[1,2,3]);
         let kb = ScopedKeyBuilder::new(TEST_PREFIX).hashed_block_exists(&hash);
-        let mut i = kb.iter();
+        let mut i = kb.iter().cloned();
         let kp = KeyParser::start(&mut i, TEST_PREFIX, 32).unwrap();
         assert_eq!(kp.kind, KeyKind::HashedBlockExists);
         let read_hash = kp.parse_key_hashed_block().unwrap();
@@ -745,7 +742,7 @@ mod tests {
     fn serialize_deserialize_hashed_block_len_64() {
         let hash = HashAlgorithm::Sha512.calculate_hash(&[1,2,3]);
         let kb = ScopedKeyBuilder::new(TEST_PREFIX).hashed_block(&hash);
-        let mut i = kb.iter();
+        let mut i = kb.iter().cloned();
         let kp = KeyParser::start(&mut i, TEST_PREFIX, 64).unwrap();
         assert_eq!(kp.kind, KeyKind::HashedBlock);
         let read_hash = kp.parse_key_hashed_block().unwrap();
@@ -754,9 +751,9 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_regular_block() {
-        let addr = BlockAddress{ino:StorageIno(7), index: 3};
+        let addr = BlockAddress{ino:StorageIno(7), index: BlockIndex(3)};
         let kb = ScopedKeyBuilder::new(TEST_PREFIX).block(addr.clone());
-        let mut i = kb.iter();
+        let mut i = kb.iter().cloned();
         let kp = KeyParser::start(&mut i, TEST_PREFIX, 32).unwrap();
         assert_eq!(kp.kind, KeyKind::Block);
         let read_addr = kp.parse_key_block_address().unwrap();
@@ -765,12 +762,45 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_block_hash() {
-        let addr = BlockAddress{ino:StorageIno(7), index: 3};
+        let addr = BlockAddress{ino:StorageIno(7), index: BlockIndex(3)};
         let kb = ScopedKeyBuilder::new(TEST_PREFIX).block_hash(addr.clone());
-        let mut i = kb.iter();
+        let mut i = kb.iter().cloned();
         let kp = KeyParser::start(&mut i, TEST_PREFIX, 32).unwrap();
         assert_eq!(kp.kind, KeyKind::InoBlockHashMapping);
         let read_addr = kp.parse_key_block_address().unwrap();
         assert_eq!(addr, read_addr);
     }
+
+    #[test]
+    fn serialize_deserialize_big_endian_integer() {
+        let mut buf = KeyBuffer::new();
+        write_big_endian(1u64 << 40, &mut buf);
+        assert_eq!(buf.len(), 8);
+        write_big_endian(55u64 << 45, &mut buf);
+        assert_eq!(buf.len(), 8*2);
+        // ----------------
+        let mut i = buf.into_iter();
+        let val1 = read_big_endian::<8, u64>(&mut i).unwrap();
+        assert_eq!(val1, 1u64 << 40);
+        let val2 = read_big_endian::<8, u64>(&mut i).unwrap();
+        assert_eq!(val2, 55u64 << 45);
+    }
+
+    #[test]
+    fn serialize_deserialize_uuid() {
+        let in_val1 = uuid::Uuid::new_v4();
+        let in_val2 = uuid::Uuid::new_v4();
+        let mut buf = KeyBuffer::new();
+        buf.extend(in_val1.as_bytes());
+        assert_eq!(buf.len(), 16);
+        buf.extend(in_val2.as_bytes());
+        assert_eq!(buf.len(), 16*2);
+        // ----------------
+        let mut i = buf.into_iter();
+        let val1 = parse_uuid(&mut i).unwrap();
+        assert_eq!(val1, in_val1);
+        let val2 = parse_uuid(&mut i).unwrap();
+        assert_eq!(val2, in_val2);
+    }
+
 }
