@@ -1,8 +1,8 @@
-use std::{collections::HashSet, ops::Deref, sync::Arc, time::SystemTime};
+use std::{collections::{HashMap, HashSet}, ops::Deref, sync::Arc, time::SystemTime};
 
 use bytestring::ByteString;
 use num_bigint::BigUint;
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use tikv_client::{transaction::Mutation, Key, KvPair, Transaction};
 use tokio::time::sleep;
@@ -15,7 +15,7 @@ use super::index::{deserialize_json, serialize_json};
 use super::fs_config::TiFsConfig;
 use super::flexible_transaction::{FlexibleTransaction, SpinningTxn, TransactionError, TransactionResult};
 use super::meta::MetaStatic;
-use super::key::{KeyGenerator, KeyParser, ScopedKeyBuilder};
+use super::key::{KeyGenerator, ScopedKeyBuilder};
 use super::inode::{InoDescription, InoSize, StorageDirItem, StorageDirItemKind, InoStorageFileAttr, StorageFilePermission, StorageIno};
 
 #[derive(PartialEq, Eq, Debug)]
@@ -125,14 +125,6 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         &self.parent.fs_config()
     }
 
-    pub fn key_builder(&self) -> ScopedKeyBuilder {
-        ScopedKeyBuilder::new(&self.fs_config().key_prefix)
-    }
-
-    pub fn key_parser<'fl>(&'fl self, i: &'fl mut std::slice::Iter<'fl, u8>) -> TiFsResult<KeyParser<'fl>> {
-        KeyParser::start(i, &self.fs_config().key_prefix, self.fs_config().hash_len)
-    }
-
     pub async fn meta_static_mutable_init(&mut self) -> TiFsResult<()> {
         let meta_static = Arc::new(MetaStatic {
             block_size: self.fs_config().block_size as u64,
@@ -180,17 +172,15 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
 
     pub async fn directory_scan_for_children(&mut self, dir_ino: StorageIno, limit: u32
     ) -> TiFsResult<Vec<DirectoryItem>> {
-        let range = self.key_builder().directory_child_range(dir_ino);
+        let range = self.fs_config().key_builder().directory_child_range(dir_ino);
         let data = self.mini.scan(range, limit).await?.collect::<Vec<_>>();
         let mut result = StorageDirectory::with_capacity(data.len());
 //        data.iter().enumerate().map(|(i, KvPair(k,v))|{
 //            trace!("scan result key #{i}: {:?}, data-len: {}", k, v.len());
 //        }).fold((), |_,_|{});
         for (_i, KvPair(k,v)) in data.into_iter().enumerate() {
-            let key_buf = Vec::from(k);
-            //trace!("process scan result key #{_i}: {:?}", key_buf);
-            let mut i = key_buf.iter();
-            let (_p_ino, name) = self.key_parser(&mut i)?.parse_directory_child()?;
+            let (_p_ino, name) = self.fs_config().key_parser_b(k)?
+                .parse_directory_child()?;
             let item = deserialize_json::<StorageDirItem>(&v)?;
             result.push(DirectoryItem {
                 ino: item.ino,
@@ -292,9 +282,9 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         name: ByteString,
         child_ino: StorageIno,
     ) -> TiFsResult<()> {
-        let key_parent_to_child = Key::from(self.key_builder().generate_key(
+        let key_parent_to_child = Key::from(self.fs_config().key_builder().generate_key(
             &(parent, name.as_bytes().deref())));
-        let key_child_to_parent = Key::from(self.key_builder().generate_key(
+        let key_child_to_parent = Key::from(self.fs_config().key_builder().generate_key(
             &(child_ino, parent, name.as_bytes().deref())));
         let mut mutations = Vec::with_capacity(2);
         mutations.push(Mutation::Delete(key_parent_to_child));
@@ -370,7 +360,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         ino: StorageIno
     ) -> TiFsResult<DeletionCheckResult> {
         // check for remaining usages:
-        let key_usages = self.key_builder().parent_link_scan(ino);
+        let key_usages = self.fs_config().key_builder().parent_link_scan(ino);
         let usage_count = self.mini.scan_keys(key_usages, MAX_TIKV_SCAN_LIMIT).await?.count();
         if usage_count == 0 {
             TxnDeleteMut::<StorageIno, InoDescription>::delete(self, &ino).await?;
@@ -460,15 +450,36 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
 
     pub async fn hb_increment_blocks_reference_count(
         &mut self,
-        block_key: Vec<u8>,
-        cnt: u64,
-    ) -> TiFsResult<BigUint> {
-        let prev_counter_value = self.mini.get(block_key.clone()).await?
-            .map(|vec|BigUint::from_bytes_be(&vec))
-            .unwrap_or(BigUint::from_u8(0u8).unwrap());
-        let new_counter_value = prev_counter_value.clone() + cnt;
-        self.mini.put(block_key.clone(), new_counter_value.to_bytes_be()).await?;
-        Ok(prev_counter_value)
+        blocks: &[(&TiFsHash, u64)],
+    ) -> TiFsResult<HashMap<TiFsHash, BigUint>> {
+
+        let keys = blocks.iter().map(|(h,_c)| {
+            self.fs_config().key_builder().named_hashed_block_x(
+                h,
+                Some(super::key::HashedBlockMeta::CCountedNamedUsages),
+                None).into()
+        }).collect::<Vec<Key>>();
+
+        let prev_counter_values = self.mini.batch_get_for_update(keys).await?
+            .into_iter().filter_map(|KvPair(k,v)|{
+                let kp = self.fs_config().key_parser_b(k).ok()?;
+                let hash = kp.parse_hash().ok()?.1;
+                let cnt = BigUint::from_bytes_be(&v);
+                Some((hash, cnt))
+            }).collect::<HashMap<_,_>>();
+
+        let new_counter_values = blocks.iter().map(|(h,c)|{
+            let new_cnt = c + prev_counter_values
+                .get(*h).cloned().unwrap_or(BigUint::zero());
+            let key: Key = self.fs_config().key_builder().named_hashed_block_x(
+                h,
+                Some(super::key::HashedBlockMeta::CCountedNamedUsages),
+                None).into();
+            Mutation::Put(key, new_cnt.to_bytes_be())
+        }).collect::<Vec<_>>();
+
+        self.mini.batch_mutate(new_counter_values).await?;
+        Ok(prev_counter_values)
     }
 
     pub async fn hb_replace_block_hash_for_address_no_size_update(
@@ -476,7 +487,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         addr: &BlockAddress,
         new_hash: Option<&TiFsHash>,
     ) -> TiFsResult<Option<TiFsHash>> {
-        let key = Key::from(self.key_builder().block_hash(addr.clone()));
+        let key = Key::from(self.fs_config().key_builder().block_hash(addr.clone()));
         let prev_block_hash = self.mini.get(key.clone()).await?;
         if let Some(new_hash) = new_hash {
             self.mini.put(key.clone(), new_hash.clone()).await?;
@@ -506,7 +517,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         hash: &Vec<u8>,
         cnt: u64,
     ) -> TiFsResult<()> {
-        let block_ref_cnt_key = self.key_builder().named_hashed_block_x(
+        let block_ref_cnt_key = self.fs_config().key_builder().named_hashed_block_x(
             hash, Some(HashedBlockMeta::CCountedNamedUsages), None);
 
         let prev_counter_value = self.mini.get(block_ref_cnt_key.clone()).await?
@@ -519,7 +530,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         }
         let new_counter_value = prev_counter_value.clone() - actual_dec;
         if new_counter_value == BigUint::from_u8(0).unwrap() {
-            let block_key = self.key_builder().hashed_block(hash);
+            let block_key = self.fs_config().key_builder().hashed_block(hash);
             let mut deletes = Vec::with_capacity(2);
             deletes.push(Mutation::Delete(Key::from(block_ref_cnt_key)));
             deletes.push(Mutation::Delete(Key::from(block_key)));
@@ -547,7 +558,7 @@ where V: for<'dl> Deserialize<'dl>, ScopedKeyBuilder: KeyGenerator<K, V>
     }
 
     async fn fetch_try(&mut self, key: &K) -> TiFsResult<Option<V>> {
-        let t = self.key_builder();
+        let t = self.fs_config().key_builder();
         let key_raw = t.generate_key(key);
         let result = self.mini.get(key_raw).await?;
         let Some(data) = result else {
@@ -567,7 +578,7 @@ impl<'ol, 'pl, K, V> TxnPutMut<K, V> for StartedMiniTransaction<'ol, 'pl>
 where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
 {
     async fn put(&mut self, key: &K, value: Arc<V>) -> TiFsResult<()> {
-        let t = self.key_builder();
+        let t = self.fs_config().key_builder();
         let key_raw = t.generate_key(key);
         let data = serialize_json(value.deref())
             .map_err(|err|FsError::Serialize{
@@ -584,7 +595,7 @@ impl<'ol, 'pl, K, V> TxnDeleteMut<K, V> for StartedMiniTransaction<'ol, 'pl>
 where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
 {
     async fn delete(&mut self, key: &K) -> TiFsResult<()> {
-        let t = self.key_builder();
+        let t = self.fs_config().key_builder();
         let key_raw = t.generate_key(key);
         self.mini.delete(key_raw).await?;
         Ok(())

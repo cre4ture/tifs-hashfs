@@ -5,7 +5,7 @@ use paste::paste;
 use tracing::error;
 use parse_size::parse_size;
 
-use super::{error::{FsError, TiFsResult}, inode::TiFsHash, utils::hash_algorithm::{HashAlgorithm, ALGO_HASH_LEN_MAP, ALGO_NAME_MAP}};
+use super::{error::{FsError, TiFsResult}, inode::TiFsHash, key::{KeyParser, ScopedKeyBuilder}, utils::hash_algorithm::{HashAlgorithm, ALGO_HASH_LEN_MAP, ALGO_NAME_MAP}};
 
 
 macro_rules! define_options {
@@ -334,6 +334,7 @@ impl TiFsConfig {
                             FsError::ConfigParsingFailed {
                                 msg: format!("failed to parse blksize({}): {}", size, err) }
                         })?;
+                    tracing::warn!("blksize: {}", block_size);
                 }
                 MountOption::MaxSize(size) => {
                     max_size = Some(parse_size(size)
@@ -461,5 +462,20 @@ impl TiFsConfig {
 
     pub fn calculate_hash(&self, input: &[u8]) -> TiFsHash {
         self.hash_algorithm.calculate_hash(input)
+    }
+
+    pub fn key_builder(&self) -> ScopedKeyBuilder {
+        ScopedKeyBuilder::new(&self.key_prefix)
+    }
+
+    pub fn key_parser<'fl, I>(&'fl self, i: I) -> TiFsResult<KeyParser<I>>
+    where I: Iterator<Item = u8>
+    {
+        KeyParser::start(i, &self.key_prefix, self.hash_len)
+    }
+
+    pub fn key_parser_b<'fl>(&'fl self, key: tikv_client::Key) -> TiFsResult<KeyParser<std::vec::IntoIter<u8>>>
+    {
+        self.key_parser(Vec::<u8>::from(key).into_iter())
     }
 }

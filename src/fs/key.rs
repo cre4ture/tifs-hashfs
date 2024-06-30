@@ -3,7 +3,6 @@ use std::ops::{Bound, Range};
 use bimap::BiHashMap;
 use lazy_static::lazy_static;
 use num_traits::FromBytes;
-use std::slice::Iter;
 use tikv_client::{BoundRange, Key};
 use uuid::Uuid;
 use strum::{EnumIter, IntoEnumIterator};
@@ -116,9 +115,10 @@ pub struct BlockAddress {
     pub index: BlockIndex,
 }
 
-pub fn read_big_endian<const N: usize, T: num_traits::FromBytes<Bytes = [u8; N]>>(i: &mut Iter<u8>) -> TiFsResult<T>
+pub fn read_big_endian<const N: usize, T: num_traits::FromBytes<Bytes = [u8; N]>>(
+    i: &mut impl Iterator<Item = u8>) -> TiFsResult<T>
 {
-    let bytes = i.as_slice().array_chunks::<N>().next()
+    let bytes = i.array_chunks::<N>().next()
         .ok_or(FsError::UnknownError(format!("deserialization failed!")))?.clone();
     let r: T = FromBytes::from_be_bytes(&bytes);
     i.advance_by(N).unwrap();
@@ -130,19 +130,19 @@ pub fn write_big_endian<T: num_traits::ToBytes>(value: T, buf: &mut KeyBuffer) {
 }
 
 pub trait KeyDeSer {
-    fn deserialize_from(i: &mut Iter<u8>) -> TiFsResult<Self> where Self: Sized;
-    fn deserialize_self_from(&mut self, i: &mut Iter<u8>) -> TiFsResult<()> where Self: Sized {
+    fn deserialize_from(i: &mut impl Iterator<Item = u8>) -> TiFsResult<Self> where Self: Sized;
+    fn deserialize_self_from(&mut self, i: &mut impl Iterator<Item = u8>) -> TiFsResult<()> where Self: Sized {
         Self::deserialize_from(i).map(|x| { *self = x; })
     }
     fn serialize_to(self, buf: &mut KeyBuffer);
 }
 
 impl KeyDeSer for StorageIno {
-    fn deserialize_from(i: &mut Iter<u8>) -> TiFsResult<Self> {
+    fn deserialize_from(i: &mut impl Iterator<Item = u8>) -> TiFsResult<Self> {
         read_big_endian(i).map(|x| StorageIno(x) )
     }
 
-    fn deserialize_self_from(&mut self, i: &mut Iter<u8>) -> TiFsResult<()> {
+    fn deserialize_self_from(&mut self, i: &mut impl Iterator<Item = u8>) -> TiFsResult<()> {
         read_big_endian(i).map(|x| { *self = StorageIno(x); } )
     }
 
@@ -153,12 +153,12 @@ impl KeyDeSer for StorageIno {
 
 
 impl KeyDeSer for BlockAddress {
-    fn deserialize_from(i: &mut Iter<u8>) -> TiFsResult<Self> {
+    fn deserialize_from(i: &mut impl Iterator<Item = u8>) -> TiFsResult<Self> {
         let ino = StorageIno(read_big_endian::<8, u64>(i)?);
         let index = BlockIndex(read_big_endian::<8, u64>(i)?);
         Ok(Self { ino, index })
     }
-    fn deserialize_self_from(&mut self, i: &mut Iter<u8>) -> TiFsResult<()> {
+    fn deserialize_self_from(&mut self, i: &mut impl Iterator<Item = u8>) -> TiFsResult<()> {
         Self::deserialize_from(i).map(|x|{ *self = x; })
     }
     fn serialize_to(self, buf: &mut KeyBuffer) {
@@ -167,9 +167,9 @@ impl KeyDeSer for BlockAddress {
     }
 }
 
-pub fn parse_uuid(i: &mut Iter<'_, u8>) -> TiFsResult<Uuid> {
+pub fn parse_uuid(i: &mut impl Iterator<Item = u8>) -> TiFsResult<Uuid> {
     const UUID_LEN: usize = 16;
-    let chunk = i.as_slice().array_chunks::<UUID_LEN>().next();
+    let chunk = i.array_chunks::<UUID_LEN>().next();
     let Some(chunk) = chunk else {
         return Err(FsError::Serialize{
             target: "Uuid",
@@ -178,7 +178,7 @@ pub fn parse_uuid(i: &mut Iter<'_, u8>) -> TiFsResult<Uuid> {
         });
     };
     i.advance_by(UUID_LEN).unwrap();
-    Ok(Uuid::from_bytes_ref(chunk).clone())
+    Ok(Uuid::from_bytes_ref(&chunk).clone())
 }
 
 pub fn check_file_name(name: &str) -> TiFsResult<()> {
@@ -191,21 +191,24 @@ pub fn check_file_name(name: &str) -> TiFsResult<()> {
     }
 }
 
-pub struct KeyParser<'ol> {
+pub struct KeyParser<I>
+where I: Iterator<Item = u8>
+{
     hash_len: usize,
-    i: &'ol mut Iter<'ol, u8>,
+    i: I,
     pub kind: KeyKind,
 }
 
-impl<'ol> KeyParser<'ol> {
-    pub fn start<'fl>(i: &'ol mut Iter<'ol, u8>, prefix: &'fl[u8], hash_len: usize) -> TiFsResult<Self> {
-        let act_prefix = i.as_slice().get(0..prefix.len())
-            .unwrap_or(i.as_slice());
+impl<I> KeyParser<I>
+where I: Iterator<Item = u8>
+{
+    pub fn start<'fl>(mut i: I, prefix: &'fl[u8], hash_len: usize) -> TiFsResult<Self> {
+        let act_prefix = i.by_ref().take(prefix.len()).collect::<Vec<_>>();
         if act_prefix != prefix {
             return Err(FsError::UnknownError(format!("key prefix mismatch: {:?}", act_prefix)));
         }
         i.advance_by(prefix.len()).unwrap();
-        let kind_id = *i.next().unwrap_or(&0xFF);
+        let kind_id = i.next().unwrap_or(0xFF);
         let kind = *KEY_KIND_IDS.get_by_left(&kind_id).ok_or(
             FsError::UnknownError(format!("key with unknown kind_i: {}", kind_id)))?;
         Ok(Self {
@@ -226,11 +229,11 @@ impl<'ol> KeyParser<'ol> {
     }
     */
 
-    pub fn parse_pending_deletes_x<'fl>(self) -> TiFsResult<KeyParserPendingDelete<'ol>> {
+    pub fn parse_pending_deletes_x<'fl>(mut self) -> TiFsResult<KeyParserPendingDelete<I>> {
         if self.kind != KeyKind::PendingDelete {
             return Err(FsError::UnknownError(format!("expected a pending delete key. got: {:?}", self.kind)))
         }
-        let kind_id = self.i.next().unwrap_or(&0xFF).clone();
+        let kind_id = self.i.next().unwrap_or(0xFF).clone();
         let kind = *PENDING_DELETE_META_KEY_IDS.get_by_left(&kind_id).ok_or(
             FsError::UnknownError(format!("key with unknown pending deletes kind: {}", kind_id)))?;
         Ok(KeyParserPendingDelete {
@@ -239,12 +242,12 @@ impl<'ol> KeyParser<'ol> {
         })
     }
 
-    pub fn parse_ino<'fl>(mut self) -> TiFsResult<KeyParserIno<'ol>> {
+    pub fn parse_ino<'fl>(mut self) -> TiFsResult<KeyParserIno<I>> {
         if self.kind != KeyKind::InoMetadata {
             return Err(FsError::UnknownError(format!("expected a ino metadata key. got: {:?}", self.kind)))
         }
         let ino = StorageIno(read_big_endian::<8, u64>(&mut self.i)?);
-        let kind_id = *self.i.next().unwrap_or(&0xFF);
+        let kind_id = self.i.next().unwrap_or(0xFF);
         let kind = *INO_META_KEY_IDS.get_by_left(&kind_id).ok_or(
             FsError::UnknownError(format!("key with unknown ino kind: {}", kind_id)))?;
         Ok(KeyParserIno {
@@ -254,12 +257,12 @@ impl<'ol> KeyParser<'ol> {
         })
     }
 
-    pub fn parse_hash_block_key_x<'fl>(self) -> TiFsResult<KeyParserHashBlock<'ol>> {
+    pub fn parse_hash_block_key_x<'fl>(self) -> TiFsResult<KeyParserHashBlock<I>> {
         if self.kind != KeyKind::HashedBlock {
             return Err(FsError::UnknownError(format!("expected a HashedBlock key. got: {:?}", self.kind)))
         }
-        let (me, hash) = self.parse_hash()?;
-        let kind_id = me.i.next().unwrap_or(&0xFF).clone();
+        let (mut me, hash) = self.parse_hash()?;
+        let kind_id = me.i.next().unwrap_or(0xFF).clone();
         let kind = *HASHED_BLOCK_META_KEY_IDS.get_by_left(&kind_id).ok_or(
             FsError::UnknownError(format!("key with unknown hash block kind: {}", kind_id)))?;
         Ok(KeyParserHashBlock {
@@ -269,14 +272,13 @@ impl<'ol> KeyParser<'ol> {
         })
     }
 
-    fn parse_hash(self) -> TiFsResult<(Self, TiFsHash)> {
+    pub fn parse_hash(mut self) -> TiFsResult<(Self, TiFsHash)> {
         let hash_len = self.hash_len;
-        let hash = self.i.as_slice();
+        let hash = (&mut self.i).take(self.hash_len).collect::<Vec<_>>();
         if hash.len() != hash_len {
             return Err(FsError::UnknownError(format!("Key with unexpected hash length: {}", hash.len())));
         }
-        self.i.advance_by(hash_len).unwrap();
-        Ok((self, hash[0..hash_len].to_vec()))
+        Ok((self, hash))
     }
 
     pub fn parse_key_hashed_block(self) -> TiFsResult<TiFsHash> {
@@ -289,10 +291,10 @@ impl<'ol> KeyParser<'ol> {
         })
     }
 
-    pub fn parse_key_block_address(self) -> TiFsResult<BlockAddress> {
+    pub fn parse_key_block_address(mut self) -> TiFsResult<BlockAddress> {
         Ok(match self.kind {
-            KeyKind::Block => BlockAddress::deserialize_from(self.i)?,
-            KeyKind::InoBlockHashMapping => BlockAddress::deserialize_from(self.i)?,
+            KeyKind::Block => BlockAddress::deserialize_from(&mut self.i)?,
+            KeyKind::InoBlockHashMapping => BlockAddress::deserialize_from(&mut self.i)?,
             other => {
                 return Err(FsError::UnknownError(format!("parse_key_block_address(): unexpected key_type: {:?}", other)));
             }
@@ -304,17 +306,16 @@ impl<'ol> KeyParser<'ol> {
         Ok((self, uuid))
     }
 
-    pub fn parse_lock_key(self, key_to_lock: &Vec<u8>) -> TiFsResult<Uuid> {
+    pub fn parse_lock_key(mut self, key_to_lock: &Vec<u8>) -> TiFsResult<Uuid> {
         if self.kind != KeyKind::KeyLockStates {
             return Err(FsError::UnknownError(
                 format!("parse_lock_key(): unexpected key_type: {:?}", self.kind)));
         }
-        let key_to_lock_act = self.i.as_slice().get(0..key_to_lock.len()).unwrap_or(self.i.as_slice());
-        if key_to_lock != key_to_lock_act {
+        let key_to_lock_act = (&mut self.i).take(key_to_lock.len()).collect::<Vec<_>>();
+        if key_to_lock != &key_to_lock_act {
             return Err(FsError::UnknownError(
                 format!("parse_lock_key(): unexpected key_to_lock_act: {:?}", key_to_lock_act)));
         }
-        self.i.advance_by(key_to_lock.len()).unwrap();
         Ok(self.parse_uuid()?.1)
     }
 
@@ -324,24 +325,30 @@ impl<'ol> KeyParser<'ol> {
                 format!("parse_lock_key(): unexpected key_type: {:?}", self.kind)));
         }
         let dir_ino = StorageIno::deserialize_from(&mut self.i)?;
-        let child_name = self.i.as_slice().to_vec();
+        let child_name = self.i.collect::<Vec<_>>();
         Ok((dir_ino, child_name))
     }
 }
 
-pub struct KeyParserIno<'ol> {
-    pub pre: KeyParser<'ol>,
+pub struct KeyParserIno<I>
+where I: Iterator<Item = u8>
+{
+    pub pre: KeyParser<I>,
     pub ino: StorageIno,
     pub meta: InoMetadata,
 }
 
-pub struct KeyParserPendingDelete<'ol> {
-    pub pre: KeyParser<'ol>,
+pub struct KeyParserPendingDelete<I>
+where I: Iterator<Item = u8>
+{
+    pub pre: KeyParser<I>,
     pub meta: PendingDeleteMeta,
 }
 
-pub struct KeyParserHashBlock<'ol> {
-    pub pre: KeyParser<'ol>,
+pub struct KeyParserHashBlock<I>
+where I: Iterator<Item = u8>
+{
+    pub pre: KeyParser<I>,
     pub hash: TiFsHash,
     pub meta: HashedBlockMeta,
 }

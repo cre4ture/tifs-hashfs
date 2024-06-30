@@ -451,19 +451,23 @@ impl HashFsInterface for HashFsClient {
 
     async fn hb_increment_reference_count(
         &self,
-        hash: &TiFsHash,
-        cnt: u64,
-    ) -> HashFsResult<BigUint> {
+        blocks: &[(&TiFsHash, u64)],
+    ) -> HashFsResult<HashMap<TiFsHash, BigUint>> {
         let mut rq = grpc_fs::HbIncrementReferenceCountRq::default();
-        rq.hash = Some(grpc_fs::Hash{data: hash.clone()});
-        rq.cnt = cnt;
+        rq.increments = blocks.iter().map(|(h,c)|{
+            grpc_fs::HashBlockIncrements {
+                hash: Some(grpc_fs::Hash{data: (**h).clone()}),
+                inc: *c,
+            }
+        }).collect();
         let rs = self.lock_grpc().await?
             .hb_increment_reference_count(rq).await?.into_inner();
         handle_error(&rs.error)?;
-        let Some(previous_cnt) = rs.previous_cnt else {
-            return Err(HashFsError::GrpcMessageIncomplete);
-        };
-        Ok(BigUint::from_bytes_be(&previous_cnt.big_endian_value))
+        let previous_cnt = rs.previous_counts.into_iter()
+            .filter_map(|grpc_fs::HashBlockCount{hash,count}|{
+                Some((hash?.data, count?.into()))
+        }).collect::<HashMap<_,_>>();
+        Ok(previous_cnt)
     }
 
     async fn hb_upload_new_block(

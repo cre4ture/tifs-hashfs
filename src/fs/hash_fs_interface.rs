@@ -190,9 +190,8 @@ pub trait HashFsInterface: Send + Sync  {
     // Also succeeds if block didn't exist before. Returns previous counter value 0 in this case.
     async fn hb_increment_reference_count(
         &self,
-        hash: &TiFsHash,
-        cnt: u64
-    ) -> HashFsResult<BigUint>;
+        blocks: &[(&TiFsHash, u64)],
+    ) -> HashFsResult<HashMap<TiFsHash, BigUint>>;
     // This uploads data for a new block. Will not do any reference count changes.
     // Will also succeed when the block already existed.
     async fn hb_upload_new_block(

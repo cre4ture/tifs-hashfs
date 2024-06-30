@@ -171,8 +171,8 @@ impl SzymanowskiCriticalSection {
         let all_states = all_states_kv.into_iter().filter_map(
             |KvPair(k,v)| {
                 let key_buffer = Vec::from(k);
-                let mut i = key_buffer.iter();
-                let TiFsResult::Ok(parsed_uuid) = txn.key_parser(&mut i).and_then(|kp|{
+                let i = key_buffer.into_iter();
+                let TiFsResult::Ok(parsed_uuid) = txn.fs_config().key_parser(i).and_then(|kp|{
                     kp.parse_lock_key(&self.key_to_lock)
                  }) else {
                     tracing::error!("parsing of lock state key failed!");

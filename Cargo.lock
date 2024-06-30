@@ -2339,6 +2339,7 @@ dependencies = [
  "fuser",
  "futures",
  "num-bigint",
+ "num-traits",
  "prost",
  "prost-types",
  "tifs",

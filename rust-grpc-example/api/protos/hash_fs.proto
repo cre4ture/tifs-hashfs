@@ -163,6 +163,16 @@ message HashBlockData {
   bytes data = 2;
 }
 
+message HashBlockCount {
+  Hash hash = 1;
+  BigUint count = 2;
+}
+
+message HashBlockIncrements {
+  Hash hash = 1;
+  uint64 inc = 2;
+}
+
 message BigUint {
   bytes big_endian_value = 1;
 }
@@ -372,13 +382,12 @@ message file_read_block_hashes_rs {
 }
 
 message hb_increment_reference_count_rq {
-  Hash hash = 1;
-  uint64 cnt = 2;
+  repeated HashBlockIncrements increments = 1;
 }
 
 message hb_increment_reference_count_rs {
   HashFsError error = 1;
-  BigUint previous_cnt = 2;
+  repeated HashBlockCount previous_counts = 2;
 }
 
 message hb_upload_new_block_rq {

@@ -10,7 +10,7 @@ use tokio::time::sleep;
 use super::error::FsError;
 use super::fs_config::TiFsConfig;
 use super::index::{deserialize_json, serialize_json};
-use super::key::{KeyGenerator, KeyParser, ScopedKeyBuilder};
+use super::key::{KeyGenerator, ScopedKeyBuilder};
 use super::mini_transaction::MiniTransaction;
 use super::utils::txn_data_cache::{TxnDelete, TxnFetch, TxnPut};
 use super::{error::TiFsResult, transaction::{DEFAULT_REGION_BACKOFF, OPTIMISTIC_BACKOFF}, transaction_client_mux::TransactionClientMux};
@@ -398,14 +398,6 @@ impl FlexibleTransaction {
             Ok(())
         }
     }
-
-    pub fn key_builder(&self) -> ScopedKeyBuilder {
-        ScopedKeyBuilder::new(&self.fs_config.key_prefix)
-    }
-
-    pub fn key_parser<'fl>(&'fl self, i: &'fl mut std::slice::Iter<'fl, u8>) -> TiFsResult<KeyParser<'fl>> {
-        KeyParser::start(i, &self.fs_config.key_prefix, self.fs_config.hash_len)
-    }
 }
 
 
@@ -414,7 +406,7 @@ impl<K, V> TxnFetch<K, V> for FlexibleTransaction
 where V: for<'dl> Deserialize<'dl>, ScopedKeyBuilder: KeyGenerator<K, V>
 {
     async fn fetch(&self, key: &K) -> TiFsResult<Arc<V>> {
-        let t = self.key_builder();
+        let t = self.fs_config.key_builder();
         let key_raw = t.generate_key(key);
         let result = self.get(key_raw).await?;
         let Some(data) = result else {
@@ -430,7 +422,7 @@ impl<K, V> TxnPut<K, V> for FlexibleTransaction
 where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
 {
     async fn put_json(&self, key: &K, value: Arc<V>) -> TiFsResult<()> {
-        let t = self.key_builder();
+        let t = self.fs_config.key_builder();
         let key = t.generate_key(key);
         let data = serialize_json(value.deref())
             .map_err(|err|FsError::UnknownError(format!("serialization failed: {err}")))?;
@@ -443,7 +435,7 @@ impl<K, V> TxnDelete<K, V> for FlexibleTransaction
 where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
 {
     async fn delete(&self, key: &K) -> TiFsResult<()> {
-        let t = self.key_builder();
+        let t = self.fs_config.key_builder();
         let key = t.generate_key(key);
         self.delete(key).await?;
         Ok(())

@@ -24,6 +24,7 @@ bytestring = "1.0"
 fuser = {git = "https://github.com/cberner/fuser.git", features = ["serializable", "abi-7-31"]}
 uuid = "1.8.0"
 num-bigint = "0.4.5"
+num-traits = "0.2.19"
 futures = "0.3.30"
 
 [build-dependencies]

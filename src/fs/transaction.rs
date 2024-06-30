@@ -442,7 +442,7 @@ impl Txn {
     ) -> TiFsResult<()> {
         let mut watch = AutoStopWatch::start("pm_details");
         let previous_reference_count = self.hash_fs.hb_increment_reference_count(
-            &block_hash, ref_count_delta).await?;
+            &[(&block_hash, ref_count_delta)]).await?.into_iter().next().unwrap().1;
 
         watch.sync("inc");
 

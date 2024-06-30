@@ -26,7 +26,7 @@ use super::utils::txn_data_cache::{TxnFetch, TxnPut, TxnPutMut};
 use super::{
     error::TiFsResult, flexible_transaction::FlexibleTransaction, fs_config::TiFsConfig, meta::MetaStatic
     };
-use super::key::{check_file_name, InoMetadata, KeyParser, ScopedKeyBuilder, ROOT_INODE};
+use super::key::{check_file_name, InoMetadata, ROOT_INODE};
 use super::hash_fs_interface::{
         BlockIndex, GotOrMade, HashFsError, HashFsInterface, HashFsResult};
 use super::inode::{DirectoryItem, InoAccessTime, InoChangeIterationId, InoDescription, InoInlineData, InoSize, InoStorageFileAttr, ModificationTime, ParentStorageIno, StorageDirItem, StorageDirItemKind, StorageFilePermission, StorageIno};
@@ -83,14 +83,6 @@ impl TikvBasedHashFs {
         })
     }
 
-    pub fn key_builder(&self) -> ScopedKeyBuilder {
-        ScopedKeyBuilder::new(&self.fs_config.key_prefix)
-    }
-
-    pub fn key_parser<'fl>(&'fl self, i: &'fl mut std::slice::Iter<'fl, u8>) -> TiFsResult<KeyParser<'fl>> {
-        KeyParser::start(i, &self.fs_config.key_prefix, self.fs_config.hash_len)
-    }
-
     async fn directory_remove_child_generic(
         &self,
         parent: ParentStorageIno,
@@ -127,7 +119,7 @@ impl TikvBasedHashFs {
             }
 
             for meta in InoMetadata::iter() {
-                let key = self.key_builder().inode_x(unlinked_item.ino, meta).as_key();
+                let key = self.fs_config.key_builder().inode_x(unlinked_item.ino, meta).as_key();
                 self.f_txn.delete(key).await?;
             }
         }
@@ -141,7 +133,7 @@ impl TikvBasedHashFs {
         ino: StorageIno,
         block_range: Range<BlockIndex>,
     ) -> TiFsResult<BTreeMap<BlockIndex, TiFsHash>> {
-        let range = self.key_builder().block_hash_range(ino, block_range.clone());
+        let range = self.fs_config.key_builder().block_hash_range(ino, block_range.clone());
         let iter = self.f_txn.scan(
                 range,
                 block_range.count() as u32,
@@ -149,9 +141,7 @@ impl TikvBasedHashFs {
             .await?;
         let mut result = BTreeMap::<BlockIndex, TiFsHash>::new();
         for KvPair(k, hash) in iter.into_iter() {
-            let key_vec = Vec::from(k);
-            let mut i = key_vec.iter();
-            let key = self.key_parser(&mut i)?.parse_key_block_address()?;
+            let key = self.fs_config.key_parser_b(k)?.parse_key_block_address()?;
             if hash.len() != self.fs_config.hash_len {
                 tracing::error!("hash length mismatch!");
                 continue;
@@ -303,16 +293,14 @@ impl TikvBasedHashFs {
         elements: &[InoMetadata],
     ) -> TiFsResult<(Vec<TiFsHash>, Vec<InoChangeIterationId>, Vec<InoSize>)> {
         let keys = elements.iter().map(|meta|{
-            Key::from(self.key_builder().inode_x(ino, *meta).buf)
+            Key::from(self.fs_config.key_builder().inode_x(ino, *meta).buf)
         }).collect::<Vec<_>>();
         let data = self.f_txn.batch_get(keys).await?;
         let mut existing_hash = Vec::new();
         let mut change_iter_id = Vec::new();
         let mut size = Vec::new();
         for KvPair(k, v) in data {
-            let key_buf: Vec<u8> = k.into();
-            let mut i = key_buf.iter();
-            match self.key_parser(&mut i)?.parse_ino()?.meta {
+            match self.fs_config.key_parser_b(k)?.parse_ino()?.meta {
                 InoMetadata::FullHash => {
                     existing_hash.push(v);
                 }
@@ -368,7 +356,7 @@ impl HashFsInterface for TikvBasedHashFs {
     }
 
     async fn meta_static_read(&self) -> HashFsResult<MetaStatic> {
-        let key = Key::from(self.key_builder().meta_static());
+        let key = Key::from(self.fs_config.key_builder().meta_static());
         let data = self.f_txn.get(key).await?.ok_or(HashFsError::FsNotInitialized)?;
         let result = MetaStatic::deserialize(&data).map_err(|err|{
             HashFsError::FsHasInvalidData(Some(format!("reading static metadata: {err:?}")))
@@ -686,7 +674,7 @@ impl HashFsInterface for TikvBasedHashFs {
 
             // clear full file hash:
             {
-                let full_hash_key = self.key_builder().inode_x(
+                let full_hash_key = self.fs_config.key_builder().inode_x(
                     ino, super::key::InoMetadata::FullHash).buf;
                 let mut spin = MiniTransaction::new(&self.f_txn).await?;
                 loop {
@@ -824,32 +812,29 @@ impl HashFsInterface for TikvBasedHashFs {
     ) -> HashFsResult<HashMap<TiFsHash, Arc<Vec<u8>>>> {
         let mut keys = Vec::with_capacity(hashes.len());
         for hash in hashes {
-            let key = self.key_builder().hashed_block(*hash);
+            let key = self.fs_config.key_builder().hashed_block(*hash);
             keys.push(Key::from(key));
         }
         let rcv_data_list = self.f_txn.batch_get(keys).await?;
         let mut hashed_block_data = HashMap::with_capacity(rcv_data_list.len());
         for KvPair(k, v) in rcv_data_list {
-            let key_data = Vec::from(k);
-            let mut i = key_data.iter();
-            let hash = self.key_parser(&mut i)?.parse_key_hashed_block()?;
+            let hash = self.fs_config.key_parser_b(k)?.parse_key_hashed_block()?;
             let value = Arc::new(v);
             hashed_block_data.insert(hash.clone(), value.clone());
         }
         Ok(hashed_block_data)
     }
 
-    async fn hb_increment_reference_count(&self, hash: &TiFsHash, cnt: u64) -> HashFsResult<BigUint> {
-
-        let block_ref_cnt_key = self.key_builder().named_hashed_block_x(
-            hash, Some(super::key::HashedBlockMeta::CCountedNamedUsages), None);
-
+    async fn hb_increment_reference_count(
+        &self,
+        blocks: &[(&TiFsHash, u64)],
+    ) -> HashFsResult<HashMap<TiFsHash, BigUint>> {
         // get and increment block reference counter (with automatic retry)
         let mut spin = self.f_txn.spinning_mini_txn().await?;
-        let prev_cnt: BigUint = loop {
+        let prev_cnt = loop {
             let mut started = spin.start().await?;
             let r1 = started.hb_increment_blocks_reference_count(
-                block_ref_cnt_key.clone(), cnt).await;
+                blocks).await;
             if let Some(result) = started.finish(r1).await
             { break result?; };
         };
@@ -857,7 +842,7 @@ impl HashFsInterface for TikvBasedHashFs {
     }
 
     async fn hb_upload_new_block(&self, block_hash: TiFsHash, data: Vec<u8>) -> HashFsResult<()> {
-        let key = self.key_builder().hashed_block(&block_hash);
+        let key = self.fs_config.key_builder().hashed_block(&block_hash);
         self.f_txn.put(key, data).await?;
         Ok(())
     }

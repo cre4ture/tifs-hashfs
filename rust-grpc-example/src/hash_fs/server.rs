@@ -557,16 +557,26 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         tonic::Status,
     >{
         let rq = request.into_inner();
-        let Some(hash) = rq.hash else {
-            return Err(tonic::Status::invalid_argument("hash parameter is required!"));
+        if rq.increments.len() == 0 {
+            return Err(tonic::Status::invalid_argument("increments parameter is required!"));
         };
+        let list = rq.increments.into_iter().filter_map(|e|{
+            Some((e.hash?.data, e.inc))
+        }).collect::<Vec<_>>();
+        let list_ref = list.iter().map(|(h,c)|(h,*c)).collect::<Vec<_>>();
         let r = self.fs_impl
-            .hb_increment_reference_count(&hash.data, rq.cnt).await;
+            .hb_increment_reference_count(&list_ref).await;
         let mut rsp = grpc_fs::HbIncrementReferenceCountRs::default();
         match r {
             Err(err) => rsp.error = Some(err.into()),
             Ok(data) => {
-                rsp.previous_cnt = Some(data.into());
+                rsp.previous_counts = data.into_iter()
+                .map(|(h,c)|{
+                    grpc_fs::HashBlockCount {
+                        hash: Some(grpc_fs::Hash { data: h }),
+                        count: Some(c.into())
+                    }
+                }).collect();
             }
         }
         Ok(tonic::Response::new(rsp))
