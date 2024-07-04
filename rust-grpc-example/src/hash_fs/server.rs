@@ -462,12 +462,14 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         let Some(ino) = rq.ino else {
             return Err(tonic::Status::invalid_argument("ino parameter is required!"));
         };
-        let Some(block_range) = rq.range else {
-            return Err(tonic::Status::invalid_argument("block_range parameter is required!"));
+        if rq.ranges.len() == 0 {
+            return Err(tonic::Status::invalid_argument("block_ranges parameter is required!"));
         };
+        let block_ranges = rq.ranges.iter().map(|br|br.clone().into())
+            .collect::<Vec<std::ops::Range<BlockIndex> >>();
         let r = self.fs_impl
             .inode_read_block_hashes_block_range(
-                ino.into(), block_range.into()).await;
+                ino.into(), &block_ranges).await;
         let mut rsp = grpc_fs::InodeReadBlockHashesBlockRangeRs::default();
         match r {
             Err(err) => rsp.error = Some(err.into()),

@@ -267,7 +267,7 @@ impl AsyncFileSystem for TiFs {
 
         let fut =
             arc.clone().spin_no_delay_arc(format!("write, ino:{ino}, fh:{fh}, offset:{offset}, data.len:{}", size),
-                move |_me, txn| txn.write(fh_clone.clone(), start as u64, data.clone()).boxed());
+                move |_me, txn| txn.write(fh_clone.clone(), start as u64, data.clone(), false).boxed());
 
         write_cache.push(fut.boxed()).await;
         let results = write_cache.get_results_so_far();

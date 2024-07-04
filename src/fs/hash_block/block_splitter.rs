@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use crate::fs::hash_fs_interface::BlockIndex;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BlockIndexAndData<'a> {
     pub block_index: BlockIndex,
     pub data: &'a[u8],

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::anyhow;
 use bimap::BiHashMap;
+use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::{FileAttr, FileType};
 use futures::FutureExt;
@@ -833,6 +834,12 @@ impl TiFs {
         for r in results {
             r?;
         }
+        let start = 0;
+        let size = 0;
+        let ino = file_handler.ino();
+        let fh_clone = file_handler.clone();
+        self.spin_no_delay(format!("write, ino:{ino}, fh:{fh}, offset:{start}, data.len:{size} - flush"),
+                move |_me, txn| txn.write(fh_clone.clone(), start as u64, Bytes::new(), true).boxed()).await?;
         Ok(())
     }
 }

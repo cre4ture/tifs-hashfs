@@ -390,11 +390,12 @@ impl HashFsInterface for HashFsClient {
     async fn inode_read_block_hashes_block_range(
         &self,
         ino: StorageIno,
-        block_range: std::ops::Range<BlockIndex> ,
+        block_ranges: &[Range<BlockIndex>],
     ) -> HashFsResult<BTreeMap<BlockIndex, TiFsHash>> {
         let mut rq = grpc_fs::InodeReadBlockHashesBlockRangeRq::default();
         rq.ino = Some(ino.into());
-        rq.range = Some(block_range.into());
+        rq.ranges = block_ranges.iter().map(|br| (*br).clone().into())
+            .collect::<Vec<grpc_fs::BlockRange>>();
         let rs = self.lock_grpc().await?
             .inode_read_block_hashes_block_range(rq).await?.into_inner();
         handle_error(&rs.error)?;

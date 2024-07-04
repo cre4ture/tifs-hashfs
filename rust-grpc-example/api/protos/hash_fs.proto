@@ -351,7 +351,7 @@ message inode_read_block_hashes_data_range_rs {
 
 message inode_read_block_hashes_block_range_rq {
   StorageIno ino = 1;
-  BlockRange range = 2;
+  repeated BlockRange ranges = 2;
 }
 
 message inode_read_block_hashes_block_range_rs {

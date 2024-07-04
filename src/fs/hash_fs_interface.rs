@@ -174,7 +174,7 @@ pub trait HashFsInterface: Send + Sync  {
     async fn inode_read_block_hashes_block_range(
         &self,
         ino: StorageIno,
-        block_range: Range<BlockIndex>,
+        block_ranges: &[Range<BlockIndex>],
     ) -> HashFsResult<BTreeMap<BlockIndex, TiFsHash>>;
     async fn hb_get_block_data_by_hashes(
         &self,

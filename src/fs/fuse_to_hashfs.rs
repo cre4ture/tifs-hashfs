@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::iter::FromIterator;
-use std::ops::Range;
+use std::mem;
+use std::ops::{DerefMut, Range};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
@@ -15,6 +16,7 @@ use tikv_client::Backoff;
 use tracing::{instrument, trace, Level};
 use uuid::Uuid;
 
+use crate::fs::file_handler::WriteTaskData;
 use crate::fs::inode::{StorageDirItemKind, StorageIno};
 use crate::fs::key::MAX_NAME_LEN;
 use crate::fs::meta::MetaStatic;
@@ -23,7 +25,7 @@ use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 use super::dir::StorageDirectory;
 use super::error::{FsError, TiFsResult};
-use super::file_handler::FileHandler;
+use super::file_handler::{FileHandler, WriteTaskDataList};
 use super::fs_config::TiFsConfig;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
@@ -466,50 +468,66 @@ impl Txn {
     pub async fn hb_write_data(
         self: Arc<Self>,
         fh: Arc<FileHandler>,
-        start: u64,
-        data: Bytes
+        jobs: WriteTaskDataList,
     ) -> TiFsResult<bool> {
 
-        let mut watch = AutoStopWatch::start("hb_wrt");
-        let bs = BlockSplitterWrite::new(self.block_size, start, &data);
-        let block_range = bs.get_range();
         let ino = fh.ino();
+        let mut watch = AutoStopWatch::start("hb_wrt");
+        let bs_list = jobs.0.iter().map(|j|{
+            let bs = BlockSplitterWrite::new(self.block_size, j.start, &j.data);
+            bs
+        }).collect::<Vec<_>>();
 
-        // 1. Remote interaction: Read existing block hashes for range:
+        let block_ranges = bs_list.iter()
+            .map(|bs|bs.get_range()).collect::<Vec<_>>();
+
+        // 1. Remote interaction: Read existing block hashes for ranges:
         let hash_list_prev = self.hash_fs.inode_read_block_hashes_block_range(
-            ino, block_range.clone()).await?;
+            ino, &block_ranges).await?;
+
         let input_block_hashes = hash_list_prev.len();
         watch.sync("hp");
 
         let mut pre_data_hash_request = HashSet::<TiFsHash>::new();
-        let first_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
-            &self.fs_config,
-            bs.first_data,
-            bs.first_data_start_position,
-            &hash_list_prev,
-            &mut pre_data_hash_request
-        );
-        let last_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
-            &self.fs_config,
-            bs.last_data,
-            0,
-            &hash_list_prev,
-            &mut pre_data_hash_request
-        );
+
+        let mut data_handlers = Vec::new();
+        for bs in &bs_list {
+            let first_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
+                &self.fs_config,
+                bs.first_data.clone(),
+                bs.first_data_start_position,
+                &hash_list_prev,
+                &mut pre_data_hash_request
+            );
+            let last_data_handler = UpdateIrregularBlock::get_and_add_original_block_hash(
+                &self.fs_config,
+                bs.last_data.clone(),
+                0,
+                &hash_list_prev,
+                &mut pre_data_hash_request
+            );
+            data_handlers.push((first_data_handler, last_data_handler));
+        }
 
         // 2. Remote interaction: Read data of first and last block (only if needed)
-        let pre_data = self.clone().hb_get_block_data_by_hashes_cached(&pre_data_hash_request).await?;
+        let pre_data = self.clone()
+            .hb_get_block_data_by_hashes_cached(&pre_data_hash_request).await?;
         watch.sync("pd");
+
         let mut new_blocks = HashMap::new();
         let mut new_block_hashes = HashMap::new();
 
-        first_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_hashes);
-        last_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_hashes);
+        for (first_data_handler, last_data_handler) in &mut data_handlers {
+            first_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_hashes);
+            last_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_hashes);
+        }
 
-        for (index, chunk) in bs.mid_data.data.chunks(self.block_size as usize).enumerate() {
-            let hash = self.fs_config.calculate_hash(chunk);
-            new_blocks.insert(hash.clone(), Arc::new(chunk.to_vec()));
-            new_block_hashes.insert(BlockIndex(bs.mid_data.block_index.0 + index as u64), hash);
+        for bs in &bs_list {
+            for (index, chunk) in bs.mid_data.data.chunks(self.block_size as usize).enumerate() {
+                let hash = self.fs_config.calculate_hash(chunk);
+                new_blocks.insert(hash.clone(), Arc::new(chunk.to_vec()));
+                new_block_hashes.insert(BlockIndex(bs.mid_data.block_index.0 + index as u64), hash);
+            }
         }
         watch.sync("hash");
 
@@ -585,21 +603,43 @@ impl Txn {
 
         watch.sync("pm");
 
-        tracing::debug!("hb_write_data(ino:{},start:{},len:{})-bl_len:{},bl_cnt:{},bl_idx[{}..{}[,jobs:{total_jobs}({skipped_new_block_hashes}/{input_block_hashes} skipped)", ino, start.to_formatted_string(&Locale::en), data.len().to_formatted_string(&Locale::en), bs.block_size, block_range.end - block_range.start, block_range.start, block_range.end);
+        let starts_str = jobs.0.iter().enumerate().map(|(i, j)|{
+            let bs = &bs_list[i];
+            format!("{}+{}-[{}..{}[(cnt:{})",
+                j.start.to_formatted_string(&Locale::en),
+                j.data.len(),
+                bs.get_range().start,
+                bs.get_range().end,
+                bs.get_range().end - bs.get_range().start,
+                )
+        }).reduce(|a,s| a + ", " + &s).unwrap_or(format!("error"));
+        tracing::debug!("hb_write_data(ino:{},start+len:{})-bl_len:{},jobs:{total_jobs}({skipped_new_block_hashes}/{input_block_hashes} skipped)", ino, starts_str, self.fs_config.block_size);
 
         let was_modified = new_block_hashes_len > 0;
         Ok(was_modified)
     }
 
-    pub async fn write(self: TxnArc, fh: Arc<FileHandler>, start: u64, data: Bytes) -> TiFsResult<usize> {
+    pub async fn write(self: TxnArc, fh: Arc<FileHandler>, start: u64, data: Bytes, flush: bool) -> TiFsResult<usize> {
         let mut watch = AutoStopWatch::start("write_data");
         let ino = fh.ino();
-        trace!("write data at ({})[{}]", ino, start);
-
         let size = data.len();
-        let _ = self.clone().hb_write_data(fh.clone(), start, data).await?;
+        trace!("write data at ({})[{}+{}]", ino, start, size);
 
-        watch.sync("write impl");
+        let mut lock = fh.write_accumulator.write().await;
+        if data.len() > 0 {
+            lock.0.push(WriteTaskData{
+                data,
+                start,
+            });
+        }
+        if flush || (lock.write_data_len() > self.fs_config.write_accumulator_flush_threshold) {
+            let jobs = mem::take(lock.deref_mut());
+            mem::drop(lock);
+            if jobs.0.len() > 0 {
+                let _ = self.clone().hb_write_data(fh.clone(), jobs).await?;
+                watch.sync("write impl");
+            }
+        }
 
         Ok(size)
     }

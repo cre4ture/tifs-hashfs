@@ -7,6 +7,8 @@ use std::time::SystemTime;
 use bytestring::ByteString;
 use fuser::TimeOrNow;
 use num_bigint::BigUint;
+use range_collections::range_set::RangeSetRange;
+use range_collections::RangeSet2;
 use strum::IntoEnumIterator;
 use tikv_client::{Key, KvPair};
 use tikv_client::transaction::Mutation;
@@ -642,10 +644,31 @@ impl HashFsInterface for TikvBasedHashFs {
     async fn inode_read_block_hashes_block_range(
         &self,
         ino: StorageIno,
-        block_range: Range<BlockIndex>,
+        block_ranges: &[Range<BlockIndex>],
     ) -> HashFsResult<BTreeMap<BlockIndex, TiFsHash>> {
-        let block_hashes = self.hb_get_block_hash_list_by_block_range_chunked(ino, block_range).await?;
-        Ok(block_hashes)
+
+        let mut range_collection = RangeSet2::empty();
+        for block_range in block_ranges {
+            let range = RangeSet2::from(block_range.start.0..block_range.end.0);
+            range_collection.union_with(range.as_ref());
+        }
+
+        let mut block_hashes_all: Option<BTreeMap<BlockIndex, Vec<u8>>> = None;
+        for range_sr in range_collection.iter() {
+            let RangeSetRange::Range(range) = range_sr else {
+                panic!("unsupported range: {:?}", range_sr);
+            };
+            let block_hashes = self
+                .hb_get_block_hash_list_by_block_range_chunked(ino,
+                    BlockIndex(*range.start)..BlockIndex(*range.end) ).await?;
+            if let Some(hm) = &mut block_hashes_all {
+                hm.extend(block_hashes.into_iter());
+            } else {
+                block_hashes_all = Some(block_hashes);
+            }
+        }
+
+        Ok(block_hashes_all.unwrap_or_default())
     }
 
     async fn inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(

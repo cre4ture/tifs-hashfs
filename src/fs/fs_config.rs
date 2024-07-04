@@ -279,6 +279,7 @@ define_options! { MountOption (FuseMountOption) {
     define HashAlgorithm(String),
     define InlineDataLimit(String),
     define SmallTxns,
+    define WriteAccumulatorFlushThreshold(String),
 }}
 
 #[derive(Clone)]
@@ -303,6 +304,7 @@ pub struct TiFsConfig {
     pub parallel_jobs_delete: usize,
     pub max_chunk_size: usize,
     pub write_in_progress_limit: usize,
+    pub write_accumulator_flush_threshold: u64,
     pub read_ahead_size: u64,
     pub read_ahead_in_progress_limit: usize,
     pub small_transactions: bool,
@@ -325,6 +327,7 @@ impl TiFsConfig {
         let mut parallel_jobs = 0;
         let mut parallel_jobs_delete = 0;
         let chunked_block_upload = true;
+        let mut write_accumulator_flush_threshold = 2 << 20;
 
         // iterate over options and overwrite defaults
         for option in options {
@@ -372,6 +375,13 @@ impl TiFsConfig {
                         .map_err(|err|{
                             FsError::ConfigParsingFailed {
                                 msg: format!("fail to parse ParallelJobsDelete({}): {}", value, err) }
+                        })?;
+                }
+                MountOption::WriteAccumulatorFlushThreshold(value) => {
+                    write_accumulator_flush_threshold = value.parse::<u64>()
+                        .map_err(|err|{
+                            FsError::ConfigParsingFailed {
+                                msg: format!("fail to parse WriteAccumulatorFlushThreshold({}): {}", value, err) }
                         })?;
                 }
                 _ => {}
@@ -459,6 +469,7 @@ impl TiFsConfig {
             }).unwrap_or(10),
             small_transactions,
             chunked_block_upload,
+            write_accumulator_flush_threshold,
         };
         Ok(cfg)
     }

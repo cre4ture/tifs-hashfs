@@ -1,5 +1,6 @@
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use range_collections::{RangeSet, RangeSet2};
 use tokio::sync::RwLock;
@@ -31,11 +32,29 @@ impl ReadAhead {
     }
 }
 
+pub struct WriteTaskData {
+    pub data: Bytes,
+    pub start: u64,
+}
+
+#[derive(Default)]
+pub struct WriteTaskDataList(pub Vec<WriteTaskData>);
+
+impl WriteTaskDataList {
+    pub fn write_data_len(&self) -> u64 {
+        self.0.iter()
+            .map(|j|j.data.len() as u64)
+            .reduce(|a,l| { a + l })
+            .unwrap_or(0)
+    }
+}
+
 pub struct FileHandler {
     pub ino_use: Arc<InoUse>,
     pub open_mode: OpenMode,
     pub mut_data: RwLock<FileHandlerMutData>,
     pub write_cache: RwLock<AsyncParallelPipeStage<BoxFuture<'static, TiFsResult<usize>>>>,
+    pub write_accumulator: RwLock<WriteTaskDataList>,
     pub read_ahead: RwLock<AsyncParallelPipeStage<BoxFuture<'static, TiFsResult<()>>>>,
     pub read_ahead_map: RwLock<ReadAhead>,
 }
@@ -53,6 +72,7 @@ impl FileHandler {
                cursor: HashMap::new(),
             }),
             write_cache: RwLock::new(AsyncParallelPipeStage::new(fs_config.write_in_progress_limit)),
+            write_accumulator: RwLock::new(WriteTaskDataList(vec![])),
             read_ahead: RwLock::new(AsyncParallelPipeStage::new(2)),
             read_ahead_map: RwLock::new(ReadAhead { cached_ranges: RangeSet2::empty() })
         }
