@@ -454,6 +454,9 @@ impl HashFsInterface for HashFsClient {
         &self,
         blocks: &[(&TiFsHash, u64)],
     ) -> HashFsResult<HashMap<TiFsHash, BigUint>> {
+        if blocks.len() == 0 {
+            return Ok(HashMap::new());
+        }
         let mut rq = grpc_fs::HbIncrementReferenceCountRq::default();
         rq.increments = blocks.iter().map(|(h,c)|{
             grpc_fs::HashBlockIncrements {
@@ -475,6 +478,10 @@ impl HashFsInterface for HashFsClient {
         &self,
         blocks: &[(&TiFsHash, Arc<Vec<u8>>)],
     ) -> HashFsResult<()> {
+        if blocks.len() == 0 {
+            return Ok(());
+        }
+
         let mut rq = grpc_fs::HbUploadNewBlockRq::default();
         rq.blocks = blocks.iter().map(|(h, data)|{
             grpc_fs::HashBlockData {
@@ -493,6 +500,9 @@ impl HashFsInterface for HashFsClient {
         ino: StorageIno,
         blocks: &[(&TiFsHash, u64, Vec<BlockIndex>)],
     ) -> HashFsResult<()> {
+        if blocks.len() == 0 {
+            return Ok(());
+        }
         let mut rq = grpc_fs::InodeWriteHashBlockToAddressesUpdateInoSizeAndCleaningPreviousBlockHashesRq::default();
         rq.ino = Some(ino.into());
         rq.blocks = blocks.iter().map(|(h,l,ids)|{
