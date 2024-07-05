@@ -515,18 +515,18 @@ impl Txn {
         watch.sync("pd");
 
         let mut new_blocks = HashMap::new();
-        let mut new_block_hashes = HashMap::new();
+        let mut new_block_index_hash = HashMap::new();
 
         for (first_data_handler, last_data_handler) in &mut data_handlers {
-            first_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_hashes);
-            last_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_hashes);
+            first_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_index_hash);
+            last_data_handler.get_and_modify_block_and_publish_hash(&pre_data, &mut new_blocks, &mut new_block_index_hash);
         }
 
         for bs in &bs_list {
             for (index, chunk) in bs.mid_data.data.chunks(self.block_size as usize).enumerate() {
                 let hash = self.fs_config.calculate_hash(chunk);
                 new_blocks.insert(hash.clone(), Arc::new(chunk.to_vec()));
-                new_block_hashes.insert(BlockIndex(bs.mid_data.block_index.0 + index as u64), hash);
+                new_block_index_hash.insert(BlockIndex(bs.mid_data.block_index.0 + index as u64), hash);
             }
         }
         watch.sync("hash");
@@ -539,16 +539,16 @@ impl Txn {
         // filter out unchanged blocks:
         let mut skipped_new_block_hashes = 0;
         for (block_index, prev_block_hash) in hash_list_prev.iter() {
-            if let Some(new_block_hash) = new_block_hashes.get(block_index) {
+            if let Some(new_block_hash) = new_block_index_hash.get(block_index) {
                 if prev_block_hash == new_block_hash {
-                    new_block_hashes.remove(block_index);
+                    new_block_index_hash.remove(block_index);
                     skipped_new_block_hashes += 1;
                 }
             }
         }
 
-        let new_block_hashes_len = new_block_hashes.len();
-        let mm = new_block_hashes.into_iter()
+        let new_block_hashes_len = new_block_index_hash.len();
+        let mm = new_block_index_hash.into_iter()
             .map(|(k,v)| (v,k)).collect::<MultiMap<_,_>>();
 
         let mut parallel_executor = AsyncParallelPipeStage::new(self.fs_config.parallel_jobs);

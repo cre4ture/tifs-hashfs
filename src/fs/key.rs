@@ -23,7 +23,10 @@ pub const ROOT_LOGICAL_INODE: LogicalIno = LogicalIno::from_raw(fuser::FUSE_ROOT
 
 // to avoid that opened inode are deleted when they are removed from the directory,
 // we add those opened inodes to a special invisible parent directory:
-pub const OPENED_INODE_PARENT_INODE: ParentStorageIno = ParentStorageIno(StorageIno(ROOT_INODE.0.0+1)); // NR: 2
+pub const OPENED_INODE_PARENT_INODE: ParentStorageIno = ParentStorageIno(StorageIno(ROOT_INODE.0.0-1+2)); // NR: 2
+pub const OPENED_INODE_PARENT_INODE_NAME: &str = ".@opened_inodes";
+pub const SNAPSHOT_PARENT_INODE: ParentStorageIno = ParentStorageIno(StorageIno(ROOT_INODE.0.0-1+3)); // NR: 3
+pub const SNAPSHOT_PARENT_INODE_NAME: &str = ".@snapshots";
 pub const FIRST_DATA_INODE: StorageIno = StorageIno(10); // keep some reserved inodes for later use
 
 /// ATTENTION: Order of enums in this struct matters for serialization!

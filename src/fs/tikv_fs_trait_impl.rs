@@ -9,7 +9,10 @@ use tracing::{debug, trace};
 
 use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, reply::InoKind};
 
-use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, hash_fs_interface::GotOrMade, inode::{ParentStorageIno, StorageDirItem}, key::check_file_name, open_modes::OpenMode};
+use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, hash_fs_interface::GotOrMade};
+use super::inode::{ParentStorageIno, StorageDirItem};
+use super::key::{check_file_name, ROOT_INODE};
+use super::open_modes::OpenMode;
 use super::mode::{as_file_kind, as_file_perm};
 use super::tikv_fs::{map_file_type_to_storage_dir_item_kind, parse_filename, InoUse, TiFs, TiFsMutable};
 use super::reply::{get_time, Attr, Create, Data, Dir, Entry, LogicalIno, Open, StatFs, Write, Xattr};
@@ -58,16 +61,43 @@ impl AsyncFileSystem for TiFs {
     async fn lookup(&self, parent: u64, name: ByteString) -> Result<Entry> {
         let p_ino = LogicalIno::from_raw(parent);
 
-        let (filename, kind) = parse_filename(name);
+        let special = if ParentStorageIno(p_ino.storage_ino()) == ROOT_INODE {
+            match name.as_ref() {
+                crate::fs::key::OPENED_INODE_PARENT_INODE_NAME => {
+                    let mut stat = self.get_all_file_attributes_storage_ino(ROOT_INODE.0, InoKind::Regular).await?;
+                    stat.ino = LogicalIno{
+                        storage_ino: crate::fs::key::OPENED_INODE_PARENT_INODE.0,
+                        kind: InoKind::Regular,
+                    }.to_raw();
+                    Some(stat)
+                }
+                crate::fs::key::SNAPSHOT_PARENT_INODE_NAME => {
+                    let mut stat = self.get_all_file_attributes_storage_ino(ROOT_INODE.0, InoKind::Regular).await?;
+                    stat.ino = LogicalIno{
+                        storage_ino: crate::fs::key::SNAPSHOT_PARENT_INODE.0,
+                        kind: InoKind::Regular,
+                    }.to_raw();
+                    Some(stat)
+                }
+                _ => None,
+            }
+        } else { None };
 
-        check_file_name(&filename)?;
-        let stat = self.lookup_all_info_logical(
-            ParentStorageIno(p_ino.storage_ino()), filename, kind).await?;
+        let attrs = if let Some(attrs) = special {
+            attrs
+        } else {
+            let (filename, kind) = parse_filename(name);
+
+            check_file_name(&filename)?;
+            let stat = self.lookup_all_info_logical(
+                ParentStorageIno(p_ino.storage_ino()), filename, kind).await?;
+            stat
+        };
 
         let entry = Entry {
             generation: 0,
             time: Duration::from_millis(0),
-            stat,
+            stat: attrs,
         };
 
         Ok(entry)

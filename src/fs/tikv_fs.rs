@@ -33,6 +33,7 @@ use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
 use super::hash_fs_interface::{BlockIndex, HashFsInterface};
 use super::inode::{InoAccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItemKind, InoStorageFileAttr, StorageIno, TiFsHash};
+use super::key::{OPENED_INODE_PARENT_INODE, ROOT_INODE, SNAPSHOT_PARENT_INODE};
 use super::reply::{
     Data, Directory, LogicalIno
 };
@@ -669,6 +670,13 @@ impl TiFs {
         ino: StorageIno,
         kind: InoKind,
     ) -> TiFsResult<FileAttr> {
+
+        let ino = match ParentStorageIno(ino) {
+            OPENED_INODE_PARENT_INODE => ROOT_INODE.0,
+            SNAPSHOT_PARENT_INODE => ROOT_INODE.0,
+            other => other.0,
+        };
+
         let (desc, attr, size, atime) =
             self.spin_no_delay(format!("get attrs ino({:?})", ino),
             move |_, txn| {
@@ -704,9 +712,10 @@ impl TiFs {
     }
 
     #[tracing::instrument]
-    pub async fn read_dir1(&self, ino: StorageIno) -> Result<Directory> {
+    pub async fn read_dir1(&self, dir_ino: StorageIno) -> Result<Directory> {
         let arc = self.weak.upgrade().unwrap();
-        let dir = arc.spin_no_delay(format!("read_dir"), move |_, txn| Box::pin(txn.read_dir(ino)))
+        let dir = arc.spin_no_delay(format!("read_dir"),
+            move |_, txn| Box::pin(txn.read_dir(dir_ino)))
             .await?;
 
         let mut dir_complete = Vec::with_capacity(dir.len() * 3);
@@ -740,6 +749,25 @@ impl TiFs {
                 typ: map_storage_dir_item_kind_to_file_type(typ),
             };
             dir_complete.push(regular_entry);
+        }
+
+        if dir_ino == crate::fs::key::ROOT_INODE.0 {
+            dir_complete.push(DirItem {
+                ino: LogicalIno {
+                    storage_ino: crate::fs::key::OPENED_INODE_PARENT_INODE.0,
+                    kind: InoKind::Regular,
+                },
+                name: format!("{}", crate::fs::key::OPENED_INODE_PARENT_INODE_NAME),
+                typ: FileType::Directory,
+            });
+            dir_complete.push(DirItem {
+                ino: LogicalIno {
+                    storage_ino: crate::fs::key::SNAPSHOT_PARENT_INODE.0,
+                    kind: InoKind::Regular,
+                },
+                name: format!("{}", crate::fs::key::SNAPSHOT_PARENT_INODE_NAME),
+                typ: FileType::Directory,
+            });
         }
 
         trace!("read_dir1 - out: {dir_complete:?}");
