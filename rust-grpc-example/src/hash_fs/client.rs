@@ -518,4 +518,12 @@ impl HashFsInterface for HashFsClient {
         handle_error(&rs.error)?;
         Ok(())
     }
+
+    async fn snapshot_create(&self, name: ByteString) -> HashFsResult<()> {
+        let mut rq = grpc_fs::SnapshotCreateRq::default();
+        rq.name = name.to_string();
+        let rs = self.lock_grpc().await?.snapshot_create(rq).await?.into_inner();
+        handle_error(&rs.error)?;
+        Ok(())
+    }
 }

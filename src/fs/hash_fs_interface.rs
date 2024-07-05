@@ -203,6 +203,7 @@ pub trait HashFsInterface: Send + Sync  {
         ino: StorageIno,
         blocks: &[(&TiFsHash, u64, Vec<BlockIndex>)],
     ) -> HashFsResult<()>;
+    async fn snapshot_create(&self, name: ByteString) -> HashFsResult<()>;
 }
 
 impl From<tonic::Status> for HashFsError {

@@ -645,4 +645,21 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         }
         Ok(tonic::Response::new(rsp))
     }
+
+    async fn snapshot_create(
+        &self,
+        request: tonic::Request<grpc_fs::SnapshotCreateRq>,
+    ) -> std::result::Result<
+        tonic::Response<grpc_fs::SnapshotCreateRs>,
+        tonic::Status,
+    >{
+        let rq = request.into_inner();
+        let r = self.fs_impl.snapshot_create(rq.name.into()).await;
+        let mut rsp = grpc_fs::SnapshotCreateRs::default();
+        match r {
+            Err(err) => rsp.error = Some(err.into()),
+            Ok(()) => {}
+        }
+        Ok(tonic::Response::new(rsp))
+    }
 }

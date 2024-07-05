@@ -878,6 +878,18 @@ impl HashFsInterface for TikvBasedHashFs {
         self.f_txn.batch_mutate(mutations).await?;
         Ok(())
     }
+
+    async fn snapshot_create(&self, name: ByteString) -> HashFsResult<()> {
+        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let prev_cnt = loop {
+            let mut started = spin.start().await?;
+            let r1 = started.snapshot_create(
+                name.clone()).await;
+            if let Some(result) = started.finish(r1).await
+            { break result?; };
+        };
+        Ok(prev_cnt)
+    }
 } // interface impl end
 
 impl From<HashFsError> for FsError {

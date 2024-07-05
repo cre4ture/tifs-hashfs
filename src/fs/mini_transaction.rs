@@ -588,6 +588,15 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
 
         Ok(())
     }
+
+    pub async fn snapshot_create(&mut self, _name: ByteString) -> TiFsResult<()> {
+
+        //self.fs_config().key_builder().snapshot_create_scan()
+        //self.mini.scan(range, limit)
+
+
+        Ok(())
+    }
 }
 
 

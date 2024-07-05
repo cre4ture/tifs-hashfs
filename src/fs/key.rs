@@ -39,7 +39,7 @@ pub enum KeyKind {
     Block, // { ino: u64, block: u64 } => { data: Vec<u8> }
     DirectoryChild, // { parent: u64, name: &'static str } => { ino: u64 }
     ParentLink, // { ino: u64, parent_ino: u64 } => None
-    HashedBlock, // { hash: &[u8] },
+    HashedBlock, // { hash: &[u8] } => { data: Vec<u8> }
     InoBlockHashMapping, // { ino: u64, block: u64 } => { hash: &[u8] }
     HashedBlockExists, // { hash: &[u8] } => None
     PendingDelete,
@@ -599,6 +599,18 @@ impl ScopedKeyBuilder {
     pub fn inode_metadata_range(self, ino: StorageIno) -> Range<Key> {
         self.clone().inode_description(ino).into()
             ..self.inode_description(StorageIno(ino.0 + 1)).into() // end not included
+    }
+
+    pub fn snapshot_scan_all_inodes(self) -> Vec<BoundRange> {
+        let ranges = Vec::new();
+        for kk in KeyKind::iter() {
+            match kk {
+                KeyKind::Block => {}
+                KeyKind::KeyLockStates => {}
+                _ => {}
+            }
+        }
+        ranges
     }
 }
 
