@@ -820,7 +820,7 @@ impl HashFsInterface for TikvBasedHashFs {
             tracing::trace!("freshly_calculated_hash: {:x?}", &new_full_hash);
 
             let mut spin = self.spinning_mini_txn().await?;
-            let result = loop {
+            let _result = loop {
                 let mut mini = spin.start().await?;
                 let r1 = mini.checked_write_of_file_hash(
                     &ino, &change_iter_id, new_full_hash.clone()).await;
@@ -828,9 +828,8 @@ impl HashFsInterface for TikvBasedHashFs {
             };
             drop(lock);
 
-            if result {
-                return Ok(new_full_hash);
-            }
+            //if result { return Ok(new_full_hash); }
+            return Ok(new_full_hash); // return it anyway. Might block otherwise if file constantly changes
         }
     }
 

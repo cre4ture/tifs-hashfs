@@ -1,6 +1,8 @@
 use std::{collections::{HashMap, VecDeque}, sync::Arc};
 
 use bytestring::ByteString;
+use counter::Counter;
+use num_bigint::BigUint;
 
 use super::{error::TiFsResult, flexible_transaction::FlexibleTransaction, fs_config::TiFsConfig, inode::InoDescription};
 use super::hash_fs_interface::{BlockIndex, GotOrMade};
@@ -169,6 +171,24 @@ impl CreateSnapshot {
         };
         let hashes = self.src_txn.hb_get_block_hash_list_by_block_range_chunked(
             src.ino, range).await?;
+
+        let block_incs = hashes.iter()
+            .map(|e|e.1).collect::<Counter<_>>()
+            .into_iter().map(|(a,c)|(a,c as u64)).collect::<Vec<_>>();
+
+        let mut spin = self.spinning_mini_txn().await?;
+        let pre_cnts = loop {
+            let mut started = spin.start().await?;
+            let r1 = started.hb_increment_blocks_reference_count(
+                &block_incs).await;
+            if let Some(r) = started.finish(r1).await { break r?; }
+        };
+
+        let _ = pre_cnts.into_iter().map(|(_,cnt)|{
+            if cnt == BigUint::ZERO {
+                tracing::error!("hashed block data is not available for snapshot. Internal Error!");
+            }
+        });
 
         let mutations = hashes.into_iter().map(|(idx, hash)|{
             let key = self.fs_config().key_builder().block_hash(BlockAddress{
