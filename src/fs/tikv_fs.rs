@@ -24,7 +24,6 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use uuid::Uuid;
 use lazy_static::lazy_static;
 
-use crate::fs::flexible_transaction::FlexibleTransaction;
 use crate::fs::hash_fs_tikv_implementation::TikvBasedHashFs;
 use crate::fs::inode::DirectoryItem;
 use crate::fs::reply::{DirItem, InoKind};
@@ -32,7 +31,7 @@ use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
 use super::hash_fs_interface::{BlockIndex, HashFsInterface};
-use super::inode::{InoAccessTime, InoDescription, InoLockState, InoSize, ModificationTime, ParentStorageIno, StorageDirItemKind, InoStorageFileAttr, StorageIno, TiFsHash};
+use super::inode::{InoAccessTime, InoDescription, InoLockState, InoSize, InoModificationTime, ParentStorageIno, StorageDirItemKind, InoStorageFileAttr, StorageIno, TiFsHash};
 use super::key::{OPENED_INODE_PARENT_INODE, ROOT_INODE, SNAPSHOT_PARENT_INODE};
 use super::reply::{
     Data, Directory, LogicalIno
@@ -113,7 +112,7 @@ pub struct TiFsCaches {
     pub inode_size: TxnDataCache<StorageIno, InoSize>,
     pub inode_lock_state: TxnDataCache<StorageIno, InoLockState>,
     pub inode_atime: TxnDataCache<StorageIno, InoAccessTime>,
-    pub inode_mtime: TxnDataCache<StorageIno, ModificationTime>,
+    pub inode_mtime: TxnDataCache<StorageIno, InoModificationTime>,
     pub inode_attr: TxnDataCache<StorageIno, InoStorageFileAttr>,
     pub ino_locks: Arc<LazyLockMap<StorageIno, ()>>,
 }
@@ -227,9 +226,6 @@ impl TiFs {
     ) -> anyhow::Result<Arc<TikvBasedHashFs>> {
 
         let cfg = Self::get_client_config(&options).await?;
-        let raw_cfg = cfg.clone();
-        let raw = Arc::new(tikv_client::RawClient::new_with_config(
-            pd_endpoints.clone(), raw_cfg).await?);
         let client = Arc::new(TransactionClientMux::new(
             pd_endpoints.clone(), cfg.clone()).await
                 .map_err(|err| anyhow!("{}", err))?);
@@ -242,7 +238,7 @@ impl TiFs {
 
         Ok(TikvBasedHashFs::new_arc(
             fs_config.clone(),
-            FlexibleTransaction::new_pure_raw(client, raw, fs_config.clone()),
+            client,
         ))
     }
 
@@ -287,8 +283,6 @@ impl TiFs {
     {
         let cfg = Self::get_client_config(&options).await?;
 
-        let raw_cfg = cfg.clone();
-        let raw = Arc::new(tikv_client::RawClient::new_with_config(pd_endpoints.clone(), raw_cfg).await?);
         let client = Arc::new(TransactionClientMux::new(
                 pd_endpoints.clone().into_iter().map(|s|s.into()).collect::<Vec<_>>(), cfg.clone()
             )
@@ -307,7 +301,7 @@ impl TiFs {
                 instance_id: uuid::Uuid::new_v4(),
                 hash_fs: TikvBasedHashFs::new_arc(
                     fs_config.clone(),
-                    FlexibleTransaction::new_pure_raw(client, raw, fs_config.clone()),
+                    client,
                 ),
                 client_config: cfg,
                 direct_io: fs_config.direct_io,

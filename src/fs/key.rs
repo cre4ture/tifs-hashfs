@@ -9,7 +9,7 @@ use strum::{EnumIter, IntoEnumIterator};
 
 use super::error::TiFsResult;
 use super::hash_fs_interface::BlockIndex;
-use super::inode::{InoAccessTime, InoChangeIterationId, InoDescription, InoFullHash, InoInlineData, InoLockState, InoSize, InoStorageFileAttr, ModificationTime, ParentStorageIno, StorageDirItem, StorageIno};
+use super::inode::{InoAccessTime, InoChangeIterationId, InoDescription, InoFullHash, InoInlineData, InoLockState, InoSize, InoStorageFileAttr, InoModificationTime, ParentStorageIno, StorageDirItem, StorageIno};
 use super::meta::{MetaMutable, MetaStatic};
 use super::reply::LogicalIno;
 use super::tikv_fs::InoUse;
@@ -80,15 +80,15 @@ pub mod key_structs {
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy, EnumIter)]
 pub enum InoMetadata {
     Description,
-    LinkCount,
+    LinkCount,          // not part of snapshot as it will be automatically determined there
     Size,
     UnixAttributes,
-    LockState,
+    LockState,          // not part of snapshot
     AccessTime,
     ModificationTime,
-    Opened,
-    FullHash,
-    ChangeIterationId, // uuid, not counter
+    Opened,             // not part of snapshot
+    FullHash,           // not part of snapshot
+    ChangeIterationId,  // uuid, not counter. not part of snapshot
     InlineData,
 }
 
@@ -666,7 +666,7 @@ impl KeyGenerator<StorageIno, InoAccessTime> for ScopedKeyBuilder {
     }
 }
 
-impl KeyGenerator<StorageIno, ModificationTime> for ScopedKeyBuilder {
+impl KeyGenerator<StorageIno, InoModificationTime> for ScopedKeyBuilder {
     fn generate_key(self, k: &StorageIno) -> KeyBuffer {
         self.inode_x(*k, InoMetadata::ModificationTime).buf
     }

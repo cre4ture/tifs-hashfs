@@ -23,6 +23,8 @@ use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 use super::error::FsError;
 use super::index::deserialize_json;
 use super::mini_transaction::{DeletionCheckResult, MiniTransaction};
+use super::snapshot::CreateSnapshot;
+use super::transaction_client_mux::TransactionClientMux;
 use super::utils::lazy_lock_map::LazyLockMap;
 use super::utils::stop_watch::AutoStopWatch;
 use super::utils::txn_data_cache::{TxnFetch, TxnPut, TxnPutMut};
@@ -32,7 +34,7 @@ use super::{
 use super::key::{check_file_name, InoMetadata, ROOT_INODE};
 use super::hash_fs_interface::{
         BlockIndex, GotOrMade, HashFsError, HashFsInterface, HashFsResult};
-use super::inode::{DirectoryItem, InoAccessTime, InoChangeIterationId, InoDescription, InoInlineData, InoSize, InoStorageFileAttr, ModificationTime, ParentStorageIno, StorageDirItem, StorageDirItemKind, StorageFilePermission, StorageIno};
+use super::inode::{DirectoryItem, InoAccessTime, InoChangeIterationId, InoDescription, InoInlineData, InoSize, InoStorageFileAttr, InoModificationTime, ParentStorageIno, StorageDirItem, StorageDirItemKind, StorageFilePermission, StorageIno};
 
 
 fn get_time_from_time_or_now(time: TimeOrNow) -> SystemTime {
@@ -58,6 +60,7 @@ fn set_if_changed<T: std::cmp::PartialEq>(
 
 pub struct TikvBasedHashFs {
     weak: Weak<TikvBasedHashFs>,
+    txn_client_mux: Arc<TransactionClientMux>,
     f_txn: FlexibleTransaction,
     fs_config: TiFsConfig,
     // this is for performance optimization only.
@@ -72,10 +75,17 @@ pub struct TikvBasedHashFs {
 }
 
 impl TikvBasedHashFs {
-    pub fn new_arc(fs_config: TiFsConfig, f_txn: FlexibleTransaction) -> Arc<Self> {
+    pub fn new_arc(fs_config: TiFsConfig, txn_client_mux: Arc<TransactionClientMux>) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
+            let f_txn = FlexibleTransaction{
+                fs_config: fs_config.clone(),
+                kind: super::flexible_transaction::FlexibleTransactionKind::SpawnMiniTransactions(
+                    txn_client_mux.clone(),
+                )
+            };
             Self {
                 weak: weak.clone(),
+                txn_client_mux,
                 f_txn,
                 fs_config,
                 local_ino_write_size_locks: LazyLockMap::new(),
@@ -86,13 +96,18 @@ impl TikvBasedHashFs {
         })
     }
 
+    pub async fn spinning_mini_txn(&self) -> TiFsResult<MiniTransaction> {
+        MiniTransaction::new(
+            self.txn_client_mux.clone(), self.fs_config.clone()).await
+    }
+
     async fn directory_remove_child_generic(
         &self,
         parent: ParentStorageIno,
         name: ByteString,
         allowed_types: HashSet<StorageDirItemKind>,
     ) -> HashFsResult<()> {
-        let mut mini = self.f_txn.spinning_mini_txn().await?;
+        let mut mini = self.spinning_mini_txn().await?;
         let unlinked_item: StorageDirItem = loop {
             let mut started = mini.start().await?;
             let r1 = started.directory_remove_child(
@@ -102,7 +117,7 @@ impl TikvBasedHashFs {
         };
         drop(mini);
 
-        let mut mini = self.f_txn.spinning_mini_txn().await?;
+        let mut mini = self.spinning_mini_txn().await?;
         let r: DeletionCheckResult = loop {
             let mut started = mini.start().await?;
             let r1 = started
@@ -130,56 +145,6 @@ impl TikvBasedHashFs {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
-    pub async fn hb_get_block_hash_list_by_block_range(
-        &self,
-        ino: StorageIno,
-        block_range: Range<BlockIndex>,
-    ) -> TiFsResult<BTreeMap<BlockIndex, TiFsHash>> {
-        let range = self.fs_config.key_builder().block_hash_range(ino, block_range.clone());
-        let iter = self.f_txn.scan(
-                range,
-                block_range.count() as u32,
-            )
-            .await?;
-        let mut result = BTreeMap::<BlockIndex, TiFsHash>::new();
-        for KvPair(k, hash) in iter.into_iter() {
-            let key = self.fs_config.key_parser_b(k)?.parse_key_block_address()?;
-            if hash.len() != self.fs_config.hash_len {
-                tracing::error!("hash length mismatch!");
-                continue;
-            };
-            if key.ino != ino {
-                tracing::error!("received wrong ino-block: expected: {ino}, got: {}", key.ino);
-                continue;
-            }
-            result.insert(key.index, hash);
-        }
-        tracing::trace!("result: len:{}", result.len());
-        Ok(result)
-    }
-
-
-    #[tracing::instrument(skip(self))]
-    pub async fn hb_get_block_hash_list_by_block_range_chunked(
-        &self, ino: StorageIno, block_range: Range<BlockIndex>
-    ) -> TiFsResult<BTreeMap<BlockIndex, TiFsHash>> {
-        let mut i = block_range.start;
-        let mut result = BTreeMap::new();
-        while i < block_range.end {
-            let chunk_start = i;
-            let chunk_end = BlockIndex(chunk_start.0+MAX_TIKV_SCAN_LIMIT as u64)
-                                        .min(block_range.end);
-            i = chunk_end;
-
-            let chunk = self.hb_get_block_hash_list_by_block_range(
-                ino, chunk_start..chunk_end).await?;
-            result.extend(chunk.into_iter());
-        }
-        tracing::trace!("result: len:{}", result.len());
-        Ok(result)
-    }
-
     pub async fn hb_clear_data_single_block_arc(
         self: Arc<Self>,
         addr: BlockAddress,
@@ -189,7 +154,8 @@ impl TikvBasedHashFs {
     }
 
     pub async fn hb_clear_data_single_block(&self, addr: BlockAddress, do_size_update: bool) -> TiFsResult<()> {
-        let mut spin = MiniTransaction::new(&self.f_txn).await?;
+        let mut spin = MiniTransaction::new(
+            self.txn_client_mux.clone(), self.fs_config.clone()).await?;
         let prev_hash = loop {
             let mut started = spin.start().await?;
             let r1 = started
@@ -200,7 +166,8 @@ impl TikvBasedHashFs {
         };
 
         if do_size_update {
-            let mut spin = MiniTransaction::new(&self.f_txn).await?;
+            let mut spin = MiniTransaction::new(
+                self.txn_client_mux.clone(), self.fs_config.clone()).await?;
             loop {
                 let lock = self.local_ino_write_size_locks.lock_write(&addr.ino).await;
                 let mut started = spin.start().await?;
@@ -217,7 +184,8 @@ impl TikvBasedHashFs {
             return Ok(());
         };
 
-        let mut spin = MiniTransaction::new(&self.f_txn).await?;
+        let mut spin = MiniTransaction::new(
+            self.txn_client_mux.clone(), self.fs_config.clone()).await?;
         loop {
             let mut started = spin.start().await?;
             let r1 = started.hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
@@ -248,11 +216,31 @@ impl TikvBasedHashFs {
         Ok(())
     }
 
+    pub async fn hb_get_block_hash_list_by_block_range_chunked(
+        &self,
+        ino: StorageIno,
+        block_range: Range<BlockIndex>,
+    ) -> TiFsResult<BTreeMap<BlockIndex, TiFsHash>> {
+        let mut spin = self.spinning_mini_txn().await?;
+        let block_hashes = loop {
+            let mut started = spin.start().await?;
+            let r1 = started.hb_get_block_hash_list_by_block_range_chunked(
+                ino, block_range.clone()).await;
+            if let Some(r) = started.finish(r1).await { break r?; }
+        };
+        Ok(block_hashes)
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn read_hashes_of_file(&self, ino: StorageIno, block_range: Range<BlockIndex>
     ) -> HashFsResult<Vec<u8>> {
-        let hashes = self.hb_get_block_hash_list_by_block_range_chunked(
-            ino, block_range.clone()).await?;
+        let mut spin = self.spinning_mini_txn().await?;
+        let hashes = loop {
+            let mut started = spin.start().await?;
+            let r1 = started.hb_get_block_hash_list_by_block_range_chunked(
+                ino, block_range.clone()).await;
+            if let Some(r) = started.finish(r1).await { break r?; }
+        };
         let mut result = Vec::with_capacity((block_range.clone().count() * self.fs_config.hash_len) as usize);
         let zero_hash = self.fs_config.calculate_hash(&[]);
         for block_id in block_range {
@@ -282,7 +270,7 @@ impl TikvBasedHashFs {
     }
 
     pub async fn meta_mutable_reserve_new_ino(&self) -> TiFsResult<StorageIno> {
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         loop {
             let mut started = spin.start().await?;
             let r1 = started.meta_mutable_reserve_new_ino().await;
@@ -326,6 +314,18 @@ impl TikvBasedHashFs {
         }
         Ok((existing_hash, change_iter_id, size))
     }
+
+    async fn snapshot_create_private(self: Arc<TikvBasedHashFs>, name: ByteString) -> HashFsResult<()> {
+        let mut txn_snapshot = self.spinning_mini_txn().await?;
+        let snapshot = txn_snapshot.start_snapshot_read_only().await?;
+
+        let mut tool = CreateSnapshot::new(
+            snapshot, self.txn_client_mux.clone());
+
+        tool.create_snapshot(name).await?;
+
+        Ok(())
+    }
 }
 
 // ================================ INTERFACE ==============================================
@@ -341,7 +341,7 @@ impl TikvBasedHashFs {
 impl HashFsInterface for TikvBasedHashFs {
 
     async fn init(&self, gid: u32, uid: u32) -> HashFsResult<StorageDirItem> {
-        tracing::info!("initializing tifs on {:?} ...", self.f_txn.get_endpoints());
+        //tracing::info!("initializing tifs on {:?} ...", self.f_txn.get_endpoints());
         let attr = self.get_or_make_dir(
                 PARENT_OF_ROOT_INODE,
                 Default::default(),
@@ -368,7 +368,7 @@ impl HashFsInterface for TikvBasedHashFs {
     }
 
     async fn directory_read_children(&self, dir_ino: StorageIno) -> HashFsResult<Vec<DirectoryItem>> {
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         loop {
             let mut started = spin.start().await?;
             let r1 = started.directory_scan_for_children(
@@ -392,7 +392,7 @@ impl HashFsInterface for TikvBasedHashFs {
 
         let new_ino = self.meta_mutable_reserve_new_ino().await?;
 
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         let r = loop {
             let mut started = spin.start().await?;
             let r1 = started.directory_add_child_checked_new_inode(
@@ -413,7 +413,7 @@ impl HashFsInterface for TikvBasedHashFs {
             return Ok(());
         }
 
-        let mut mini = self.f_txn.spinning_mini_txn().await?;
+        let mut mini = self.spinning_mini_txn().await?;
         let r: GotOrMade<StorageDirItem> = loop {
             let mut started = mini.start().await?;
             let r1 = started
@@ -473,7 +473,7 @@ impl HashFsInterface for TikvBasedHashFs {
         parent: ParentStorageIno,
         name: ByteString,
     ) -> HashFsResult<()> {
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         let _unlinked_item: StorageDirItem = loop {
             let mut started = spin.start().await?;
             let r1 = started.directory_remove_child_empty_directory(
@@ -493,7 +493,7 @@ impl HashFsInterface for TikvBasedHashFs {
     ) -> HashFsResult<()> {
         check_file_name(&raw_name)?;
         check_file_name(&new_raw_name)?;
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         loop {
             let mut started = spin.start().await?;
             let r1 = started.directory_rename_child(
@@ -508,7 +508,7 @@ impl HashFsInterface for TikvBasedHashFs {
         parent: ParentStorageIno,
         name: ByteString,
     ) -> HashFsResult<(Arc<InoDescription>, Arc<InoStorageFileAttr>, Arc<InoSize>, InoAccessTime)> {
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         let entry_opt = loop {
             let mut started = spin.start().await?;
             let r1 = started.directory_get_child(
@@ -555,7 +555,7 @@ impl HashFsInterface for TikvBasedHashFs {
         }
 
         if let Some(mtime_modification) = mtime {
-            let new_mtime = ModificationTime(get_time_from_time_or_now(mtime_modification));
+            let new_mtime = InoModificationTime(get_time_from_time_or_now(mtime_modification));
             self.f_txn.put_json(&ino, Arc::new(new_mtime)).await?;
         }
 
@@ -583,7 +583,7 @@ impl HashFsInterface for TikvBasedHashFs {
     async fn inode_open(&self, ino: StorageIno) -> HashFsResult<Uuid> {
         let use_id = Uuid::new_v4();
         // publish opened state
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         loop {
             let mut mini = spin.start().await?;
             let r1 = mini.inode_open(ino, use_id).await;
@@ -594,7 +594,7 @@ impl HashFsInterface for TikvBasedHashFs {
 
     async fn inode_close(&self, ino: StorageIno, use_id: Uuid) -> HashFsResult<()> {
         // de-publish opened state
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         loop {
             let mut mini = spin.start().await?;
             let r1 = mini.inode_close(ino, use_id).await;
@@ -609,7 +609,7 @@ impl HashFsInterface for TikvBasedHashFs {
         offset: i64,
         length: i64,
     ) -> HashFsResult<()> {
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         loop {
             let mut started = spin.start().await?;
             let r1 = started.inode_allocate_size(ino, offset, length).await;
@@ -636,8 +636,10 @@ impl HashFsInterface for TikvBasedHashFs {
         let end_block = end_addr.div_ceil(self.fs_config.block_size); // end block is exclusive
         let block_range = BlockIndex(start_block)..BlockIndex(end_block);
 
-        let block_hashes = self.hb_get_block_hash_list_by_block_range(
-            ino, block_range).await?;
+        let block_hashes = self.hb_get_block_hash_list_by_block_range_chunked(
+            ino, block_range
+        ).await?;
+
         Ok(block_hashes)
     }
 
@@ -691,7 +693,7 @@ impl HashFsInterface for TikvBasedHashFs {
             ()
         }).collect::<Vec<()>>();
 
-        let mut spin = MiniTransaction::new(&self.f_txn).await?;
+        let mut spin = self.spinning_mini_txn().await?;
         let prev_hash_decrements = loop {
             let mut started = spin.start().await?;
             let r1 = started
@@ -708,7 +710,7 @@ impl HashFsInterface for TikvBasedHashFs {
         {
             let full_hash_key = self.fs_config.key_builder().inode_x(
                 ino, super::key::InoMetadata::FullHash).buf;
-            let mut spin = MiniTransaction::new(&self.f_txn).await?;
+            let mut spin = self.spinning_mini_txn().await?;
             loop {
                 let lock = self.local_ino_locks_clear_full_hash
                     .lock_write(&ino).await;
@@ -722,7 +724,7 @@ impl HashFsInterface for TikvBasedHashFs {
 
         // change change iter id:
         {
-            let mut spin = MiniTransaction::new(&self.f_txn).await?;
+            let mut spin = self.spinning_mini_txn().await?;
             loop {
                 let lock = self.local_ino_locks_update_change_iter
                     .lock_write(&ino).await;
@@ -743,7 +745,7 @@ impl HashFsInterface for TikvBasedHashFs {
             let mut size_peek = size_peek_arc.deref().clone();
             if max_file_size > size_peek.size {
                 size_peek.set_size(max_file_size, self.fs_config.block_size);
-                let mut spin = MiniTransaction::new(&self.f_txn).await?;
+                let mut spin = self.spinning_mini_txn().await?;
                 loop {
                     let lock = self.local_ino_write_size_locks.lock_write(&ino).await;
                     let mut started = spin.start().await?;
@@ -762,7 +764,7 @@ impl HashFsInterface for TikvBasedHashFs {
         let prev_hash_decrements_ref = prev_hash_decrements.iter().map(|(h,dec)|{
             (h, *dec)
         }).collect::<HashMap<_,_>>();
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         loop {
             let mut started = spin.start().await?;
             let r1 = started
@@ -814,7 +816,7 @@ impl HashFsInterface for TikvBasedHashFs {
             let new_full_hash = self.fs_config.calculate_hash(&hash_data);
             tracing::trace!("freshly_calculated_hash: {:x?}", &new_full_hash);
 
-            let mut spin = MiniTransaction::new(&self.f_txn).await?;
+            let mut spin = self.spinning_mini_txn().await?;
             let result = loop {
                 let mut mini = spin.start().await?;
                 let r1 = mini.checked_write_of_file_hash(
@@ -858,7 +860,7 @@ impl HashFsInterface for TikvBasedHashFs {
         blocks: &[(&TiFsHash, u64)],
     ) -> HashFsResult<HashMap<TiFsHash, BigUint>> {
         // get and increment block reference counter (with automatic retry)
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
+        let mut spin = self.spinning_mini_txn().await?;
         let prev_cnt = loop {
             let mut started = spin.start().await?;
             let r1 = started.hb_increment_blocks_reference_count(
@@ -880,15 +882,7 @@ impl HashFsInterface for TikvBasedHashFs {
     }
 
     async fn snapshot_create(&self, name: ByteString) -> HashFsResult<()> {
-        let mut spin = self.f_txn.spinning_mini_txn().await?;
-        let prev_cnt = loop {
-            let mut started = spin.start().await?;
-            let r1 = started.snapshot_create(
-                name.clone()).await;
-            if let Some(result) = started.finish(r1).await
-            { break result?; };
-        };
-        Ok(prev_cnt)
+        self.weak.upgrade().unwrap().snapshot_create_private(name).await
     }
 } // interface impl end
 

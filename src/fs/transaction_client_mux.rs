@@ -3,6 +3,8 @@ use std::{mem, sync::{atomic::AtomicUsize, Arc}};
 use tikv_client::{Backoff, Config, Transaction, TransactionClient, TransactionOptions};
 use tokio::{sync::RwLock, time::sleep};
 
+use super::flexible_transaction::FlexibleTransaction;
+
 
 
 pub struct TransactionClientMux {
@@ -111,5 +113,14 @@ impl TransactionClientMux {
 
     async fn make_one(&self) -> tikv_client::Result<TransactionClient> {
         TransactionClient::new_with_config(self._pd_endpoints.clone(), self._cfg.clone()).await
+    }
+
+    pub async fn single_action_txn_raw(self: Arc<Self>) -> tikv_client::Result<Transaction> {
+        let transaction = FlexibleTransaction::begin_optimistic_small(
+            self.clone()).await.map_err(|err|{
+                tracing::warn!("single_action_txn_raw failed. Err: {err:?}");
+                err
+            })?;
+        Ok(transaction)
     }
 }

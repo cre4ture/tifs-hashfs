@@ -84,7 +84,7 @@ pub struct InoAccessTime(pub SystemTime);
 
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ModificationTime(pub SystemTime);
+pub struct InoModificationTime(pub SystemTime);
 
 
 /// These parameters do not change during the lifetime of an inode.

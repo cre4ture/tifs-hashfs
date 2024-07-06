@@ -11,7 +11,6 @@ use super::error::FsError;
 use super::fs_config::TiFsConfig;
 use super::index::{deserialize_json, serialize_json};
 use super::key::{KeyGenerator, ScopedKeyBuilder};
-use super::mini_transaction::MiniTransaction;
 use super::utils::txn_data_cache::{TxnDelete, TxnFetch, TxnPut};
 use super::{error::TiFsResult, fuse_to_hashfs::{DEFAULT_REGION_BACKOFF, OPTIMISTIC_BACKOFF}, transaction_client_mux::TransactionClientMux};
 
@@ -131,32 +130,33 @@ impl SpinningTxn {
     }
 }
 
+pub enum FlexibleTransactionKind {
+    UseExistingTxn(RwLock<Transaction>),
+    UseRawClient(Arc<tikv_client::RawClient>),
+    SpawnMiniTransactions(Arc<TransactionClientMux>),
+}
+
 pub struct FlexibleTransaction {
-    txn_client_mux: Arc<TransactionClientMux>,
-    txn: Option<RwLock<Transaction>>,
-    raw: Arc<tikv_client::RawClient>,
-    fs_config: TiFsConfig,
+    pub kind: FlexibleTransactionKind,
+    pub fs_config: TiFsConfig,
 }
 
 impl FlexibleTransaction {
     pub fn new_pure_raw(
-        txn_client_mux: Arc<TransactionClientMux>,
         raw: Arc<tikv_client::RawClient>,
         fs_config: TiFsConfig
     ) -> Self {
-        Self { txn_client_mux, txn: None, raw, fs_config }
+        Self { kind: FlexibleTransactionKind::UseRawClient(raw), fs_config }
     }
 
-    pub fn new_txn(
-        txn_client_mux: Arc<TransactionClientMux>,
-        txn: Option<RwLock<Transaction>>,
-        raw: Arc<tikv_client::RawClient>,
+    pub fn new_with_existing_txn(
+        txn: Transaction,
         fs_config: TiFsConfig,
     ) -> Self {
-        Self { txn_client_mux, txn, raw, fs_config }
+        Self { kind: FlexibleTransactionKind::UseExistingTxn(RwLock::new(txn)), fs_config }
     }
 
-    async fn begin_optimistic_small(
+    pub async fn begin_optimistic_small(
         client_mux: Arc<TransactionClientMux>,
     ) -> Result<Transaction> {
         let options = TransactionOptions::new_optimistic()
@@ -169,25 +169,29 @@ impl FlexibleTransaction {
         Ok(client_mux.give_one_transaction(&options).await?)
     }
 
-    pub fn get_endpoints(&self) -> Vec<String> {
-        self.txn_client_mux.get_endpoints()
+    pub async fn get_snapshot_read_transaction(
+        client_mux: Arc<TransactionClientMux>,
+    ) -> TiFsResult<Transaction> {
+        let options = TransactionOptions::new_optimistic()
+            .retry_options(RetryOptions {
+                region_backoff: DEFAULT_REGION_BACKOFF,
+                lock_backoff: OPTIMISTIC_BACKOFF,
+            })
+            .read_only();
+        Ok(client_mux.give_one_transaction(&options).await?)
     }
 
     pub fn fs_config(&self) -> &TiFsConfig {
         &self.fs_config
     }
 
-    pub async fn single_action_txn_raw(&self) -> TiFsResult<Transaction> {
+    pub async fn single_action_txn_raw(txn_client_mux: Arc<TransactionClientMux>) -> TiFsResult<Transaction> {
         let transaction = Self::begin_optimistic_small(
-            self.txn_client_mux.clone()).await.map_err(|err|{
+            txn_client_mux.clone()).await.map_err(|err|{
                 tracing::warn!("mini_txn failed. Err: {err:?}");
                 err
             })?;
         Ok(transaction)
-    }
-
-    pub async fn spinning_mini_txn(&self) -> TiFsResult<MiniTransaction> {
-        MiniTransaction::new(self).await
     }
 
     pub async fn finish_txn<R>(result: TiKvResult<R>, mut mini: Transaction) -> TiFsResult<R> {
@@ -200,20 +204,22 @@ impl FlexibleTransaction {
     }
 
     pub async fn get(&self, key: impl Into<Key>) -> TiFsResult<Option<Value>> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.get(key).await?)
-        } else {
-            if self.fs_config.small_transactions {
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                Ok(txn.write().await.get(key).await?)
+            },
+            FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
                 let key: Key = key.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.single_action_txn_raw().await?;
+                    let mut mini = txn_mux.clone().single_action_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.get(key.clone()).await.map_err(|e|e.into()),
                         mini, "get").await { break Ok(r?); }
                 }
-            } else {
-                Ok(self.raw.get(key).await?)
+            },
+            FlexibleTransactionKind::UseRawClient(raw) => {
+                Ok(raw.get(key).await?)
             }
         }
     }
@@ -222,98 +228,108 @@ impl FlexibleTransaction {
         &self,
         keys: impl IntoIterator<Item = impl Into<Key>>,
     ) -> TiFsResult<Vec<KvPair>> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.batch_get(keys).await
-                .map(|iter|iter.collect::<Vec<_>>())?)
-        } else {
-            if self.fs_config.small_transactions {
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                Ok(txn.write().await.batch_get(keys).await
+                    .map(|iter|iter.collect::<Vec<_>>())?)
+            },
+            FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
                 let keys = keys.into_iter().map(|k|Key::from(k.into())).collect::<Vec<_>>();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.single_action_txn_raw().await?;
+                    let mut mini = txn_mux.clone().single_action_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.batch_get(keys.clone()).await.map_err(|e|e.into()),
                         mini, "batch_get").await { break Ok(r?.into_iter().collect::<Vec<_>>()); }
                 }
-            } else {
-                Ok(self.raw.batch_get(keys).await?)
+            },
+            FlexibleTransactionKind::UseRawClient(raw) => {
+                Ok(raw.batch_get(keys).await?)
             }
         }
     }
 
     pub async fn put(&self, key: impl Into<Key>, value: impl Into<Value>) -> TiFsResult<()> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.put(key, value).await?)
-        } else {
-            if self.fs_config.small_transactions {
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                Ok(txn.write().await.put(key, value).await?)
+            },
+            FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
                 let key: Key = key.into();
                 let value: Value = value.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.single_action_txn_raw().await?;
+                    let mut mini = txn_mux.clone().single_action_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.put(key.clone(), value.clone()).await.map_err(|e|e.into()),
                         mini, "put").await { break Ok(r?); }
                 }
-            } else {
-                Ok(self.raw.put(key, value).await?)
+            },
+            FlexibleTransactionKind::UseRawClient(raw) => {
+                Ok(raw.put(key, value).await?)
             }
         }
     }
 
     pub async fn batch_put(&self, pairs: Vec<KvPair>) -> TiFsResult<()> {
-        if let Some(txn) = &self.txn {
-            let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
-            Ok(txn.write().await.batch_mutate(mutations).await?)
-        } else {
-            if self.fs_config.small_transactions {
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
+                Ok(txn.write().await.batch_mutate(mutations).await?)
+            },
+            FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
                 let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.single_action_txn_raw().await?;
+                    let mut mini = txn_mux.clone().single_action_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.batch_mutate(mutations.clone()).await.map_err(|e|e.into()),
                         mini, "batch_put").await { break Ok(r?); }
                 }
-            } else {
-                Ok(self.raw.batch_put(pairs).await?)
+            },
+            FlexibleTransactionKind::UseRawClient(raw) => {
+                Ok(raw.batch_put(pairs).await?)
             }
         }
     }
 
     pub async fn delete(&self, key: impl Into<Key>) -> TiFsResult<()> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.delete(key).await?)
-        } else {
-            if self.fs_config.small_transactions {
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                Ok(txn.write().await.delete(key).await?)
+            },
+            FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
                 let key: Key = key.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.single_action_txn_raw().await?;
+                    let mut mini = txn_mux.clone().single_action_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.delete(key.clone()).await.map_err(|e|e.into()),
                         mini, "delete").await { break Ok(r?); }
                 }
-            } else {
-                Ok(self.raw.delete(key).await?)
+            },
+            FlexibleTransactionKind::UseRawClient(raw) => {
+                Ok(raw.delete(key).await?)
             }
         }
     }
 
     pub async fn batch_mutate(&self, mutations: impl IntoIterator<Item = Mutation>) -> TiFsResult<()> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.batch_mutate(mutations).await?)
-        } else {
-            if self.fs_config.small_transactions {
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                Ok(txn.write().await.batch_mutate(mutations).await?)
+            },
+            FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
                 let mutations: Vec<Mutation> = mutations.into_iter().collect();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.single_action_txn_raw().await?;
+                    let mut mini = txn_mux.clone().single_action_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.batch_mutate(mutations.clone()).await.map_err(|e|e.into()),
                         mini, "batch_mutate").await { break Ok(r?); }
                 }
-            } else {
+            },
+            FlexibleTransactionKind::UseRawClient(raw) => {
                 let mut deletes = Vec::new();
                 let mut put_pairs = Vec::new();
                 for entry in mutations.into_iter() {
@@ -325,10 +341,10 @@ impl FlexibleTransaction {
                     }
                 };
                 if put_pairs.len() > 0 {
-                    self.raw.batch_put(put_pairs).await?;
+                    raw.batch_put(put_pairs).await?;
                 }
                 if deletes.len() > 0 {
-                    self.raw.batch_delete(deletes).await?;
+                    raw.batch_delete(deletes).await?;
                 }
                 Ok(())
             }
@@ -340,21 +356,23 @@ impl FlexibleTransaction {
         range: impl Into<BoundRange>,
         limit: u32,
     ) -> TiFsResult<Vec<KvPair>> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.scan(range, limit).await
-                .map(|iter|iter.collect::<Vec<KvPair>>())?)
-        } else {
-            if self.fs_config.small_transactions {
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                Ok(txn.write().await.scan(range, limit).await
+                    .map(|iter|iter.collect::<Vec<KvPair>>())?)
+            },
+            FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
                 let range: BoundRange = range.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.single_action_txn_raw().await?;
+                    let mut mini = txn_mux.clone().single_action_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.scan(range.clone(), limit).await.map_err(|e|e.into()),
                         mini, "scan").await { break Ok(r?.collect::<Vec<KvPair>>()); }
                 }
-            } else {
-                Ok(self.raw.scan(range, limit).await?)
+            },
+            FlexibleTransactionKind::UseRawClient(raw) => {
+                Ok(raw.scan(range, limit).await?)
             }
         }
     }
@@ -364,38 +382,42 @@ impl FlexibleTransaction {
         range: impl Into<BoundRange>,
         limit: u32,
     ) -> TiFsResult<Vec<Key>> {
-        if let Some(txn) = &self.txn {
-            Ok(txn.write().await.scan_keys(range, limit).await
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                Ok(txn.write().await.scan_keys(range, limit).await
                 .map(|iter|iter.collect::<Vec<_>>())?)
-        } else {
-            if self.fs_config.small_transactions {
+            },
+            FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
                 let range: BoundRange = range.into();
                 let mut spin = SpinningTxn::default();
                 loop {
-                    let mut mini = self.single_action_txn_raw().await?;
+                    let mut mini = txn_mux.clone().single_action_txn_raw().await?;
                     if let Some(r) = spin.end_iter_b(
                         mini.scan_keys(range.clone(), limit).await.map_err(|e|e.into()),
                         mini, "scan_keys").await { break Ok(r?.collect::<Vec<Key>>()); }
                 }
-            } else {
-                Ok(self.raw.scan_keys(range, limit).await?)
+            },
+            FlexibleTransactionKind::UseRawClient(raw) => {
+                Ok(raw.scan_keys(range, limit).await?)
             }
         }
     }
 
     pub async fn commit(&self) -> TiKvResult<Option<Timestamp>> {
-        if let Some(txn) = &self.txn {
-            txn.write().await.commit().await
-        } else {
-            Ok(Some(Timestamp::default()))
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                txn.write().await.commit().await
+            },
+            _ => Ok(Some(Timestamp::default())),
         }
     }
 
     pub async fn rollback(&self) -> TiKvResult<()> {
-        if let Some(txn) = &self.txn {
-            txn.write().await.rollback().await
-        } else {
-            Ok(())
+        match &self.kind {
+            FlexibleTransactionKind::UseExistingTxn(txn) => {
+                txn.write().await.rollback().await
+            },
+            _ => Ok(()),
         }
     }
 }

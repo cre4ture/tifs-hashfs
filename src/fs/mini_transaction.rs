@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, ops::Deref, sync::Arc, time::SystemTime};
+use std::{collections::{BTreeMap, HashMap, HashSet}, ops::{Deref, DerefMut, Range}, sync::Arc, time::SystemTime};
 
 use bytestring::ByteString;
 use num_bigint::BigUint;
@@ -10,7 +10,11 @@ use uuid::Uuid;
 
 use crate::fs::{inode::ParentStorageIno, meta::MetaMutable};
 
-use super::{dir::StorageDirectory, error::{FsError, TiFsResult}, hash_fs_interface::GotOrMade, inode::{DirectoryItem, InoChangeIterationId, InoFullHash, InoInlineData, TiFsHash}, key::{BlockAddress, HashedBlockMeta, OPENED_INODE_PARENT_INODE}, fuse_to_hashfs::MAX_TIKV_SCAN_LIMIT, utils::txn_data_cache::{TxnDeleteMut, TxnFetchMut, TxnPutMut}};
+use super::{dir::StorageDirectory, error::{FsError, TiFsResult}, inode::{DirectoryItem, InoChangeIterationId, InoFullHash, InoInlineData, TiFsHash}};
+use super::utils::txn_data_cache::{TxnDeleteMut, TxnFetchMut, TxnPutMut};
+use super::key::{BlockAddress, HashedBlockMeta, OPENED_INODE_PARENT_INODE};
+use super::hash_fs_interface::{BlockIndex, GotOrMade};
+use super::fuse_to_hashfs::MAX_TIKV_SCAN_LIMIT;
 use super::index::{deserialize_json, serialize_json};
 use super::fs_config::TiFsConfig;
 use super::flexible_transaction::{FlexibleTransaction, SpinningTxn, TransactionError, TransactionResult};
@@ -24,22 +28,30 @@ pub enum DeletionCheckResult {
     DeletedInoDesc,
 }
 
-pub struct MiniTransaction<'ft_l> {
-    txn: &'ft_l FlexibleTransaction,
-    fs_config: &'ft_l TiFsConfig,
+pub struct MiniTransaction {
+    pub txn_client_mux: Arc<super::transaction_client_mux::TransactionClientMux>,
+    fs_config: TiFsConfig,
     spin: SpinningTxn,
 }
 
-pub struct StartedMiniTransaction<'mmt_l, 'ft_l> {
-    parent: &'mmt_l mut MiniTransaction<'ft_l>,
+pub struct StartedMiniTransaction<'mmt_l> {
+    parent: &'mmt_l mut MiniTransaction,
+    txn: TransactionWithFsConfig,
+}
+
+pub struct TransactionWithFsConfig {
+    pub fs_config: TiFsConfig,
     pub mini: Transaction,
 }
 
-impl<'ft_l> MiniTransaction<'ft_l> {
-    pub async fn new(txn: &'ft_l FlexibleTransaction) -> TiFsResult<Self> {
+impl MiniTransaction {
+    pub async fn new(
+        txn_client_mux: Arc<super::transaction_client_mux::TransactionClientMux>,
+        fs_config: TiFsConfig,
+    ) -> TiFsResult<Self> {
         Ok(Self{
-            txn,
-            fs_config: txn.fs_config(),
+            txn_client_mux,
+            fs_config,
             spin: SpinningTxn::default(),
         })
     }
@@ -53,10 +65,40 @@ impl<'ft_l> MiniTransaction<'ft_l> {
         &1
     }
 
-    pub async fn start<'mol>(&'mol mut self) -> TiFsResult<StartedMiniTransaction<'mol, 'ft_l>>
+    pub async fn start<'mol>(&'mol mut self) -> TiFsResult<StartedMiniTransaction<'mol>>
     {
         let mini_res = loop {
-            let r = self.txn.single_action_txn_raw().await;
+            let r = self.txn_client_mux.clone().single_action_txn_raw().await;
+            match r {
+                Ok(mini) => break mini,
+                Err(e) => {
+                    if let Some(delay) = self.spin.backoff.next_delay_duration() {
+                        sleep(delay).await;
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
+        };
+
+        let txn = TransactionWithFsConfig{
+            fs_config: self.fs_config().clone(),
+            mini: mini_res,
+        };
+
+        Ok(StartedMiniTransaction::<'mol>{
+            parent: self,
+            txn,
+        })
+    }
+
+    pub async fn start_snapshot_read_only(
+        &mut self
+    ) -> TiFsResult<TransactionWithFsConfig>
+    {
+        let mini_res = loop {
+            let r = FlexibleTransaction::get_snapshot_read_transaction(
+                self.txn_client_mux.clone()).await;
             match r {
                 Ok(mini) => break mini,
                 Err(e) => {
@@ -68,14 +110,14 @@ impl<'ft_l> MiniTransaction<'ft_l> {
                 }
             }
         };
-        Ok(StartedMiniTransaction::<'mol, 'ft_l>{
-            parent: self,
-            mini: mini_res
+        Ok(TransactionWithFsConfig{
+            fs_config: self.fs_config().clone(),
+            mini: mini_res,
         })
     }
 }
 
-impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
+impl<'pl> StartedMiniTransaction<'pl> {
 
     pub async fn finish<'fl, R>(
         mut self,
@@ -124,6 +166,27 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
     pub fn fs_config(&self) -> &TiFsConfig {
         &self.parent.fs_config()
     }
+}
+
+impl<'mmtl> Deref for StartedMiniTransaction<'mmtl> {
+    type Target = TransactionWithFsConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.txn
+    }
+}
+
+impl<'mmtl> DerefMut for StartedMiniTransaction<'mmtl> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.txn
+    }
+}
+
+impl TransactionWithFsConfig {
+
+    pub fn fs_config(&self) -> &TiFsConfig {
+        &self.fs_config
+    }
 
     pub async fn meta_static_mutable_init(&mut self) -> TiFsResult<()> {
         let meta_static = Arc::new(MetaStatic {
@@ -140,6 +203,10 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
     }
 
     pub async fn meta_mutable_reserve_new_ino(&mut self) -> TiFsResult<StorageIno> {
+        self.meta_mutable_reserve_new_inos(1).await
+    }
+
+    pub async fn meta_mutable_reserve_new_inos(&mut self, count: u64) -> TiFsResult<StorageIno> {
         let read_meta: Result<Arc<MetaMutable>, FsError> = self.fetch(&()).await;
 
         let Ok(mut dyn_meta) = read_meta.as_deref().cloned() else {
@@ -157,7 +224,7 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         };
 
         let ino = dyn_meta.inode_next;
-        dyn_meta.inode_next += 1;
+        dyn_meta.inode_next += count;
 
         self.put(&(), Arc::new(dyn_meta)).await?;
         tracing::info!("reserved new ino: {}", ino);
@@ -589,19 +656,61 @@ impl<'ol, 'pl> StartedMiniTransaction<'ol, 'pl> {
         Ok(())
     }
 
-    pub async fn snapshot_create(&mut self, _name: ByteString) -> TiFsResult<()> {
+    #[tracing::instrument(skip(self))]
+    pub async fn hb_get_block_hash_list_by_block_range(
+        &mut self,
+        ino: StorageIno,
+        block_range: Range<BlockIndex>,
+    ) -> TiFsResult<BTreeMap<BlockIndex, TiFsHash>> {
+        let range = self.fs_config().key_builder().block_hash_range(ino, block_range.clone());
+        let iter = self.mini.scan(
+                range,
+                block_range.count() as u32,
+            )
+            .await?;
+        let mut result = BTreeMap::<BlockIndex, TiFsHash>::new();
+        for KvPair(k, hash) in iter.into_iter() {
+            let key = self.fs_config().key_parser_b(k)?.parse_key_block_address()?;
+            if hash.len() != self.fs_config().hash_len {
+                tracing::error!("hash length mismatch!");
+                continue;
+            };
+            if key.ino != ino {
+                tracing::error!("received wrong ino-block: expected: {ino}, got: {}", key.ino);
+                continue;
+            }
+            result.insert(key.index, hash);
+        }
+        tracing::trace!("result: len:{}", result.len());
+        Ok(result)
+    }
 
-        //self.fs_config().key_builder().snapshot_create_scan()
-        //self.mini.scan(range, limit)
+    #[tracing::instrument(skip(self))]
+    pub async fn hb_get_block_hash_list_by_block_range_chunked(
+        &mut self,
+        ino: StorageIno,
+        block_range: Range<BlockIndex>,
+    ) -> TiFsResult<BTreeMap<BlockIndex, TiFsHash>> {
+        let mut i = block_range.start;
+        let mut result = BTreeMap::new();
+        while i < block_range.end {
+            let chunk_start = i;
+            let chunk_end = BlockIndex(chunk_start.0+MAX_TIKV_SCAN_LIMIT as u64)
+                                        .min(block_range.end);
+            i = chunk_end;
 
-
-        Ok(())
+            let chunk = self.hb_get_block_hash_list_by_block_range(
+                ino, chunk_start..chunk_end).await?;
+            result.extend(chunk.into_iter());
+        }
+        tracing::trace!("result: len:{}", result.len());
+        Ok(result)
     }
 }
 
 
 
-impl<'ol, 'pl, K, V> TxnFetchMut<K, V> for StartedMiniTransaction<'ol, 'pl>
+impl<K, V> TxnFetchMut<K, V> for TransactionWithFsConfig
 where V: for<'dl> Deserialize<'dl>, ScopedKeyBuilder: KeyGenerator<K, V>
 {
     async fn fetch(&mut self, key: &K) -> TiFsResult<Arc<V>> {
@@ -630,7 +739,7 @@ where V: for<'dl> Deserialize<'dl>, ScopedKeyBuilder: KeyGenerator<K, V>
 }
 
 
-impl<'ol, 'pl, K, V> TxnPutMut<K, V> for StartedMiniTransaction<'ol, 'pl>
+impl<K, V> TxnPutMut<K, V> for TransactionWithFsConfig
 where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
 {
     async fn put(&mut self, key: &K, value: Arc<V>) -> TiFsResult<()> {
@@ -647,7 +756,7 @@ where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
     }
 }
 
-impl<'ol, 'pl, K, V> TxnDeleteMut<K, V> for StartedMiniTransaction<'ol, 'pl>
+impl<K, V> TxnDeleteMut<K, V> for TransactionWithFsConfig
 where V: Serialize, ScopedKeyBuilder: KeyGenerator<K, V>
 {
     async fn delete(&mut self, key: &K) -> TiFsResult<()> {

@@ -27,3 +27,5 @@ pub mod pending_deletes;
 pub mod hash_fs_interface;
 pub mod hash_fs_tikv_implementation;
 pub mod mini_transaction;
+pub mod snapshot;
+pub mod kv_parser;
