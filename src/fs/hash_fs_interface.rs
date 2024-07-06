@@ -15,6 +15,7 @@ pub enum HashFsError {
     RawGrpcStatus(Option<tonic::Status>),
     FsNotInitialized,
     FsHasInvalidData(Option<String>),
+    FsHasMissingData(Option<String>),
     FileNotFound,
     FileAlreadyExists,
     InodeHasNoInlineData,
@@ -203,7 +204,7 @@ pub trait HashFsInterface: Send + Sync  {
         ino: StorageIno,
         blocks: &[(&TiFsHash, u64, Vec<BlockIndex>)],
     ) -> HashFsResult<()>;
-    async fn snapshot_create(&self, name: ByteString) -> HashFsResult<()>;
+    async fn snapshot_create(&self, name: ByteString) -> HashFsResult<GotOrMade<StorageDirItem>>;
 }
 
 impl From<tonic::Status> for HashFsError {

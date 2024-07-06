@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, ops::{Deref, DerefMut, Range}, sync::Arc, time::SystemTime};
+use std::{any::type_name, collections::{BTreeMap, HashMap, HashSet}, fmt::Debug, ops::{Deref, DerefMut, Range}, sync::Arc, time::SystemTime};
 
 use bytestring::ByteString;
 use num_bigint::BigUint;
@@ -207,14 +207,9 @@ impl TransactionWithFsConfig {
     }
 
     pub async fn meta_mutable_reserve_new_inos(&mut self, count: u64) -> TiFsResult<StorageIno> {
-        let read_meta: Result<Arc<MetaMutable>, FsError> = self.fetch(&()).await;
+        let read_meta: Option<MetaMutable> = self.fetch_try(&()).await?;
 
-        let Ok(mut dyn_meta) = read_meta.as_deref().cloned() else {
-            let err = read_meta.unwrap_err();
-            if err != FsError::KeyNotFound {
-                return Err(err);
-            }
-
+        let Some(mut dyn_meta) = read_meta else {
             tracing::info!("dyn meta data is missing -> assume fresh FS. Initialize on the fly.");
             self.meta_static_mutable_init().await?;
 
@@ -711,14 +706,18 @@ impl TransactionWithFsConfig {
 
 
 impl<K, V> TxnFetchMut<K, V> for TransactionWithFsConfig
-where V: for<'dl> Deserialize<'dl>, ScopedKeyBuilder: KeyGenerator<K, V>
+where
+    V: for<'dl> Deserialize<'dl>,
+    ScopedKeyBuilder: KeyGenerator<K, V>,
+    K: Debug,
 {
     async fn fetch(&mut self, key: &K) -> TiFsResult<Arc<V>> {
         let opt = self.fetch_try(key).await?;
         if let Some(data) = opt {
             Ok(Arc::new(data))
         } else {
-            Err(FsError::KeyNotFound)
+            Err(FsError::KeyNotFound(
+                Some(format!("kv-type: {}->{}, key: {:?}", type_name::<K>(), type_name::<V>(), key))))
         }
     }
 

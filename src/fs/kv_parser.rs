@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use tikv_client::KvPair;
 
-use super::{error::TiFsResult, fs_config::TiFsConfig, index::deserialize_json, inode::{InoAccessTime, InoChangeIterationId, InoInlineData, InoModificationTime, InoSize, InoStorageFileAttr, StorageIno, TiFsHash}, key::InoMetadata};
+use super::{error::TiFsResult, fs_config::TiFsConfig, index::deserialize_json, inode::{InoAccessTime, InoChangeIterationId, InoDescription, InoInlineData, InoModificationTime, InoSize, InoStorageFileAttr, StorageIno, TiFsHash}, key::InoMetadata};
 
 #[derive(Default)]
 pub struct InodesAttrsHashMaps {
+    pub descriptions: HashMap<StorageIno, InoDescription>,
     pub existing_hash: HashMap<StorageIno, TiFsHash>,
     pub change_iter_id: HashMap<StorageIno, InoChangeIterationId>,
     pub size: HashMap<StorageIno, InoSize>,
@@ -27,6 +28,13 @@ impl KvPairParser {
         for KvPair(k, v) in pairs {
             let parsed = self.fs_config.key_parser_b(k)?.parse_ino()?;
             match parsed.meta {
+                InoMetadata::Description => {
+                    let _ = deserialize_json::<InoDescription>(&v)
+                        .map_err(|err| {
+                            tracing::error!("failed to parse InoDescription: {err:?}");
+                        })
+                        .map(|id| maps.descriptions.insert(parsed.ino, id));
+                }
                 InoMetadata::FullHash => {
                     maps.existing_hash.insert(parsed.ino, v);
                 }

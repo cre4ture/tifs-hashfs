@@ -2,7 +2,8 @@ use std::{collections::{HashMap, VecDeque}, sync::Arc};
 
 use bytestring::ByteString;
 
-use super::{error::TiFsResult, flexible_transaction::FlexibleTransaction, fs_config::TiFsConfig, hash_fs_interface::{BlockIndex, GotOrMade}};
+use super::{error::TiFsResult, flexible_transaction::FlexibleTransaction, fs_config::TiFsConfig, inode::InoDescription};
+use super::hash_fs_interface::{BlockIndex, GotOrMade};
 use super::transaction_client_mux::TransactionClientMux;
 use super::kv_parser::KvPairParser;
 use super::utils::txn_data_cache::{TxnFetchMut, TxnPutMut};
@@ -42,7 +43,7 @@ impl CreateSnapshot {
             self.txn_client_mux.clone(), self.fs_config().clone()).await
     }
 
-    pub async fn create_snapshot(&mut self, name: ByteString) -> TiFsResult<()> {
+    pub async fn create_snapshot(&mut self, name: ByteString) -> TiFsResult<GotOrMade<StorageDirItem>> {
 
         let root_attr: Arc<InoStorageFileAttr> = self.src_txn.fetch(&ROOT_INODE.0).await?;
 
@@ -66,12 +67,12 @@ impl CreateSnapshot {
         };
 
         let GotOrMade::NewlyCreated(snapshot_dir) = got_or_made else {
-            return Err(super::error::FsError::FileExist { file: name.into() });
+            return Ok(got_or_made);
         };
 
         self.directory_copy_recursive(ROOT_INODE, ParentStorageIno(snapshot_dir.ino)).await?;
 
-        Ok(())
+        Ok(GotOrMade::NewlyCreated(snapshot_dir))
     }
 
     pub fn fs_config(&self) -> &TiFsConfig {
@@ -95,6 +96,9 @@ impl CreateSnapshot {
 
         let mut keys = Vec::with_capacity(src_dst_mapping.len()*5);
         for (src, _dst) in src_dst_mapping {
+            keys.push(KeyGenerator::<StorageIno, InoDescription>::generate_key(
+                self.src_txn.fs_config().key_builder(),
+                &src.ino));
             keys.push(KeyGenerator::<StorageIno, InoStorageFileAttr>::generate_key(
                 self.src_txn.fs_config().key_builder(),
                 &src.ino));
@@ -122,6 +126,11 @@ impl CreateSnapshot {
             let mut started = spin.start().await?;
             let mut r1 = Ok(());
             for (src, new_ino) in src_dst_mapping {
+                if let Some(mut value) = maps.descriptions.remove(&src.ino) {
+                    value.ino = *new_ino;
+                    r1 = started.put(new_ino, Arc::new(value)).await;
+                    if r1.is_err() { break; }
+                }
                 if let Some(value) = maps.attrs.remove(&src.ino) {
                     r1 = started.put(new_ino, Arc::new(value)).await;
                     if r1.is_err() { break; }
@@ -192,7 +201,7 @@ impl CreateSnapshot {
                 origin_dir_ino.0, super::fuse_to_hashfs::MAX_TIKV_SCAN_LIMIT).await?;
 
             if src_list.len() == 0 {
-                return Ok(())
+                continue;
             }
 
             let new_inos = self.reserve_new_inos(src_list.len() as u64).await?;

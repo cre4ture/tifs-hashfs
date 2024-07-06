@@ -31,6 +31,7 @@ use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::hash_fs_interface::{BlockIndex, GotOrMade, HashFsInterface};
 use super::inode::{InoAccessTime, InoDescription, InoSize, ParentStorageIno, StorageDirItem, InoStorageFileAttr, StorageFilePermission, TiFsHash};
+use super::key::SNAPSHOT_PARENT_INODE;
 use super::mode::as_file_perm;
 use super::parsers;
 use super::reply::StatFs;
@@ -719,6 +720,15 @@ impl Txn {
         gid: u32,
         uid: u32,
     ) -> TiFsResult<StorageDirItem> {
+
+        if parent == SNAPSHOT_PARENT_INODE {
+            let got_or_made = self.hash_fs.snapshot_create(name.clone()).await?;
+            let GotOrMade::NewlyCreated(created) = got_or_made else {
+                return Err(FsError::FileExist { file: name.to_string() });
+            };
+            return Ok(created);
+        }
+
         let result = self.clone().directory_add_child_checked_new_inode(
                 parent, name.clone(), StorageDirItemKind::Directory,
                 perm, gid, uid, 0, None).await?;

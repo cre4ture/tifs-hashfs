@@ -86,8 +86,8 @@ pub enum FsError {
     #[error("failed parsing config: {msg}")]
     ConfigParsingFailed{msg: String},
 
-    #[error("db-key not found")]
-    KeyNotFound,
+    #[error("db-key not found ({0:?})")]
+    KeyNotFound(Option<String>),
 
     #[error("try lock failed")]
     TryLockFailed,
@@ -154,7 +154,7 @@ impl From<FsError> for libc::c_int {
             FileNotFound { file: _ } => libc::ENOENT,
             FileExist { file: _ } => libc::EEXIST,
             InodeNotFound { inode: _ } => libc::EFAULT,
-            KeyNotFound => libc::EFAULT,
+            KeyNotFound (_) => libc::EFAULT,
             FhNotFound { fh: _ } => libc::EBADF,
             InvalidOffset { ino: _, offset: _ } => libc::EINVAL,
             UnknownWhence { whence: _ } => libc::EINVAL,

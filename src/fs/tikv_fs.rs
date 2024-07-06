@@ -559,6 +559,7 @@ impl TiFs {
                     sleep(Duration::from_millis(100)).await;
                 }
                 Err(err @ FsError::FileNotFound { file: _ }) => return Err(err),
+                Err(err @ FsError::KeyNotFound(_)) => return Err(err),
                 Err(err @ FsError::GrpcMessageIncomplete) => return Err(err),
                 Err(err) => {
                     eprintln!("{msg}: no spin, error({}, {:?})", err, err);

@@ -315,16 +315,19 @@ impl TikvBasedHashFs {
         Ok((existing_hash, change_iter_id, size))
     }
 
-    async fn snapshot_create_private(self: Arc<TikvBasedHashFs>, name: ByteString) -> HashFsResult<()> {
+    async fn snapshot_create_private(
+        self: Arc<TikvBasedHashFs>,
+        name: ByteString
+    ) -> HashFsResult<GotOrMade<StorageDirItem>> {
         let mut txn_snapshot = self.spinning_mini_txn().await?;
         let snapshot = txn_snapshot.start_snapshot_read_only().await?;
 
         let mut tool = CreateSnapshot::new(
             snapshot, self.txn_client_mux.clone());
 
-        tool.create_snapshot(name).await?;
+        let got_or_made = tool.create_snapshot(name).await?;
 
-        Ok(())
+        Ok(got_or_made)
     }
 }
 
@@ -881,7 +884,7 @@ impl HashFsInterface for TikvBasedHashFs {
         Ok(())
     }
 
-    async fn snapshot_create(&self, name: ByteString) -> HashFsResult<()> {
+    async fn snapshot_create(&self, name: ByteString) -> HashFsResult<GotOrMade<StorageDirItem>> {
         self.weak.upgrade().unwrap().snapshot_create_private(name).await
     }
 } // interface impl end
@@ -893,6 +896,7 @@ impl From<HashFsError> for FsError {
             HashFsError::FsNotInitialized => FsError::ConfigParsingFailed { msg: format!("Fs not initialized.") },
             HashFsError::FsHasInvalidData(msg) => FsError::UnknownError(format!("msg: {msg:?}")),
             HashFsError::FileNotFound => FsError::FileNotFound { file: format!("undefined") },
+            HashFsError::FsHasMissingData(msg) => FsError::KeyNotFound(msg),
             HashFsError::Unspecific(msg) => FsError::UnknownError(msg),
             HashFsError::FileAlreadyExists => FsError::FileExist { file: format!("undefined") },
             HashFsError::InodeHasNoInlineData => FsError::WrongFileType,
@@ -907,6 +911,8 @@ impl From<FsError> for HashFsError {
         match value {
             FsError::InodeNotFound { inode: _ } => HashFsError::FileNotFound,
             FsError::FileNotFound { file: _ } => HashFsError::FileNotFound,
+            FsError::KeyNotFound(msg) =>
+                HashFsError::FsHasMissingData(Some(format!("key not found: {:?}", msg))),
             other => HashFsError::Unspecific(format!("FsError: {other:?}")),
         }
     }

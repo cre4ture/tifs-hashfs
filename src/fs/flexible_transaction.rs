@@ -1,3 +1,5 @@
+use std::any::type_name;
+use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -425,14 +427,18 @@ impl FlexibleTransaction {
 
 
 impl<K, V> TxnFetch<K, V> for FlexibleTransaction
-where V: for<'dl> Deserialize<'dl>, ScopedKeyBuilder: KeyGenerator<K, V>
+where
+    V: for<'dl> Deserialize<'dl>,
+    ScopedKeyBuilder: KeyGenerator<K, V>,
+    K: Debug,
 {
     async fn fetch(&self, key: &K) -> TiFsResult<Arc<V>> {
         let t = self.fs_config.key_builder();
         let key_raw = t.generate_key(key);
         let result = self.get(key_raw).await?;
         let Some(data) = result else {
-            return Err(FsError::KeyNotFound);
+            return Err(FsError::KeyNotFound(
+                Some(format!("kv-type: {}->{}, key: {:?}", type_name::<K>(), type_name::<V>(), key))));
         };
         Ok(Arc::new(deserialize_json::<V>(&data)
             .map_err(|err|FsError::UnknownError(format!("deserialize failed: {err}")))?))
