@@ -83,6 +83,7 @@ enum fs_error_id {
   InodeHasNoInlineData = 6;
   GrpcMessageIncomplete = 7;
   RawTonicTransportError = 8;
+  FsDataIsMissing = 9;
 }
 
 message StorageIno {
@@ -420,4 +421,6 @@ message snapshot_create_rq {
 
 message snapshot_create_rs {
   HashFsError error = 1;
+  bool existed_already = 2;
+  StorageDirItem item = 3;
 }

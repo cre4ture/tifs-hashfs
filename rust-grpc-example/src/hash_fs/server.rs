@@ -658,7 +658,10 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         let mut rsp = grpc_fs::SnapshotCreateRs::default();
         match r {
             Err(err) => rsp.error = Some(err.into()),
-            Ok(()) => {}
+            Ok(gom) => {
+                rsp.existed_already = gom.existed_before();
+                rsp.item = Some(gom.value().into());
+            }
         }
         Ok(tonic::Response::new(rsp))
     }

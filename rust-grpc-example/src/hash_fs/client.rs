@@ -519,11 +519,20 @@ impl HashFsInterface for HashFsClient {
         Ok(())
     }
 
-    async fn snapshot_create(&self, name: ByteString) -> HashFsResult<()> {
+    async fn snapshot_create(&self, name: ByteString) -> HashFsResult<GotOrMade<StorageDirItem>> {
         let mut rq = grpc_fs::SnapshotCreateRq::default();
         rq.name = name.to_string();
         let rs = self.lock_grpc().await?.snapshot_create(rq).await?.into_inner();
         handle_error(&rs.error)?;
-        Ok(())
+        let existed_before = rs.existed_already;
+        let Some(item) = rs.item else {
+            return Err(HashFsError::GrpcMessageIncomplete);
+        };
+        if existed_before {
+            Ok(GotOrMade::ExistedAlready(item.into()))
+        } else {
+            Ok(GotOrMade::NewlyCreated(item.into()))
+        }
+
     }
 }
