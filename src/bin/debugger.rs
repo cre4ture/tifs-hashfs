@@ -3,10 +3,9 @@ use std::io::{stdin, stdout, BufRead, BufReader, Write};
 
 use anyhow::{anyhow, Result};
 use clap::{crate_version, App, Arg};
-use tifs::fs::inode::Inode;
 use tifs::fs::key::{ScopedKey, ROOT_INODE};
 use tifs::fs::tikv_fs::TiFs;
-use tifs::fs::transaction::Txn;
+use tifs::fs::fuse_to_hashfs::Txn;
 use tikv_client::TransactionClient;
 use tracing_subscriber::EnvFilter;
 
@@ -126,7 +125,7 @@ impl Console {
                 (next_inode - ROOT_INODE) as u32,
             )
             .await?
-            .map(|pair| Inode::deserialize(pair.value()))
+            .map(|pair| InoDescription::deserialize(pair.value()))
         {
             let inode = inode?;
             txn.clear_data(inode.ino).await?;
@@ -169,7 +168,7 @@ impl Console {
             return Err(anyhow!("invalid arguments `{:?}`", args));
         }
         match txn.get(ScopedKey::inode(args[0].parse()?)).await? {
-            Some(value) => println!("{:?}", Inode::deserialize(&value)?),
+            Some(value) => println!("{:?}", InoDescription::deserialize(&value)?),
             None => println!("Not Found"),
         }
         Ok(())
@@ -192,7 +191,7 @@ impl Console {
         }
         match txn.get(ScopedKey::inode(args[0].parse()?)).await? {
             Some(value) => {
-                let inline = Inode::deserialize(&value)?
+                let inline = InoDescription::deserialize(&value)?
                     .inline_data
                     .unwrap_or_else(Vec::new);
                 println!("{}", String::from_utf8_lossy(&inline));

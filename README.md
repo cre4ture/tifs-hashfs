@@ -1,6 +1,27 @@
-# TiFS
+# HashFs based on TiKV (derived from TiFS)
 
-A distributed POSIX filesystem based on TiKV, with partition tolerance and strict consistency.
+This repo contains my experimental implementation of a POSIX(FUSE) based distributed filesystem
+that automatically de-duplicates by managing data blocks by hashes.
+
+It contains executables for
+1. direct connection to the TiKV cluster
+2. GRPC client+server to avoid many long round-trip times when operating on slow internet connection.
+
+Features:
+- deduplication by using hashed blocks
+- reference counting on the bashed blocks
+- provides access to the internally computed hashes by special automatically listed hash-files.
+- vectored upload and download of blocks to speedup transfer
+- very basic snapshot mechanism (no write-protection yet)
+
+Experiences:
+- despite some optimizations, the block-reference counting brings some overhead that
+significantly slows down the write operations. For me it wasn't possible to get much more than 20 MBit/s on Gigabit Ethernet (LAN).
+
+# Credits to TiFS - project
+
+TiFS is a distributed POSIX filesystem based on TiKV, with partition tolerance and strict consistency.
+The remaining part of this README is still original from TiFS.
 
 [![pjdfstest](https://github.com/Hexilee/tifs/workflows/pjdfstest/badge.svg)](https://github.com/Hexilee/tifs/actions)
 

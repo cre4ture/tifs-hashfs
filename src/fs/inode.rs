@@ -1,15 +1,16 @@
 use std::collections::HashSet;
-use std::ops::{Deref, DerefMut};
+use std::fmt::Display;
+use std::time::SystemTime;
 
-use fuser::FileAttr;
-use libc::F_UNLCK;
+
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use super::error::{FsError, Result};
-use super::serialize::{deserialize, serialize, ENCODING};
+use super::key::BlockAddress;
+
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LockState {
+pub struct InoLockState {
     pub owner_set: HashSet<u64>,
     #[cfg(target_os = "linux")]
     pub lk_type: i32,
@@ -17,24 +18,227 @@ pub struct LockState {
     pub lk_type: i16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Inode {
-    pub file_attr: FileAttr,
-    pub lock_state: LockState,
-    pub inline_data: Option<Vec<u8>>,
-    pub next_fh: u64,
-    pub opened_fh: u64,
+pub type TiFsHash = Vec<u8>;
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StorageIno(pub u64);
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ParentStorageIno(pub StorageIno);
+
+impl Display for StorageIno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
-impl Inode {
+impl Display for ParentStorageIno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StorageDirItemKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectoryItem {
+    pub ino: StorageIno,
+    pub name: String,
+    pub typ: StorageDirItemKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageDirItem {
+    pub ino: StorageIno,
+    pub typ: StorageDirItemKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize)]
+pub struct StorageFilePermission(pub u16);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize)]
+pub struct InoStorageFileAttr {
+    /// Permissions
+    pub perm: StorageFilePermission,
+    /// User id
+    pub uid: u32,
+    /// Group id
+    pub gid: u32,
+    /// Rdev
+    pub rdev: u32,
+    /// Flags (macOS only, see chflags(2))
+    pub flags: u32,
+    /// time when this struct changed last time
+    pub last_change: SystemTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InoAccessTime(pub SystemTime);
+
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InoModificationTime(pub SystemTime);
+
+
+/// These parameters do not change during the lifetime of an inode.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InoDescription {
+    pub ino: StorageIno,
+    pub typ: StorageDirItemKind,
+    pub creation_time: SystemTime,
+}
+
+impl InoDescription {
+    pub fn storage_ino(&self) -> StorageIno {
+        self.ino
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct InoChangeIterationId(pub Uuid);
+
+impl InoChangeIterationId {
+    pub fn random() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InoFullHash(pub TiFsHash);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InoInlineData{
+    pub inlined: Vec<u8>,
+    pub last_change: SystemTime,
+}
+
+impl InoInlineData {
+    pub async fn write_into_inline_data(
+        &mut self,
+        start: u64,
+        data: &[u8],
+    ) -> () {
+        let size = data.len();
+        let start = start as usize;
+
+        if start + size > self.inlined.len() {
+            self.inlined.resize(start + size, 0);
+        }
+        self.inlined[start..start + size].copy_from_slice(data);
+
+        self.last_change = SystemTime::now();
+    }
+
+    pub async fn read_from_inline_data(
+        &mut self,
+        start: u64,
+        size: u64,
+    ) -> Vec<u8> {
+        let start = start as usize;
+        let size = size as usize;
+
+        let mut data = Vec::with_capacity(size);
+        if self.inlined.len() > start {
+            let to_copy = size.min(self.inlined.len() - start);
+            data.extend_from_slice(&self.inlined[start..start + to_copy]);
+        }
+        data
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InoSize {
+    pub size: u64,
+    pub blocks: u64,
+    pub last_change: SystemTime,
+}
+
+impl InoSize {
+    pub fn new() -> Self {
+        Self {
+            size: 0,
+            blocks: 0,
+            last_change: SystemTime::now(),
+        }
+    }
+
     fn update_blocks(&mut self, block_size: u64) {
-        self.blocks = (self.size + block_size - 1) / block_size;
+        self.blocks = self.size.div_ceil(block_size);
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn blocks(&self) -> u64 {
+        self.blocks
     }
 
     pub fn set_size(&mut self, size: u64, block_size: u64) {
-        self.size = size;
-        self.update_blocks(block_size);
+        if self.size != size {
+            self.size = size;
+            self.update_blocks(block_size);
+            self.last_change = SystemTime::now();
+        }
     }
+
+    pub fn block_write_size_update(
+        &mut self,
+        addr: &BlockAddress,
+        fs_block_size: u64,
+        new_blocks_actual_size: u64
+    ) -> bool {
+        let target_size = addr.index.0 * fs_block_size + new_blocks_actual_size;
+        if target_size <= self.size() {
+            return false;
+        }
+
+        self.set_size(target_size, fs_block_size);
+        self.last_change = SystemTime::now();
+
+        true
+    }
+
+}
+
+/*
+impl InoDescription {
+    pub fn new(ino: StorageIno, typ: StorageDirItemKind, perm: StorageFilePermission, gid: u32, uid: u32, rdev: u32,) -> Self {
+        let inode = Self {
+            ino,
+            typ,
+            size: 0,
+            blocks: 0,
+            attr: StorageFileAttr {
+                atime: SystemTime::now(),
+                mtime: SystemTime::now(),
+                ctime: SystemTime::now(),
+                crtime: SystemTime::now(),
+                perm,
+                uid,
+                gid,
+                rdev,
+                flags: 0,
+            },
+            lock_state: LockState::new(HashSet::new(), 0),
+            inline_data: None,
+            data_hash: None,
+        };
+        inode
+    }
+
+    pub fn storage_ino(&self) -> StorageIno {
+        self.ino
+    }
+
+
 
     pub fn serialize(&self) -> Result<Vec<u8>> {
         serialize(self).map_err(|err| FsError::Serialize {
@@ -53,41 +257,9 @@ impl Inode {
     }
 }
 
-impl From<FileAttr> for Inode {
-    fn from(attr: FileAttr) -> Self {
-        Inode {
-            file_attr: attr,
-            lock_state: LockState::new(HashSet::new(), F_UNLCK),
-            inline_data: None,
-            next_fh: 0,
-            opened_fh: 0,
-        }
-    }
-}
-
-impl From<Inode> for FileAttr {
-    fn from(inode: Inode) -> Self {
-        inode.file_attr
-    }
-}
-
-impl From<Inode> for LockState {
-    fn from(inode: Inode) -> Self {
+impl From<InoDescription> for LockState {
+    fn from(inode: InoDescription) -> Self {
         inode.lock_state
-    }
-}
-
-impl Deref for Inode {
-    type Target = FileAttr;
-
-    fn deref(&self) -> &Self::Target {
-        &self.file_attr
-    }
-}
-
-impl DerefMut for Inode {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.file_attr
     }
 }
 
@@ -101,3 +273,4 @@ impl LockState {
         LockState { owner_set, lk_type }
     }
 }
+*/

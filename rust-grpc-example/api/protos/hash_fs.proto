@@ -1,0 +1,426 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+package hash_fs;
+
+service HashFS {
+
+  rpc init(init_rq) returns (init_rs);
+  rpc meta_static_read(meta_static_read_rq) returns (meta_static_read_rs);
+
+  rpc directory_read_children(directory_read_children_rq) returns (directory_read_children_rs);
+  rpc directory_add_child_checked_existing_inode(directory_add_child_checked_existing_inode_rq) returns (directory_add_child_checked_existing_inode_rs);
+  rpc directory_add_child_checked_new_inode(directory_add_child_checked_new_inode_rq) returns (directory_add_child_checked_new_inode_rs);
+  rpc directory_remove_child_file(directory_remove_child_file_rq) returns (directory_remove_child_file_rs);
+  rpc directory_remove_child_directory(directory_remove_child_directory_rq) returns (directory_remove_child_directory_rs);
+  rpc directory_rename_child(directory_rename_child_rq) returns (directory_rename_child_rs);
+  rpc directory_child_get_all_attributes(directory_child_get_all_attributes_rq) returns (directory_child_get_all_attributes_rs);
+  rpc directory_add_new_symlink(directory_add_new_symlink_rq) returns (directory_add_new_symlink_rs);
+  rpc inode_get_all_attributes(inode_get_all_attributes_rq) returns (inode_get_all_attributes_rs);
+  rpc inode_set_all_attributes(inode_set_all_attributes_rq) returns (inode_set_all_attributes_rs);
+  rpc inode_open(inode_open_rq) returns (inode_open_rs);
+  rpc inode_close(inode_close_rq) returns (inode_close_rs);
+  rpc inode_allocate_size(inode_allocate_size_rq) returns (inode_allocate_size_rs);
+  rpc inode_read_inline_data(inode_read_inline_data_rq) returns (inode_read_inline_data_rs);
+  rpc inode_read_block_hashes_data_range(inode_read_block_hashes_data_range_rq) returns (inode_read_block_hashes_data_range_rs);
+  rpc inode_read_block_hashes_block_range(inode_read_block_hashes_block_range_rq) returns (inode_read_block_hashes_block_range_rs);
+  rpc hb_get_block_data_by_hashes(hb_get_block_data_by_hashes_rq) returns (hb_get_block_data_by_hashes_rs);
+  rpc file_get_hash(file_get_hash_rq) returns (file_get_hash_rs);
+  rpc file_read_block_hashes(file_read_block_hashes_rq) returns (file_read_block_hashes_rs);
+  rpc hb_increment_reference_count(hb_increment_reference_count_rq) returns (hb_increment_reference_count_rs);
+  rpc hb_upload_new_block(hb_upload_new_block_rq) returns (hb_upload_new_block_rs);
+  rpc inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes_rq) returns (inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes_rs);
+  rpc snapshot_create(snapshot_create_rq) returns (snapshot_create_rs);
+}
+
+message meta_static_read_rq {}
+
+message meta_static_read_rs {
+  HashFsError error = 1;
+  MetaStatic value = 2;
+}
+
+message MetaStatic {
+  uint64 block_size = 1;
+  bool hashed_blocks = 2;
+  string hash_algorithm = 3;
+}
+
+message init_rq {
+  uint32 gid = 1;
+  uint32 uid = 2;
+}
+
+message init_rs {
+  HashFsError error = 1;
+  StorageDirItem value = 2;
+}
+
+message StorageDirItem {
+  StorageIno ino = 1;
+  StorageDirItemKind typ = 2;
+}
+
+enum StorageDirItemKind {
+  File = 0;
+  Directory = 1;
+  Symlink = 2;
+}
+
+message HashFsError {
+  fs_error_id id = 1;
+  string msg = 2;
+}
+
+enum fs_error_id {
+  Unspecific = 0;
+  RawGrpcStatus = 1;
+  FsNotInitialized = 2;
+  FsHasInvalidData = 3;
+  FileNotFound = 4;
+  FileAlreadyExists = 5;
+  InodeHasNoInlineData = 6;
+  GrpcMessageIncomplete = 7;
+  RawTonicTransportError = 8;
+  FsDataIsMissing = 9;
+}
+
+message StorageIno {
+  uint64 t = 1;
+}
+
+message ParentStorageIno {
+  StorageIno t = 1;
+}
+
+message DirectoryItem {
+  StorageIno ino = 1;
+  string name = 2;
+  StorageDirItemKind typ = 3;
+}
+
+message StorageFilePermission {
+  uint32 t = 1;
+}
+
+message InoDescription {
+  StorageIno ino = 1;
+  StorageDirItemKind typ = 2;
+  google.protobuf.Timestamp creation_time = 3;
+}
+
+message InoStorageFileAttr {
+  StorageFilePermission perm = 1;
+  uint32 uid = 2;
+  uint32 gid = 3;
+  uint32 rdev = 4;
+  uint32 flags = 5;
+  google.protobuf.Timestamp last_change = 6;
+}
+
+message InoSize {
+  uint64 size = 1;
+  uint64 blocks = 2;
+  // bytes inline_data = 3;
+  // bytes data_hash = 4;
+  google.protobuf.Timestamp last_change = 5;
+  // uint64 change_iteration = 6;
+}
+
+message InoAccessTime {
+  google.protobuf.Timestamp atime = 1;
+}
+
+message InoAllAttributes {
+  InoDescription desc = 2;
+  InoStorageFileAttr attrs = 3;
+  InoSize size = 4;
+  InoAccessTime atime = 5;
+}
+
+message TimeOrNow {
+  google.protobuf.Timestamp time = 5;
+}
+
+message Uuid {
+  string t = 1;
+}
+
+message BlockIndex {
+  uint64 t = 1;
+}
+
+message Hash {
+  bytes data = 1;
+}
+
+message BlockRange {
+  BlockIndex start = 1;
+  BlockIndex end = 2;
+}
+
+message HashBlockData {
+  Hash hash = 1;
+  bytes data = 2;
+}
+
+message HashBlockCount {
+  Hash hash = 1;
+  BigUint count = 2;
+}
+
+message HashBlockIncrements {
+  Hash hash = 1;
+  uint64 inc = 2;
+}
+
+message HashBlockAddresses {
+  Hash hash = 1;
+  uint64 block_actual_length = 2;
+  repeated BlockIndex block_ids = 3;
+}
+
+message BigUint {
+  bytes big_endian_value = 1;
+}
+
+// =========================================================
+
+message directory_read_children_rq {
+  StorageIno dir_ino = 1;
+}
+
+message directory_read_children_rs {
+  HashFsError error = 1;
+  repeated DirectoryItem value = 2;
+}
+
+message directory_add_child_checked_existing_inode_rq {
+  ParentStorageIno parent = 1;
+  string name = 2;
+  StorageIno ino = 3;
+}
+
+message directory_add_child_checked_existing_inode_rs {
+  HashFsError error = 1;
+}
+
+message directory_add_child_checked_new_inode_rq {
+  ParentStorageIno parent = 1;
+  string name = 2;
+  StorageDirItemKind typ = 3;
+  StorageFilePermission perm = 4;
+  uint32 gid = 5;
+  uint32 uid = 6;
+  uint32 rdev = 7;
+  bytes inline_data = 8;
+}
+
+message directory_add_child_checked_new_inode_rs {
+  HashFsError error = 1;
+  bool existed_already = 2;
+  StorageDirItem item = 3;
+}
+
+message directory_remove_child_file_rq {
+  ParentStorageIno parent = 1;
+  string name = 2;
+}
+
+message directory_remove_child_file_rs {
+  HashFsError error = 1;
+}
+
+message directory_remove_child_directory_rq {
+  ParentStorageIno parent = 1;
+  string name = 2;
+}
+
+message directory_remove_child_directory_rs {
+  HashFsError error = 1;
+}
+
+message directory_rename_child_rq {
+  ParentStorageIno parent = 1;
+  string child_name = 2;
+  ParentStorageIno new_parent = 3;
+  string new_child_name = 4;
+}
+
+message directory_rename_child_rs {
+  HashFsError error = 1;
+}
+
+message directory_child_get_all_attributes_rq {
+  ParentStorageIno parent = 1;
+  string name = 2;
+}
+
+message directory_child_get_all_attributes_rs {
+  HashFsError error = 1;
+  InoAllAttributes all = 2;
+}
+
+message directory_add_new_symlink_rq {
+  ParentStorageIno parent = 1;
+  string name = 2;
+  string link = 3;
+  uint32 gid = 4;
+  uint32 uid = 5;
+}
+
+message directory_add_new_symlink_rs {
+  HashFsError error = 1;
+  StorageDirItem item = 2;
+}
+
+message inode_get_all_attributes_rq {
+  StorageIno ino = 1;
+}
+
+message inode_get_all_attributes_rs {
+  HashFsError error = 1;
+  InoAllAttributes all = 2;
+}
+
+message inode_set_all_attributes_rq {
+  StorageIno ino = 1;
+  StorageFilePermission mode = 2;
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
+  optional uint64 size = 5;
+  TimeOrNow atime = 6;
+  TimeOrNow mtime = 7;
+  google.protobuf.Timestamp ctime = 8;
+  google.protobuf.Timestamp crtime = 9;
+  google.protobuf.Timestamp chgtime = 10;
+  google.protobuf.Timestamp bkuptime = 11;
+  optional uint32 flags = 12;
+}
+
+message inode_set_all_attributes_rs {
+  HashFsError error = 1;
+}
+
+message inode_open_rq {
+  StorageIno ino = 1;
+}
+
+message inode_open_rs {
+  HashFsError error = 1;
+  Uuid use_id = 2;
+}
+
+message inode_close_rq {
+  StorageIno ino = 1;
+  Uuid use_id = 2;
+}
+
+message inode_close_rs {
+  HashFsError error = 1;
+}
+
+message inode_allocate_size_rq {
+  StorageIno ino = 1;
+  int64 offset = 2;
+  int64 length = 3;
+}
+
+message inode_allocate_size_rs {
+  HashFsError error = 1;
+}
+
+message inode_read_inline_data_rq {
+  StorageIno ino = 1;
+}
+
+message inode_read_inline_data_rs {
+  HashFsError error = 1;
+  bytes data = 2;
+}
+
+message inode_read_block_hashes_data_range_rq {
+  StorageIno ino = 1;
+  uint64 start = 2;
+  uint64 read_size = 3;
+}
+
+message inode_read_block_hashes_data_range_rs {
+  HashFsError error = 1;
+  map<uint64, Hash> block_hashes = 2;
+}
+
+message inode_read_block_hashes_block_range_rq {
+  StorageIno ino = 1;
+  repeated BlockRange ranges = 2;
+}
+
+message inode_read_block_hashes_block_range_rs {
+  HashFsError error = 1;
+  map<uint64, Hash> block_hashes = 2;
+}
+
+message hb_get_block_data_by_hashes_rq {
+  repeated Hash hashes = 1;
+}
+
+message hb_get_block_data_by_hashes_rs {
+  HashFsError error = 1;
+  repeated HashBlockData block_data = 2;
+}
+
+message file_get_hash_rq {
+  StorageIno ino = 1;
+}
+
+message file_get_hash_rs {
+  HashFsError error = 1;
+  Hash hash = 2;
+}
+
+message file_read_block_hashes_rq {
+  StorageIno ino = 1;
+  BlockRange block_range = 2;
+}
+
+message file_read_block_hashes_rs {
+  HashFsError error = 1;
+  bytes hashes = 2;
+}
+
+message hb_increment_reference_count_rq {
+  repeated HashBlockIncrements increments = 1;
+}
+
+message hb_increment_reference_count_rs {
+  HashFsError error = 1;
+  repeated HashBlockCount previous_counts = 2;
+}
+
+message hb_upload_new_block_rq {
+  repeated HashBlockData blocks = 1;
+}
+
+message hb_upload_new_block_rs {
+  HashFsError error = 1;
+}
+
+message inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes_rq {
+  StorageIno ino = 1;
+  repeated HashBlockAddresses blocks = 2;
+}
+
+message inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes_rs {
+  HashFsError error = 1;
+}
+
+message snapshot_create_rq {
+  string name = 1;
+}
+
+message snapshot_create_rs {
+  HashFsError error = 1;
+  bool existed_already = 2;
+  StorageDirItem item = 3;
+}

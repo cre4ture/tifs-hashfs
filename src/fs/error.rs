@@ -1,7 +1,11 @@
+use std::backtrace::Backtrace;
+
 use thiserror::Error;
 use tracing::error;
 
-#[derive(Error, Debug)]
+use super::{inode::{StorageIno, TiFsHash}, reply::InoKind};
+
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum FsError {
     #[error("unimplemented")]
     Unimplemented,
@@ -26,10 +30,10 @@ pub enum FsError {
     FileExist { file: String },
 
     #[error("cannot find inode({inode})")]
-    InodeNotFound { inode: u64 },
+    InodeNotFound { inode: StorageIno },
 
-    #[error("cannot find {ino}({fh})")]
-    FhNotFound { ino: u64, fh: u64 },
+    #[error("cannot find fh({fh})")]
+    FhNotFound { fh: u64 },
 
     #[error("invalid offset({offset}) of ino({ino})")]
     InvalidOffset { ino: u64, offset: i64 },
@@ -38,13 +42,16 @@ pub enum FsError {
     UnknownWhence { whence: i32 },
 
     #[error("cannot find block(<{inode}>[{block}])")]
-    BlockNotFound { inode: u64, block: u64 },
+    BlockNotFound { inode: StorageIno, block: u64 },
 
     #[error("dir({dir}) not empty")]
     DirNotEmpty { dir: String },
 
     #[error("invalid string")]
     InvalidStr,
+
+    #[error("wrong file type for this operation")]
+    WrongFileType,
 
     #[error("unknown file type")]
     UnknownFileType,
@@ -69,9 +76,34 @@ pub enum FsError {
 
     #[error("no space left: MaxSize({0})")]
     NoSpaceLeft(u64),
+
+    #[error("Read checksum mismatch: hash: {hash:?} vs. actual: {actual_hash:?}")]
+    ChecksumMismatch{hash: TiFsHash, actual_hash: TiFsHash},
+
+    #[error("Requested operation not supported by this ino kind ({0:?})")]
+    InoKindNotSupported(InoKind),
+
+    #[error("failed parsing config: {msg}")]
+    ConfigParsingFailed{msg: String},
+
+    #[error("db-key not found ({0:?})")]
+    KeyNotFound(Option<String>),
+
+    #[error("try lock failed")]
+    TryLockFailed,
+
+    #[error("open mode doesn't allow write")]
+    WriteNotAllowed,
+
+    #[error("close failed due to wrong ino or use_id")]
+    CloseFailedDueToWrongInoOrUseId,
+
+    #[error("grpc message was incomplete")]
+    GrpcMessageIncomplete,
 }
 
 pub type Result<T> = std::result::Result<T, FsError>;
+pub type TiFsResult<T> = std::result::Result<T, FsError>;
 
 impl FsError {
     pub fn unimplemented() -> Self {
@@ -91,6 +123,7 @@ impl From<std::ffi::NulError> for FsError {
 
 impl From<std::io::Error> for FsError {
     fn from(err: std::io::Error) -> Self {
+        println!("Unknown Error 1: {:?}, backtrace:\n{}", err, Backtrace::force_capture());
         Self::UnknownError(err.to_string())
     }
 }
@@ -102,7 +135,12 @@ impl From<tikv_client::Error> for FsError {
         match err {
             KeyError(err) => Self::KeyError(format!("{:?}", err)),
             MultipleKeyErrors(errs) => Self::KeyError(format!("{:?}", errs)),
-            _ => Self::UnknownError(err.to_string()),
+            // Grpc(ge) if let grpcio::error::Error::RpcFailure(status) = ge => {}
+            _ => {
+                //println!("Unknown Error 2: {:?}, backtrace:\n{}", err, Backtrace::force_capture());
+                //tracing::debug!("Unknown Error 2: {err:?}");
+                Self::UnknownError(err.to_string())
+            }
         }
     }
 }
@@ -116,7 +154,8 @@ impl From<FsError> for libc::c_int {
             FileNotFound { file: _ } => libc::ENOENT,
             FileExist { file: _ } => libc::EEXIST,
             InodeNotFound { inode: _ } => libc::EFAULT,
-            FhNotFound { ino: _, fh: _ } => libc::EBADF,
+            KeyNotFound (_) => libc::EFAULT,
+            FhNotFound { fh: _ } => libc::EBADF,
             InvalidOffset { ino: _, offset: _ } => libc::EINVAL,
             UnknownWhence { whence: _ } => libc::EINVAL,
             BlockNotFound { inode: _, block: _ } => libc::EINVAL,
@@ -127,7 +166,14 @@ impl From<FsError> for libc::c_int {
             InvalidStr => libc::EINVAL,
             BlockSizeConflict { origin: _, new: _ } => libc::EINVAL,
             NoSpaceLeft(_) => libc::ENOSPC,
+            ChecksumMismatch { hash: _, actual_hash: _ } => libc::ERANGE,
             _ => libc::EFAULT,
         }
+    }
+}
+
+impl From<tokio::sync::TryLockError> for FsError {
+    fn from(_value: tokio::sync::TryLockError) -> Self {
+        Self::TryLockFailed
     }
 }
