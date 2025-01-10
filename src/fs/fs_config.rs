@@ -312,7 +312,7 @@ pub struct TiFsConfig {
 }
 
 impl TiFsConfig {
-    pub const DEFAULT_BLOCK_SIZE: u64 = 1 << 16;
+    pub const DEFAULT_BLOCK_SIZE: u64 = 64 << 10;
 
     pub fn from_options(options: &Vec<MountOption>) -> TiFsResult<Self> {
 

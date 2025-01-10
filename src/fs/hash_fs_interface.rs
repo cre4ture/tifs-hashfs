@@ -29,7 +29,7 @@ pub enum HashFsError {
 pub struct BlockIndex(pub u64);
 
 impl std::iter::Step for BlockIndex {
-    fn steps_between(start: &Self, end: &Self) -> Option<usize> {
+    fn steps_between(start: &Self, end: &Self) -> (usize, Option<usize>) {
         u64::steps_between(&start.0, &end.0)
     }
 
@@ -43,6 +43,7 @@ impl std::iter::Step for BlockIndex {
 }
 
 pub type HashFsResult<V> = Result<V, HashFsError>;
+pub type HashFsData = bytes::Bytes;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GotOrMadePure {
@@ -180,7 +181,7 @@ pub trait HashFsInterface: Send + Sync  {
     async fn hb_get_block_data_by_hashes(
         &self,
         hashes: &HashSet<&TiFsHash>,
-    ) -> HashFsResult<HashMap<TiFsHash, Arc<Vec<u8>>>>;
+    ) -> HashFsResult<HashMap<TiFsHash, HashFsData>>;
     async fn file_get_hash(&self, ino: StorageIno) -> HashFsResult<Vec<u8>>;
     async fn file_read_block_hashes(
         &self,
@@ -195,9 +196,9 @@ pub trait HashFsInterface: Send + Sync  {
     ) -> HashFsResult<HashMap<TiFsHash, BigUint>>;
     // This uploads data for a new block. Will not do any reference count changes.
     // Will also succeed when the block already existed.
-    async fn hb_upload_new_block(
+    async fn hb_upload_new_blocks(
         &self,
-        blocks: &[(&TiFsHash, Arc<Vec<u8>>)],
+        blocks: &[(&TiFsHash, HashFsData)],
     ) -> HashFsResult<()>;
     async fn inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
         &self,

@@ -1,6 +1,5 @@
 #![feature(array_chunks)]
 #![feature(map_try_insert)]
-#![feature(async_closure)]
 #![feature(type_alias_impl_trait)]
 #![feature(async_fn_traits)]
 #![feature(iter_array_chunks)]

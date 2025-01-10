@@ -12,6 +12,7 @@ use range_collections::RangeSet2;
 use strum::IntoEnumIterator;
 use tikv_client::{Key, KvPair};
 use tikv_client::transaction::Mutation;
+use super::block_storage_interface::BlockStorageInterface;
 use uuid::Uuid;
 
 use crate::fs::hash_fs_interface::GotOrMadePure;
@@ -33,7 +34,7 @@ use super::{
     };
 use super::key::{check_file_name, InoMetadata, ROOT_INODE};
 use super::hash_fs_interface::{
-        BlockIndex, GotOrMade, HashFsError, HashFsInterface, HashFsResult};
+        BlockIndex, GotOrMade, HashFsData, HashFsError, HashFsInterface, HashFsResult};
 use super::inode::{DirectoryItem, InoAccessTime, InoChangeIterationId, InoDescription, InoInlineData, InoSize, InoStorageFileAttr, InoModificationTime, ParentStorageIno, StorageDirItem, StorageDirItemKind, StorageFilePermission, StorageIno};
 
 
@@ -58,11 +59,68 @@ fn set_if_changed<T: std::cmp::PartialEq>(
     }
 }
 
+pub struct TikvBasedBlockStorage {
+    fs_config: TiFsConfig,
+    f_txn: FlexibleTransaction,
+}
+
+impl TikvBasedBlockStorage {
+    fn new(fs_config: TiFsConfig, f_txn: FlexibleTransaction) -> Self {
+        return Self{
+            f_txn,
+            fs_config,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BlockStorageInterface for TikvBasedBlockStorage {
+    async fn hb_get_block_data_by_hashes(
+        &self,
+        hashes: &HashSet<&TiFsHash>,
+    ) -> HashFsResult<HashMap<TiFsHash, HashFsData>> {
+        let mut keys = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let key = self.fs_config.key_builder().hashed_block(*hash);
+            keys.push(Key::from(key));
+        }
+        let rcv_data_list = self.f_txn.batch_get(keys).await?;
+        let mut hashed_block_data = HashMap::with_capacity(rcv_data_list.len());
+        for KvPair(k, v) in rcv_data_list {
+            let hash = self.fs_config.key_parser_b(k)?.parse_key_hashed_block()?;
+            let value: HashFsData = v.into();
+            hashed_block_data.insert(hash.clone(), value.clone());
+        }
+        Ok(hashed_block_data)
+    }
+
+    async fn hb_upload_new_blocks(&self, blocks: &[(&TiFsHash, HashFsData)]) -> HashFsResult<()> {
+        let mutations = blocks.iter().map(|(h,d)|{
+            let key = self.fs_config.key_builder().hashed_block(h);
+            Mutation::Put(key.into(), d.to_vec())
+        }).collect::<Vec<_>>();
+
+        self.f_txn.batch_mutate(mutations).await?;
+        Ok(())
+    }
+
+    async fn hb_upload_new_block_by_composition(
+        &self,
+        _original_hash: &TiFsHash,
+        _new_hash: &TiFsHash,
+        _new_block_data_offset: u64,
+        _new_block_data: HashFsData,
+    ) -> HashFsResult<()> {
+        unimplemented!()
+    }
+}
+
 pub struct TikvBasedHashFs {
     weak: Weak<TikvBasedHashFs>,
     txn_client_mux: Arc<TransactionClientMux>,
     f_txn: FlexibleTransaction,
     fs_config: TiFsConfig,
+    block_storage: Arc<dyn BlockStorageInterface>,
     // this is for performance optimization only.
     // in cases when parallel writes are executed on the same client,
     // these locks are used to avoid unnecessary transaction spins
@@ -77,7 +135,13 @@ pub struct TikvBasedHashFs {
 impl TikvBasedHashFs {
     pub fn new_arc(fs_config: TiFsConfig, txn_client_mux: Arc<TransactionClientMux>) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
-            let f_txn = FlexibleTransaction{
+            let f_txn1 = FlexibleTransaction{
+                fs_config: fs_config.clone(),
+                kind: super::flexible_transaction::FlexibleTransactionKind::SpawnMiniTransactions(
+                    txn_client_mux.clone(),
+                )
+            };
+            let f_txn2 = FlexibleTransaction{
                 fs_config: fs_config.clone(),
                 kind: super::flexible_transaction::FlexibleTransactionKind::SpawnMiniTransactions(
                     txn_client_mux.clone(),
@@ -86,8 +150,9 @@ impl TikvBasedHashFs {
             Self {
                 weak: weak.clone(),
                 txn_client_mux,
-                f_txn,
-                fs_config,
+                f_txn: f_txn1,
+                fs_config: fs_config.clone(),
+                block_storage: Arc::new(TikvBasedBlockStorage::new(fs_config, f_txn2)),
                 local_ino_write_size_locks: LazyLockMap::new(),
                 local_ino_locks_full_hash: LazyLockMap::new(),
                 local_ino_locks_clear_full_hash: LazyLockMap::new(),
@@ -841,20 +906,8 @@ impl HashFsInterface for TikvBasedHashFs {
     async fn hb_get_block_data_by_hashes(
         &self,
         hashes: &HashSet<&TiFsHash>,
-    ) -> HashFsResult<HashMap<TiFsHash, Arc<Vec<u8>>>> {
-        let mut keys = Vec::with_capacity(hashes.len());
-        for hash in hashes {
-            let key = self.fs_config.key_builder().hashed_block(*hash);
-            keys.push(Key::from(key));
-        }
-        let rcv_data_list = self.f_txn.batch_get(keys).await?;
-        let mut hashed_block_data = HashMap::with_capacity(rcv_data_list.len());
-        for KvPair(k, v) in rcv_data_list {
-            let hash = self.fs_config.key_parser_b(k)?.parse_key_hashed_block()?;
-            let value = Arc::new(v);
-            hashed_block_data.insert(hash.clone(), value.clone());
-        }
-        Ok(hashed_block_data)
+    ) -> HashFsResult<HashMap<TiFsHash, HashFsData>> {
+        self.block_storage.hb_get_block_data_by_hashes(hashes).await
     }
 
     async fn hb_increment_reference_count(
@@ -873,14 +926,8 @@ impl HashFsInterface for TikvBasedHashFs {
         Ok(prev_cnt)
     }
 
-    async fn hb_upload_new_block(&self, blocks: &[(&TiFsHash, Arc<Vec<u8>>)]) -> HashFsResult<()> {
-        let mutations = blocks.iter().map(|(h,d)|{
-            let key = self.fs_config.key_builder().hashed_block(h);
-            Mutation::Put(key.into(), d.deref().clone())
-        }).collect::<Vec<_>>();
-
-        self.f_txn.batch_mutate(mutations).await?;
-        Ok(())
+    async fn hb_upload_new_blocks(&self, blocks: &[(&TiFsHash, HashFsData)]) -> HashFsResult<()> {
+        self.block_storage.hb_upload_new_blocks(blocks).await
     }
 
     async fn snapshot_create(&self, name: ByteString) -> HashFsResult<GotOrMade<StorageDirItem>> {

@@ -1,6 +1,7 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, ops::Deref, sync::Arc};
+use core::option::Option;
+use std::{collections::{BTreeMap, HashMap, HashSet}, ops::Deref};
 
-use crate::fs::{fs_config::TiFsConfig, hash_fs_interface::BlockIndex, hashed_block::HashedBlock};
+use crate::fs::{fs_config::TiFsConfig, hash_fs_interface::{BlockIndex, HashFsData}, hashed_block::HashedBlock, inode::TiFsData};
 use crate::fs::inode::TiFsHash;
 
 use super::block_splitter::BlockIndexAndData;
@@ -37,20 +38,20 @@ impl<'ol> UpdateIrregularBlock<'ol> {
 
     pub fn get_and_modify_block_and_publish_hash(
         &self,
-        pre_data: &HashMap<TiFsHash, Arc<Vec<u8>>>,
-        new_blocks: &mut HashMap<TiFsHash, Arc<Vec<u8>>>,
+        pre_data: &HashMap<TiFsHash, TiFsData>,
+        new_blocks: &mut HashMap<TiFsHash, TiFsData>,
         new_block_hashes: &mut HashMap<BlockIndex, TiFsHash>,
     ) {
         if self.block_splitter_data.data.len() > 0 {
-            let original = self.original_data_hash.as_ref().and_then(|h| pre_data.get(h));
+            let original: Option<&HashFsData> = self.original_data_hash.as_ref().and_then(|h| pre_data.get(h));
             let mut modifiable = if let Some(orig) = original {
-                orig.deref().clone()
+                orig.deref().to_vec()
             } else {
                 Vec::new()
             };
             HashedBlock::update_data_range_in_vec(self.block_splitter_data_start_position, self.block_splitter_data.data, &mut modifiable);
             let new_hash = self.fs_config.calculate_hash(&modifiable);
-            let _ = new_blocks.try_insert(new_hash.clone(), Arc::new(modifiable));
+            let _ = new_blocks.try_insert(new_hash.clone(), modifiable.into());
             new_block_hashes.insert(self.block_splitter_data.block_index, new_hash);
         }
     }

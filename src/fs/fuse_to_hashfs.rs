@@ -30,7 +30,7 @@ use super::fs_config::TiFsConfig;
 use super::hash_block::block_splitter::{BlockSplitterRead, BlockSplitterWrite};
 use super::hash_block::helpers::UpdateIrregularBlock;
 use super::hash_fs_interface::{BlockIndex, GotOrMade, HashFsInterface};
-use super::inode::{InoAccessTime, InoDescription, InoSize, ParentStorageIno, StorageDirItem, InoStorageFileAttr, StorageFilePermission, TiFsHash};
+use super::inode::{InoAccessTime, InoDescription, InoSize, InoStorageFileAttr, ParentStorageIno, StorageDirItem, StorageFilePermission, TiFsData, TiFsHash};
 use super::key::SNAPSHOT_PARENT_INODE;
 use super::mode::as_file_perm;
 use super::parsers;
@@ -389,7 +389,7 @@ impl Txn {
     }
 */
     pub async fn hb_get_block_data_by_hashes_cached(self: TxnArc, hash_list: &HashSet<TiFsHash>
-    ) -> TiFsResult<HashMap<TiFsHash, Arc<Vec<u8>>>> {
+    ) -> TiFsResult<HashMap<TiFsHash, TiFsData>> {
         let mut watch = AutoStopWatch::start("get_hash_blocks_data");
 
         let mut result = HashMap::new();
@@ -440,7 +440,7 @@ impl Txn {
         ino: StorageIno,
         block_hash: TiFsHash,
         ref_count_delta: u64,
-        data: Arc<Vec<u8>>,
+        data: TiFsData,
         block_ids: Vec<BlockIndex>,
     ) -> TiFsResult<()> {
         let mut watch = AutoStopWatch::start("pm_details");
@@ -453,7 +453,7 @@ impl Txn {
 
         // Upload block if new
         if previous_reference_count == BigUint::from_u8(0).unwrap() {
-            self.hash_fs.hb_upload_new_block(&[(&block_hash, data)]).await?;
+            self.hash_fs.hb_upload_new_blocks(&[(&block_hash, data)]).await?;
 
             watch.sync("upload");
         }
@@ -526,7 +526,7 @@ impl Txn {
         for bs in &bs_list {
             for (index, chunk) in bs.mid_data.data.chunks(self.block_size as usize).enumerate() {
                 let hash = self.fs_config.calculate_hash(chunk);
-                new_blocks.insert(hash.clone(), Arc::new(chunk.to_vec()));
+                new_blocks.insert(hash.clone(), chunk.to_vec().into());
                 new_block_index_hash.insert(BlockIndex(bs.mid_data.block_index.0 + index as u64), hash);
             }
         }
@@ -571,7 +571,7 @@ impl Txn {
                 }
             }
 
-            self.hash_fs.hb_upload_new_block(&blocks_to_upload).await?;
+            self.hash_fs.hb_upload_new_blocks(&blocks_to_upload).await?;
 
             self.hash_fs
                 .inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(

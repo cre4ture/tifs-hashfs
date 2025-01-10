@@ -1,7 +1,7 @@
-use std::{collections::{BTreeMap, HashMap}, ops::Deref, sync::Arc};
+use std::{collections::{BTreeMap, HashMap}, ops::Deref};
 
 
-use super::{hash_block::block_splitter::BlockSplitterRead, hash_fs_interface::BlockIndex, inode::TiFsHash};
+use super::{hash_block::block_splitter::BlockSplitterRead, hash_fs_interface::BlockIndex, inode::{TiFsData, TiFsHash}};
 
 use crate::fs::error::Result;
 
@@ -9,7 +9,7 @@ use crate::fs::error::Result;
 pub fn hb_read_from_blocks(
     bs: &BlockSplitterRead,
     block_hashes: &BTreeMap<BlockIndex, TiFsHash>,
-    blocks_data: &HashMap<TiFsHash, Arc<Vec<u8>>>
+    blocks_data: &HashMap<TiFsHash, TiFsData>
 ) -> Result<Vec<u8>> {
     let mut result = Vec::with_capacity(bs.block_size as usize * block_hashes.len());
     for block_index in bs.first_block_index..bs.end_block_index {

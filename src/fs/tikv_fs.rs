@@ -31,7 +31,7 @@ use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
 use super::hash_fs_interface::{BlockIndex, HashFsInterface};
-use super::inode::{InoAccessTime, InoDescription, InoLockState, InoSize, InoModificationTime, ParentStorageIno, StorageDirItemKind, InoStorageFileAttr, StorageIno, TiFsHash};
+use super::inode::{InoAccessTime, InoDescription, InoLockState, InoModificationTime, InoSize, InoStorageFileAttr, ParentStorageIno, StorageDirItemKind, StorageIno, TiFsData, TiFsHash};
 use super::key::{OPENED_INODE_PARENT_INODE, ROOT_INODE, SNAPSHOT_PARENT_INODE};
 use super::reply::{
     Data, Directory, LogicalIno
@@ -41,7 +41,7 @@ use super::transaction_client_mux::TransactionClientMux;
 use super::utils::lazy_lock_map::LazyLockMap;
 use super::utils::txn_data_cache::TxnDataCache;
 
-pub type TiFsBlockCache = Cache<TiFsHash, Arc<Vec<u8>>>;
+pub type TiFsBlockCache = Cache<TiFsHash, TiFsData>;
 pub type TiFsInodeCache = Cache<StorageIno, (Instant, Arc<InoDescription>)>;
 
 lazy_static! {

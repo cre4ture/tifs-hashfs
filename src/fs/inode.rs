@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fmt::Display;
 use std::time::SystemTime;
 
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,6 +18,7 @@ pub struct InoLockState {
 }
 
 pub type TiFsHash = Vec<u8>;
+pub type TiFsData = bytes::Bytes;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct StorageIno(pub u64);
