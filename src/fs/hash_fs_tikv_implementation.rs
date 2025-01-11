@@ -11,7 +11,6 @@ use range_collections::range_set::RangeSetRange;
 use range_collections::RangeSet2;
 use strum::IntoEnumIterator;
 use tikv_client::{Key, KvPair};
-use tikv_client::transaction::Mutation;
 use super::block_storage_interface::BlockStorageInterface;
 use uuid::Uuid;
 
@@ -23,7 +22,7 @@ use crate::utils::async_parallel_pipe_stage::AsyncParallelPipeStage;
 
 use super::error::FsError;
 use super::index::deserialize_json;
-use super::mini_transaction::{DeletionCheckResult, MiniTransaction};
+use super::mini_transaction::{mutation_delete, mutation_put, DeletionCheckResult, MiniTransaction};
 use super::snapshot::CreateSnapshot;
 use super::transaction_client_mux::TransactionClientMux;
 use super::utils::lazy_lock_map::LazyLockMap;
@@ -97,7 +96,7 @@ impl BlockStorageInterface for TikvBasedBlockStorage {
     async fn hb_upload_new_blocks(&self, blocks: &[(&TiFsHash, HashFsData)]) -> HashFsResult<()> {
         let mutations = blocks.iter().map(|(h,d)|{
             let key = self.fs_config.key_builder().hashed_block(h);
-            Mutation::Put(key.into(), d.to_vec())
+            mutation_put(key, d.to_vec())
         }).collect::<Vec<_>>();
 
         self.f_txn.batch_mutate(mutations).await?;
@@ -112,6 +111,17 @@ impl BlockStorageInterface for TikvBasedBlockStorage {
         _new_block_data: HashFsData,
     ) -> HashFsResult<()> {
         unimplemented!()
+    }
+
+    async fn hb_delete_blocks(
+        &self,
+        hashes: &HashSet<&TiFsHash>,
+    ) -> HashFsResult<()> {
+        let mutations = hashes.iter().map(|h|{
+            mutation_delete(Key::from(self.fs_config.key_builder().hashed_block(h)))
+        }).collect::<Vec<_>>();
+        self.f_txn.batch_mutate(mutations).await?;
+        Ok(())
     }
 }
 
@@ -133,7 +143,11 @@ pub struct TikvBasedHashFs {
 }
 
 impl TikvBasedHashFs {
-    pub fn new_arc(fs_config: TiFsConfig, txn_client_mux: Arc<TransactionClientMux>) -> Arc<Self> {
+    pub fn new_arc(
+        fs_config: TiFsConfig,
+        txn_client_mux: Arc<TransactionClientMux>,
+        block_storage: Option<Arc<dyn BlockStorageInterface>>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let f_txn1 = FlexibleTransaction{
                 fs_config: fs_config.clone(),
@@ -147,12 +161,15 @@ impl TikvBasedHashFs {
                     txn_client_mux.clone(),
                 )
             };
+            let bs_impl = block_storage.unwrap_or_else(||{
+                Arc::new(TikvBasedBlockStorage::new(fs_config.clone(), f_txn2))
+            });
             Self {
                 weak: weak.clone(),
                 txn_client_mux,
                 f_txn: f_txn1,
-                fs_config: fs_config.clone(),
-                block_storage: Arc::new(TikvBasedBlockStorage::new(fs_config, f_txn2)),
+                fs_config: fs_config,
+                block_storage: bs_impl,
                 local_ino_write_size_locks: LazyLockMap::new(),
                 local_ino_locks_full_hash: LazyLockMap::new(),
                 local_ino_locks_clear_full_hash: LazyLockMap::new(),
@@ -163,7 +180,10 @@ impl TikvBasedHashFs {
 
     pub async fn spinning_mini_txn(&self) -> TiFsResult<MiniTransaction> {
         MiniTransaction::new(
-            self.txn_client_mux.clone(), self.fs_config.clone()).await
+            self.txn_client_mux.clone(),
+            self.fs_config.clone(),
+            self.block_storage.clone(),
+        ).await
     }
 
     async fn directory_remove_child_generic(
@@ -219,8 +239,7 @@ impl TikvBasedHashFs {
     }
 
     pub async fn hb_clear_data_single_block(&self, addr: BlockAddress, do_size_update: bool) -> TiFsResult<()> {
-        let mut spin = MiniTransaction::new(
-            self.txn_client_mux.clone(), self.fs_config.clone()).await?;
+        let mut spin = self.spinning_mini_txn().await?;
         let prev_hash = loop {
             let mut started = spin.start().await?;
             let r1 = started
@@ -231,8 +250,7 @@ impl TikvBasedHashFs {
         };
 
         if do_size_update {
-            let mut spin = MiniTransaction::new(
-                self.txn_client_mux.clone(), self.fs_config.clone()).await?;
+            let mut spin = self.spinning_mini_txn().await?;
             loop {
                 let lock = self.local_ino_write_size_locks.lock_write(&addr.ino).await;
                 let mut started = spin.start().await?;
@@ -249,8 +267,7 @@ impl TikvBasedHashFs {
             return Ok(());
         };
 
-        let mut spin = MiniTransaction::new(
-            self.txn_client_mux.clone(), self.fs_config.clone()).await?;
+        let mut spin = self.spinning_mini_txn().await?;
         loop {
             let mut started = spin.start().await?;
             let r1 = started.hb_decrement_blocks_reference_count_and_delete_if_zero_reached(
@@ -388,7 +405,10 @@ impl TikvBasedHashFs {
         let snapshot = txn_snapshot.start_snapshot_read_only().await?;
 
         let mut tool = CreateSnapshot::new(
-            snapshot, self.txn_client_mux.clone());
+            snapshot,
+            self.txn_client_mux.clone(),
+            self.block_storage.clone(),
+        );
 
         let got_or_made = tool.create_snapshot(name).await?;
 

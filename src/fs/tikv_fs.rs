@@ -214,8 +214,7 @@ impl TiFs {
             Default::default()
         };
 
-        let mut client_cfg = client_cfg.with_default_keyspace();
-        client_cfg.timeout = Duration::from_secs(1);
+        let client_cfg = client_cfg.with_timeout(Duration::from_secs(1));
         debug!("use tikv client config: {:?}", client_cfg);
         Ok(client_cfg)
     }
@@ -239,6 +238,7 @@ impl TiFs {
         Ok(TikvBasedHashFs::new_arc(
             fs_config.clone(),
             client,
+            None,
         ))
     }
 
@@ -302,6 +302,7 @@ impl TiFs {
                 hash_fs: TikvBasedHashFs::new_arc(
                     fs_config.clone(),
                     client,
+                    None,
                 ),
                 client_config: cfg,
                 direct_io: fs_config.direct_io,

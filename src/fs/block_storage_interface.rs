@@ -21,6 +21,10 @@ pub trait BlockStorageInterface: Send + Sync  {
         new_block_data_offset: u64,
         new_block_data: HashFsData,
     ) -> HashFsResult<()>;
+    async fn hb_delete_blocks(
+        &self,
+        hashes: &HashSet<&TiFsHash>,
+    ) -> HashFsResult<()>;
 }
 
 impl Debug for dyn BlockStorageInterface {

@@ -4,7 +4,7 @@ use bytestring::ByteString;
 use counter::Counter;
 use num_bigint::BigUint;
 
-use super::{error::TiFsResult, flexible_transaction::FlexibleTransaction, fs_config::TiFsConfig, inode::InoDescription};
+use super::{error::TiFsResult, flexible_transaction::FlexibleTransaction, fs_config::TiFsConfig, inode::InoDescription, mini_transaction::mutation_put};
 use super::hash_fs_interface::{BlockIndex, GotOrMade};
 use super::transaction_client_mux::TransactionClientMux;
 use super::kv_parser::KvPairParser;
@@ -17,6 +17,7 @@ pub struct CreateSnapshot {
     src_txn: super::mini_transaction::TransactionWithFsConfig,
     txn_client_mux: Arc<TransactionClientMux>,
     single_action: FlexibleTransaction,
+    block_storage: Arc<dyn super::block_storage_interface::BlockStorageInterface>,
 }
 
 impl CreateSnapshot {
@@ -24,6 +25,7 @@ impl CreateSnapshot {
     pub fn new(
         src_txn: super::mini_transaction::TransactionWithFsConfig,
         txn_client_mux: Arc<TransactionClientMux>,
+        block_storage: Arc<dyn super::block_storage_interface::BlockStorageInterface>,
     ) -> Self {
         let single_action = FlexibleTransaction{
             fs_config: src_txn.fs_config().clone(),
@@ -35,6 +37,7 @@ impl CreateSnapshot {
             src_txn,
             txn_client_mux,
             single_action,
+            block_storage,
         }
     }
 
@@ -42,7 +45,10 @@ impl CreateSnapshot {
         &self
     ) -> TiFsResult<super::mini_transaction::MiniTransaction> {
         super::mini_transaction::MiniTransaction::new(
-            self.txn_client_mux.clone(), self.fs_config().clone()).await
+            self.txn_client_mux.clone(),
+            self.fs_config().clone(),
+            self.block_storage.clone(),
+        ).await
     }
 
     pub async fn create_snapshot(&mut self, name: ByteString) -> TiFsResult<GotOrMade<StorageDirItem>> {
@@ -194,7 +200,7 @@ impl CreateSnapshot {
             let key = self.fs_config().key_builder().block_hash(BlockAddress{
                 ino: dst, index: idx
             });
-            tikv_client::transaction::Mutation::Put(tikv_client::Key::from(key), hash)
+            mutation_put(tikv_client::Key::from(key), hash)
         });
 
         self.single_action.batch_mutate(mutations).await?;

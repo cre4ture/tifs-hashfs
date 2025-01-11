@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tikv_client::{Backoff, BoundRange, Key, KvPair, Result, RetryOptions, Timestamp, Transaction, TransactionOptions, Value};
-use tikv_client::transaction::Mutation;
+use tikv_client::proto::kvrpcpb;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
@@ -13,6 +13,7 @@ use super::error::FsError;
 use super::fs_config::TiFsConfig;
 use super::index::{deserialize_json, serialize_json};
 use super::key::{KeyGenerator, ScopedKeyBuilder};
+use super::mini_transaction::mutation_put;
 use super::utils::txn_data_cache::{TxnDelete, TxnFetch, TxnPut};
 use super::{error::TiFsResult, fuse_to_hashfs::{DEFAULT_REGION_BACKOFF, OPTIMISTIC_BACKOFF}, transaction_client_mux::TransactionClientMux};
 
@@ -276,11 +277,11 @@ impl FlexibleTransaction {
     pub async fn batch_put(&self, pairs: Vec<KvPair>) -> TiFsResult<()> {
         match &self.kind {
             FlexibleTransactionKind::UseExistingTxn(txn) => {
-                let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
+                let mutations = pairs.into_iter().map(|KvPair(k,v)| mutation_put(k, v));
                 Ok(txn.write().await.batch_mutate(mutations).await?)
             },
             FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
-                let mutations = pairs.into_iter().map(|KvPair(k,v)| Mutation::Put(k, v));
+                let mutations = pairs.into_iter().map(|KvPair(k,v)| mutation_put(k, v));
                 let mut spin = SpinningTxn::default();
                 loop {
                     let mut mini = txn_mux.clone().single_action_txn_raw().await?;
@@ -316,13 +317,13 @@ impl FlexibleTransaction {
         }
     }
 
-    pub async fn batch_mutate(&self, mutations: impl IntoIterator<Item = Mutation>) -> TiFsResult<()> {
+    pub async fn batch_mutate(&self, mutations: impl IntoIterator<Item = kvrpcpb::Mutation>) -> TiFsResult<()> {
         match &self.kind {
             FlexibleTransactionKind::UseExistingTxn(txn) => {
                 Ok(txn.write().await.batch_mutate(mutations).await?)
             },
             FlexibleTransactionKind::SpawnMiniTransactions(txn_mux) => {
-                let mutations: Vec<Mutation> = mutations.into_iter().collect();
+                let mutations: Vec<kvrpcpb::Mutation> = mutations.into_iter().collect();
                 let mut spin = SpinningTxn::default();
                 loop {
                     let mut mini = txn_mux.clone().single_action_txn_raw().await?;
@@ -335,11 +336,10 @@ impl FlexibleTransaction {
                 let mut deletes = Vec::new();
                 let mut put_pairs = Vec::new();
                 for entry in mutations.into_iter() {
-                    match entry {
-                        Mutation::Delete(key) => deletes.push(key),
-                        Mutation::Put(key, value) => {
-                            put_pairs.push(KvPair(key, value));
-                        }
+                    match entry.op {
+                        o if o == kvrpcpb::Op::Del as i32 => deletes.push(entry.key),
+                        o if o == kvrpcpb::Op::Put as i32 => put_pairs.push(KvPair(entry.key.into(), entry.value)),
+                        _ => return Err(FsError::UnknownError(format!("unsupported mutation type: {}", entry.op))),
                     }
                 };
                 if put_pairs.len() > 0 {

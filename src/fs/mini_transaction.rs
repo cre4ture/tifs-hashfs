@@ -4,7 +4,8 @@ use bytestring::ByteString;
 use num_bigint::BigUint;
 use num_traits::{FromPrimitive, Zero};
 use serde::{Deserialize, Serialize};
-use tikv_client::{transaction::Mutation, Key, KvPair, Transaction};
+use tikv_client::{Key, KvPair, Transaction};
+use tikv_client::proto::kvrpcpb::{Mutation, Op};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -22,6 +23,30 @@ use super::meta::MetaStatic;
 use super::key::{KeyGenerator, ScopedKeyBuilder};
 use super::inode::{InoDescription, InoSize, StorageDirItem, StorageDirItemKind, InoStorageFileAttr, StorageFilePermission, StorageIno};
 
+pub fn mutation_put<K, V>(key: K, value: V) -> Mutation
+where
+    K: Into<Vec<u8>>,
+    V: Into<Vec<u8>>,
+{
+    Mutation {
+        op: Op::Put.into(),
+        key: key.into(),
+        value: value.into(),
+        ..Mutation::default()
+    }
+}
+
+pub fn mutation_delete<K>(key: K) -> Mutation
+where
+    K: Into<Vec<u8>>,
+{
+    Mutation {
+        op: Op::Del.into(),
+        key: key.into(),
+        ..Mutation::default()
+    }
+}
+
 #[derive(PartialEq, Eq, Debug)]
 pub enum DeletionCheckResult {
     StillUsed,
@@ -32,6 +57,7 @@ pub struct MiniTransaction {
     pub txn_client_mux: Arc<super::transaction_client_mux::TransactionClientMux>,
     fs_config: TiFsConfig,
     spin: SpinningTxn,
+    pub block_storage: Arc<dyn super::block_storage_interface::BlockStorageInterface>,
 }
 
 pub struct StartedMiniTransaction<'mmt_l> {
@@ -42,17 +68,20 @@ pub struct StartedMiniTransaction<'mmt_l> {
 pub struct TransactionWithFsConfig {
     pub fs_config: TiFsConfig,
     pub mini: Transaction,
+    pub block_storage: Arc<dyn super::block_storage_interface::BlockStorageInterface>,
 }
 
 impl MiniTransaction {
     pub async fn new(
         txn_client_mux: Arc<super::transaction_client_mux::TransactionClientMux>,
         fs_config: TiFsConfig,
+        block_storage: Arc<dyn super::block_storage_interface::BlockStorageInterface>,
     ) -> TiFsResult<Self> {
         Ok(Self{
             txn_client_mux,
             fs_config,
             spin: SpinningTxn::default(),
+            block_storage,
         })
     }
 
@@ -84,6 +113,7 @@ impl MiniTransaction {
         let txn = TransactionWithFsConfig{
             fs_config: self.fs_config().clone(),
             mini: mini_res,
+            block_storage: self.block_storage.clone(),
         };
 
         Ok(StartedMiniTransaction::<'mol>{
@@ -113,6 +143,7 @@ impl MiniTransaction {
         Ok(TransactionWithFsConfig{
             fs_config: self.fs_config().clone(),
             mini: mini_res,
+            block_storage: self.block_storage.clone(),
         })
     }
 }
@@ -349,8 +380,8 @@ impl TransactionWithFsConfig {
         let key_child_to_parent = Key::from(self.fs_config().key_builder().generate_key(
             &(child_ino, parent, name.as_bytes().deref())));
         let mut mutations = Vec::with_capacity(2);
-        mutations.push(Mutation::Delete(key_parent_to_child));
-        mutations.push(Mutation::Delete(key_child_to_parent));
+        mutations.push(mutation_delete(key_parent_to_child));
+        mutations.push(mutation_delete(key_child_to_parent));
         Ok(self.mini.batch_mutate(mutations).await?)
     }
 
@@ -537,7 +568,7 @@ impl TransactionWithFsConfig {
                 h,
                 Some(super::key::HashedBlockMeta::CCountedNamedUsages),
                 None).into();
-            Mutation::Put(key, new_cnt.to_bytes_be())
+                mutation_put(key, new_cnt.to_bytes_be())
         }).collect::<Vec<_>>();
 
         self.mini.batch_mutate(new_counter_values).await?;
@@ -556,9 +587,18 @@ impl TransactionWithFsConfig {
         let keys = addresses.iter().map(|(addr, new_hash)|{
             let key = Key::from(self.fs_config().key_builder().block_hash(*addr));
             if let Some(hash) = new_hash {
-                mutations.push(Mutation::Put(key.clone(), hash.to_vec()));
+                mutations.push(Mutation {
+                    op: Op::Put.into(),
+                    key: key.clone().into(),
+                    value: hash.to_vec(),
+                    ..Mutation::default()
+                });
             } else {
-                mutations.push(Mutation::Delete(key.clone()));
+                mutations.push(Mutation{
+                    op: Op::Del.into(),
+                    key: key.clone().into(),
+                    ..Mutation::default()
+                });
             }
             key
         }).collect::<Vec<_>>();
@@ -624,7 +664,8 @@ impl TransactionWithFsConfig {
                 Some((hash, cnt))
             }).collect::<HashMap<_,_>>();
 
-        let mut mutations = Vec::new();
+        let mut mutations_kv = Vec::new();
+        let mut deletes_block_hashes = HashSet::new();
         for (h, dec) in decrements {
             let mut actual_dec = BigUint::from_u64(*dec).unwrap();
             let prev_counter_value = prev_counter_values.get(*h).cloned().unwrap_or(BigUint::ZERO);
@@ -638,16 +679,24 @@ impl TransactionWithFsConfig {
                 h, Some(HashedBlockMeta::CCountedNamedUsages), None));
 
             if new_counter_value == BigUint::from_u8(0).unwrap() {
-                let block_key = self.fs_config().key_builder().hashed_block(h);
-                mutations.push(Mutation::Delete(Key::from(key)));
-                mutations.push(Mutation::Delete(Key::from(block_key)));
+                mutations_kv.push(mutation_delete(key));
+                deletes_block_hashes.insert(*h);
                 tracing::warn!("deleting block with hash: {h:?}");
             } else {
-                mutations.push(Mutation::Put(key.clone(), new_counter_value.to_bytes_be()));
+                mutations_kv.push(Mutation {
+                    op: Op::Put.into(),
+                    key: key.into(),
+                    value: new_counter_value.to_bytes_be(),
+                    ..Mutation::default()
+                });
             }
         }
-        self.mini.batch_mutate(mutations).await?;
+        let fut1 = self.mini.batch_mutate(mutations_kv);
+        let fut2 = self.block_storage.hb_delete_blocks(&deletes_block_hashes);
 
+        let (r1, r2) = futures::join!(fut1, fut2);
+        r1?;
+        r2?;
         Ok(())
     }
 

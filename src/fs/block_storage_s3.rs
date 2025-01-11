@@ -97,4 +97,20 @@ impl BlockStorageInterface for S3BasedBlockStorage {
     ) -> HashFsResult<()> {
         unimplemented!()
     }
+    async fn hb_delete_blocks(
+        &self,
+        hashes: &HashSet<&TiFsHash>,
+    ) -> HashFsResult<()> {
+        for b_hash in hashes.iter() {
+            let hex_hash = hex::encode(b_hash);
+            self.client
+                .delete_object()
+                .bucket(self.bucket_name.clone())
+                .key(hex_hash)
+                .send()
+                .await
+                .map_err(from_s3_error)?;
+        }
+        Ok(())
+    }
 }
