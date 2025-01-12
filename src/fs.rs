@@ -31,3 +31,4 @@ pub mod snapshot;
 pub mod kv_parser;
 pub mod block_storage_interface;
 pub mod block_storage_s3;
+pub mod block_storage_tikv;

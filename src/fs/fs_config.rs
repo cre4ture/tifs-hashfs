@@ -280,6 +280,9 @@ define_options! { MountOption (FuseMountOption) {
     define InlineDataLimit(String),
     define SmallTxns,
     define WriteAccumulatorFlushThreshold(String),
+    define S3Region(String),
+    define S3Endpoint(String),
+    define S3Bucket(String),
 }}
 
 #[derive(Clone)]
@@ -309,6 +312,10 @@ pub struct TiFsConfig {
     pub read_ahead_in_progress_limit: usize,
     pub small_transactions: bool,
     pub chunked_block_upload: bool,
+    pub s3_region: String,
+    pub s3_endpoint: String,
+    pub s3_bucket: String,
+    pub s3_path_prefix: String,
 }
 
 impl TiFsConfig {
@@ -317,161 +324,174 @@ impl TiFsConfig {
     pub fn from_options(options: &Vec<MountOption>) -> TiFsResult<Self> {
 
         // first declare params and set default value
-        let mut name = String::from("");
-        let mut max_size = None;
-        let mut block_size = Self::DEFAULT_BLOCK_SIZE;
-        let mut hash_algo = HashAlgorithm::Blake3;
         const INLINE_DATA_THRESHOLD_BASE: u64 = 1 << 4;
-        let mut inline_data_limit = block_size / INLINE_DATA_THRESHOLD_BASE;
-        let mut small_transactions = false;
-        let mut parallel_jobs = 0;
-        let mut parallel_jobs_delete = 0;
-        let chunked_block_upload = true;
-        let mut write_accumulator_flush_threshold = 2 << 20;
+        let mut config = TiFsConfig{
+            key_prefix: Vec::new(),
+            block_size: Self::DEFAULT_BLOCK_SIZE,
+            inline_data_limit: Self::DEFAULT_BLOCK_SIZE / INLINE_DATA_THRESHOLD_BASE,
+            enable_atime: true,
+            enable_mtime: true,
+            direct_io: false,
+            inode_cache_size: 10 << 20,
+            hashed_blocks: false,
+            hash_algorithm: HashAlgorithm::Blake3,
+            hash_len: 32,
+            hashed_blocks_cache_size: 200 << 20,
+            max_size: None,
+            validate_writes: false,
+            validate_read_hashes: false,
+            pure_raw: false,
+            existence_check: true,
+            parallel_jobs: 0,
+            parallel_jobs_delete: 0,
+            max_chunk_size: usize::MAX,
+            write_in_progress_limit: 0,
+            write_accumulator_flush_threshold: 2 << 20,
+            read_ahead_size: 0,
+            read_ahead_in_progress_limit: 10,
+            small_transactions: false,
+            chunked_block_upload: true,
+            s3_region: String::default(),
+            s3_endpoint: String::default(),
+            s3_bucket: String::default(),
+            s3_path_prefix: String::default(),
+        };
 
         // iterate over options and overwrite defaults
         for option in options {
             match option {
-                MountOption::Name(n) => name = n.clone(),
+                MountOption::Name(n) => {
+                    config.key_prefix = n.clone().into_bytes();
+                    config.s3_path_prefix = n.clone() + "/";
+                },
                 MountOption::BlkSize(size) => {
-                    block_size = parse_size(size)
+                    config.block_size = parse_size(size)
                         .map_err(|err| {
                             FsError::ConfigParsingFailed {
                                 msg: format!("failed to parse blksize({}): {}", size, err) }
                         })?;
-                    tracing::warn!("blksize: {}", block_size);
+                    tracing::warn!("blksize: {}", config.block_size);
                 }
                 MountOption::MaxSize(size) => {
-                    max_size = Some(parse_size(size)
+                    config.max_size = Some(parse_size(size)
                         .map_err(|err| {
                             FsError::ConfigParsingFailed {
                                 msg: format!("failed to parse maxsize({}): {}", size, err) }
                         })?);
                 }
                 MountOption::HashAlgorithm(value) => {
-                    hash_algo = *ALGO_NAME_MAP.get_by_left(value.as_str()).ok_or(
+                    config.hash_algorithm = *ALGO_NAME_MAP.get_by_left(value.as_str()).ok_or(
                         FsError::ConfigParsingFailed {
                             msg: format!("hash algo name unsupported: {}", value)
                         }
                     )?;
+                    config.hash_len = *ALGO_HASH_LEN_MAP.get(&config.hash_algorithm).unwrap();
                 }
                 MountOption::InlineDataLimit(value) => {
-                    inline_data_limit = parse_size(value)
+                    config.inline_data_limit = parse_size(value)
                         .map_err(|err| {
                             FsError::ConfigParsingFailed {
                                 msg: format!("failed to parse InlineDataLimit({}): {}", value, err) }
                         })?;
                 }
-                MountOption::SmallTxns => small_transactions = true,
+                MountOption::SmallTxns => config.small_transactions = true,
                 MountOption::ParallelJobs(value) => {
-                    parallel_jobs = value.parse::<usize>()
+                    config.parallel_jobs = value.parse::<usize>()
                         .map_err(|err|{
                             FsError::ConfigParsingFailed {
                                 msg: format!("fail to parse ParallelJobs({}): {}", value, err) }
                         })?;
                 }
                 MountOption::ParallelJobsDelete(value) => {
-                    parallel_jobs_delete = value.parse::<usize>()
+                    config.parallel_jobs_delete = value.parse::<usize>()
                         .map_err(|err|{
                             FsError::ConfigParsingFailed {
                                 msg: format!("fail to parse ParallelJobsDelete({}): {}", value, err) }
                         })?;
                 }
                 MountOption::WriteAccumulatorFlushThreshold(value) => {
-                    write_accumulator_flush_threshold = value.parse::<u64>()
+                    config.write_accumulator_flush_threshold = value.parse::<u64>()
                         .map_err(|err|{
                             FsError::ConfigParsingFailed {
                                 msg: format!("fail to parse WriteAccumulatorFlushThreshold({}): {}", value, err) }
                         })?;
                 }
+                MountOption::S3Region(value) => config.s3_region = value.clone(),
+                MountOption::S3Endpoint(value) => config.s3_endpoint = value.clone(),
+                MountOption::S3Bucket(value) => config.s3_bucket = value.clone(),
                 _ => {}
             }
         }
 
-        // calculate derived parameters
-        let hash_len = *ALGO_HASH_LEN_MAP.get(&hash_algo).unwrap();
-
-        let cfg = TiFsConfig {
-            key_prefix: name.into_bytes(),
-            block_size,
-            inline_data_limit,
-            direct_io: options.iter().any(|option| matches!(option, MountOption::DirectIO)),
-            max_size,
-            enable_atime: options.iter().find_map(|option| match option {
+        config.direct_io = options.iter().any(|option| matches!(option, MountOption::DirectIO));
+        config.enable_atime = options.iter().find_map(|option| match option {
                 MountOption::NoAtime => Some(false),
                 MountOption::Atime => Some(true),
                 _ => None,
-            }).unwrap_or(true),
-            enable_mtime: options.iter().find_map(|option| match option {
+            }).unwrap_or(true);
+        config.enable_mtime = options.iter().find_map(|option| match option {
                 MountOption::NoMtime => Some(false),
                 _ => None,
-            }).unwrap_or(true),
-            inode_cache_size: options.iter().find_map(|opt|{
+            }).unwrap_or(true);
+        config.inode_cache_size = options.iter().find_map(|opt|{
                 if let MountOption::InodeCacheSize(value) = &opt {
                     parse_size(value).map_err(|err|{
                         error!("fail to parse InodeCacheSize({}): {}", value, err);
                     }).ok()
                 } else { None }
-            }).unwrap_or(10 << 20),
-            hashed_blocks: options.iter().find_map(|opt|{
+            }).unwrap_or(10 << 20);
+        config.hashed_blocks = options.iter().find_map(|opt|{
                 (MountOption::HashedBlocks == *opt).then_some(true)
-            }).unwrap_or(false),
-            hash_algorithm: hash_algo,
-            hash_len: hash_len,
-            hashed_blocks_cache_size: options.iter().find_map(|opt|{
+            }).unwrap_or(false);
+        config.hashed_blocks_cache_size = options.iter().find_map(|opt|{
                 if let MountOption::HashedBlocksCacheSize(value) = &opt {
                     parse_size(value).map_err(|err|{
                         error!("fail to parse HashedBlocksCacheSize({}): {}", value, err);
                     }).ok()
                 } else { None }
-            }).unwrap_or(200 << 20),
-            validate_writes: options.iter().find_map(|opt|{
+            }).unwrap_or(200 << 20);
+        config.validate_writes = options.iter().find_map(|opt|{
                 (MountOption::ValidateWrites == *opt).then_some(true)
-            }).unwrap_or(false),
-            validate_read_hashes: options.iter().find_map(|opt|{
+            }).unwrap_or(false);
+        config.validate_read_hashes = options.iter().find_map(|opt|{
                 (MountOption::ValidateReadHashes == *opt).then_some(true)
-            }).unwrap_or(false),
-            pure_raw: options.iter().find_map(|opt|{
+            }).unwrap_or(false);
+        config.pure_raw = options.iter().find_map(|opt|{
                 (MountOption::PureRaw == *opt).then_some(true)
-            }).unwrap_or(false),
-            existence_check: options.iter().find_map(|opt|{
+            }).unwrap_or(false);
+        config.existence_check = options.iter().find_map(|opt|{
                 (MountOption::NoExistenceCheck == *opt).then_some(false)
-            }).unwrap_or(true),
-            parallel_jobs,
-            parallel_jobs_delete,
-            max_chunk_size: options.iter().find_map(|opt|{
+            }).unwrap_or(true);
+        config.max_chunk_size = options.iter().find_map(|opt|{
                 if let MountOption::MaxChunkSize(value) = &opt {
                     value.parse::<usize>().map_err(|err|{
                         error!("fail to parse MaxChunkSize({}): {}", value, err);
                     }).ok()
                 } else { None }
-            }).unwrap_or(usize::MAX),
-            write_in_progress_limit: options.iter().find_map(|opt|{
+            }).unwrap_or(usize::MAX);
+        config.write_in_progress_limit = options.iter().find_map(|opt|{
                 if let MountOption::WriteInProgressLimit(value) = &opt {
                     value.parse::<usize>().map_err(|err|{
                         error!("fail to parse WriteInProgressLimit({}): {}", value, err);
                     }).ok()
                 } else { None }
-            }).unwrap_or(0),
-            read_ahead_size: options.iter().find_map(|opt|{
+            }).unwrap_or(0);
+        config.read_ahead_size = options.iter().find_map(|opt|{
                 if let MountOption::ReadAheadSize(value) = &opt {
                     parse_size(value).map_err(|err|{
                         error!("fail to parse WriteInProgressLimit({}): {}", value, err);
                     }).ok()
                 } else { None }
-            }).unwrap_or(0),
-            read_ahead_in_progress_limit: options.iter().find_map(|opt|{
+            }).unwrap_or(0);
+        config.read_ahead_in_progress_limit = options.iter().find_map(|opt|{
                 if let MountOption::ReadAheadInProgressLimit(value) = &opt {
                     value.parse::<usize>().map_err(|err|{
                         error!("fail to parse ReadAheadInProgressLimit({}): {}", value, err);
                     }).ok()
                 } else { None }
-            }).unwrap_or(10),
-            small_transactions,
-            chunked_block_upload,
-            write_accumulator_flush_threshold,
-        };
-        Ok(cfg)
+            }).unwrap_or(10);
+
+        Ok(config)
     }
 
     pub fn calculate_hash(&self, input: &[u8]) -> TiFsHash {

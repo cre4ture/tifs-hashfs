@@ -571,7 +571,9 @@ impl Txn {
                 }
             }
 
-            self.hash_fs.hb_upload_new_blocks(&blocks_to_upload).await?;
+            if blocks_to_upload.len() > 0 {
+                self.hash_fs.hb_upload_new_blocks(&blocks_to_upload).await?;
+            }
 
             self.hash_fs
                 .inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(

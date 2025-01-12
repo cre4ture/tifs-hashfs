@@ -9,6 +9,9 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::anyhow;
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::Region;
+use aws_sdk_s3::Client;
 use bimap::BiHashMap;
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -27,6 +30,8 @@ use lazy_static::lazy_static;
 use crate::fs::hash_fs_tikv_implementation::TikvBasedHashFs;
 use crate::fs::inode::DirectoryItem;
 use crate::fs::reply::{DirItem, InoKind};
+use crate::fs::block_storage_s3::S3BasedBlockStorage;
+use crate::fs::block_storage_interface::BlockStorageInterface;
 use super::error::{FsError, Result, TiFsResult};
 use super::file_handler::FileHandler;
 use super::fs_config::{MountOption, TiFsConfig};
@@ -295,6 +300,23 @@ impl TiFs {
             err
         })?;
 
+        let mut block_storage = None;
+        if fs_config.s3_bucket != "" {
+            let shared_config = if fs_config.s3_endpoint != "" {
+                aws_config::from_env().endpoint_url(fs_config.s3_endpoint.clone()).load().await
+            } else {
+                let region_provider = RegionProviderChain::first_try(Region::new(fs_config.s3_region.clone()));
+                aws_config::from_env().region(region_provider).load().await
+            };
+            let client = Client::new(&shared_config);
+            let block_storage_impl = Arc::new(S3BasedBlockStorage::new(
+                client,
+                fs_config.s3_bucket.clone(),
+                fs_config.s3_path_prefix.clone()),
+            );
+            block_storage = Some(block_storage_impl as Arc<dyn BlockStorageInterface>);
+        }
+
         let fs = Arc::new_cyclic(|me| {
             TiFs {
                 weak: me.clone(),
@@ -302,7 +324,7 @@ impl TiFs {
                 hash_fs: TikvBasedHashFs::new_arc(
                     fs_config.clone(),
                     client,
-                    None,
+                    block_storage,
                 ),
                 client_config: cfg,
                 direct_io: fs_config.direct_io,

@@ -10,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
 
     let matches = App::new("mount.tifs")
         .version(crate_version!())
-        .author("Hexi Lee")
+        .author("Hexi Lee, Ulrich Hornung")
         .arg(
             Arg::with_name("device")
                 .value_name("ENDPOINTS")
