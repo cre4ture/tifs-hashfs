@@ -1,16 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
-use std::ops::{Deref, Range};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::TimeOrNow;
 use num_bigint::BigUint;
 
 use crate::grpc::hash_fs::{self as grpc_fs, InitRq, MetaStaticReadRq};
 use crate::utils::object_pool::{HandedOutPoolElement, Pool};
-use tifs::fs::hash_fs_interface::{BlockIndex, GotOrMade, HashFsError, HashFsInterface, HashFsResult};
+use tifs::fs::hash_fs_interface::{BlockIndex, GotOrMade, HashFsData, HashFsError, HashFsInterface, HashFsResult};
 use tifs::fs::inode::{DirectoryItem, InoAccessTime, InoDescription, InoSize, InoStorageFileAttr, ParentStorageIno, StorageDirItem, StorageDirItemKind, StorageFilePermission, StorageIno, TiFsHash};
 use tifs::fs::meta::MetaStatic;
 use tokio::time::sleep;
@@ -407,7 +408,7 @@ impl HashFsInterface for HashFsClient {
     async fn hb_get_block_data_by_hashes(
         &self,
         hashes: &HashSet<&TiFsHash>,
-    ) -> HashFsResult<HashMap<TiFsHash, Arc<Vec<u8>>>> {
+    ) -> HashFsResult<HashMap<TiFsHash, HashFsData>> {
         let mut rq = grpc_fs::HbGetBlockDataByHashesRq::default();
         rq.hashes = hashes.iter().map(|h|{
             grpc_fs::Hash{ data: h.to_vec() }
@@ -415,9 +416,9 @@ impl HashFsInterface for HashFsClient {
         let rs = self.lock_grpc().await?
             .hb_get_block_data_by_hashes(rq).await?.into_inner();
         handle_error(&rs.error)?;
-        Ok(rs.block_data.into_iter().filter_map(|mut d|{
-            if let Some(hash) = mem::take(&mut d.hash) {
-                Some((hash.data, Arc::new(d.data)))
+        Ok(rs.block_data.into_iter().filter_map(|grpc_fs::HashBlockData{hash, data}|{
+            if let Some(hash) = hash {
+                Some((hash.data, Bytes::from(data)))
             } else {
                 None
             }
@@ -474,9 +475,9 @@ impl HashFsInterface for HashFsClient {
         Ok(previous_cnt)
     }
 
-    async fn hb_upload_new_block(
+    async fn hb_upload_new_blocks(
         &self,
-        blocks: &[(&TiFsHash, Arc<Vec<u8>>)],
+        blocks: &[(&TiFsHash, HashFsData)],
     ) -> HashFsResult<()> {
         if blocks.len() == 0 {
             return Ok(());
@@ -486,7 +487,7 @@ impl HashFsInterface for HashFsClient {
         rq.blocks = blocks.iter().map(|(h, data)|{
             grpc_fs::HashBlockData {
                 hash: Some(grpc_fs::Hash{data: (*h).clone()}),
-                data: data.deref().clone()
+                data: data.to_vec(),
             }
         }).collect();
         let rs = self.lock_grpc().await?

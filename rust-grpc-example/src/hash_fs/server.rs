@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::grpc_time_to_system_time;
+use bytes::Bytes;
 use tifs::fs::fs_config::{self};
 use tifs::fs::hash_fs_interface::{BlockIndex, HashFsInterface};
 use tonic::{Request, Response, Status};
@@ -501,7 +502,7 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
                 rsp.block_data = data.into_iter().map(|(k,v)|{
                     grpc_fs::HashBlockData{
                         hash: Some(grpc_fs::Hash{data: k}),
-                        data: v.deref().clone(),
+                        data: v.to_vec(),
                     }
                 }).collect::<Vec<_>>();
             }
@@ -597,10 +598,10 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         };
         let blocks = rq.blocks.iter_mut().filter_map(|d|{
             let hash = &d.hash.as_ref()?.data;
-            Some((hash, Arc::new(mem::take(&mut d.data))))
+            Some((hash, Bytes::from(mem::take(&mut d.data))))
         }).collect::<Vec<_>>();
         let r = self.fs_impl
-            .hb_upload_new_block(&blocks).await;
+            .hb_upload_new_blocks(&blocks).await;
         let mut rsp = grpc_fs::HbUploadNewBlockRs::default();
         match r {
             Err(err) => rsp.error = Some(err.into()),

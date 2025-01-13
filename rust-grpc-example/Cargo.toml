@@ -8,10 +8,10 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0"
-tonic = "0.11"
-prost = "0.12.6"
-prost-types = "0.12.6"
-tokio = { version = "1.18", features = ["macros", "rt-multi-thread"] }
+tonic = {workspace = true}
+prost = "0.13"
+prost-types = "0.13"
+tokio = {workspace = true}
 tifs = { path = ".." }
 clap = { version = "4.4", features = ["wrap_help", "cargo"] }
 clap_complete = "4.4"
@@ -28,4 +28,4 @@ num-traits = "0.2.19"
 futures = "0.3.30"
 
 [build-dependencies]
-tonic-build = "0.11"
+tonic-build = {workspace = true}
