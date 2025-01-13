@@ -466,6 +466,30 @@ impl Txn {
         Ok(())
     }
 
+    pub async fn hb_write_data_list_aligned(
+        self: Arc<Self>,
+        fh: Arc<FileHandler>,
+        jobs: &mut WriteTaskDataList,
+        write_end: bool,
+    ) -> TiFsResult<bool> {
+        let aligned = jobs.get_aligned_write_queue_length(self.block_size);
+        let mut tasks = WriteTaskDataList::default();
+        if let Some(start) = jobs.pop_from_start(aligned.non_aligned_start) {
+            tasks.0.push_back(start);
+        }
+        if let Some(middle) = jobs.pop_from_start(aligned.aligned_middle) {
+            tasks.0.push_back(middle);
+        }
+        if write_end && let Some(end) = jobs.pop_from_start(aligned.non_aligned_end) {
+            tasks.0.push_back(end);
+        }
+        if tasks.0.len() > 0 {
+            self.hb_write_data(fh, tasks).await
+        } else {
+            Ok(false)
+        }
+    }
+
     pub async fn hb_write_data(
         self: Arc<Self>,
         fh: Arc<FileHandler>,
@@ -630,18 +654,30 @@ impl Txn {
 
         let mut lock = fh.write_accumulator.write().await;
         if data.len() > 0 {
-            lock.0.push(WriteTaskData{
+            let aligned = lock.add_write_task_and_get_queue_length(WriteTaskData{
                 data,
                 start,
             });
-        }
-        if flush || (lock.write_data_len() > self.fs_config.write_accumulator_flush_threshold) {
-            let jobs = mem::take(lock.deref_mut());
-            mem::drop(lock);
-            if jobs.0.len() > 0 {
-                let _ = self.clone().hb_write_data(fh.clone(), jobs).await?;
-                watch.sync("write impl");
+
+            if !flush {
+                if aligned.aligned_middle > self.fs_config.write_accumulator_flush_threshold {
+                    if let Some(mut job) = lock.task_queues.remove(&aligned.end) {
+                        let _was_modified = self.clone().hb_write_data_list_aligned(fh.clone(), &mut job, false).await?;
+                        if let Some(end) = job.end_offset() {
+                            lock.task_queues.insert(end, job);
+                        }
+                    }
+                    watch.sync("write aligned");
+                }
             }
+        }
+        if flush {
+            let jobs = mem::take(&mut lock.deref_mut().task_queues);
+            mem::drop(lock);
+            for (_, mut job_queue) in jobs.into_iter() {
+                let _was_modified = self.clone().hb_write_data_list_aligned(fh.clone(), &mut job_queue, true).await?;
+            }
+            watch.sync("flush");
         }
 
         Ok(size)

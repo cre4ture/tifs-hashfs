@@ -7,6 +7,7 @@
 #![feature(try_trait_v2)]
 #![feature(closure_lifetime_binder)]
 #![feature(step_trait)]
+#![feature(let_chains)]
 
 pub mod fs;
 pub mod utils;

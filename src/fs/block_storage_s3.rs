@@ -8,6 +8,7 @@ use super::hash_fs_interface::{HashFsData, HashFsError};
 use super::utils::stop_watch::AutoStopWatch;
 use super::{block_storage_interface::BlockStorageInterface, hash_fs_interface::HashFsResult, inode::TiFsHash};
 
+use aws_sdk_s3::primitives::{ByteStream, SdkBody};
 use aws_sdk_s3::Client;
 use futures::TryFutureExt;
 
@@ -105,11 +106,12 @@ impl BlockStorageInterface for S3BasedBlockStorage {
         let mut watch = AutoStopWatch::start("hb_upload_new_blocks-s3");
         let r = futures::future::join_all(blocks.iter().map(|(b_hash, b_data)| {
             let hex_hash = self.get_hash_block_location(b_hash);
+            let stream = ByteStream::new(SdkBody::from(b_data.clone()));
             self.client
                 .put_object()
                 .bucket(self.bucket_name.clone())
                 .key(hex_hash)
-                .body(aws_sdk_s3::primitives::ByteStream::from(b_data.clone()))
+                .body(stream)
                 .send()
                 .map_err(from_s3_error)
         }).collect::<Vec<_>>()).await;
