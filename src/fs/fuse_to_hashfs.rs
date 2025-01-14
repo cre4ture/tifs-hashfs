@@ -451,17 +451,23 @@ impl Txn {
 
         let block_len = data.len() as u64;
 
-        // Upload block if new
-        if previous_reference_count == BigUint::from_u8(0).unwrap() {
-            self.hash_fs.hb_upload_new_blocks(&[(&block_hash, data)]).await?;
+        let fut1 = async || -> TiFsResult<()> {
+            // Upload block if new
+            if previous_reference_count == BigUint::from_u8(0).unwrap() {
+                self.hash_fs.hb_upload_new_blocks(&[(&block_hash, data)]).await?;
+            }
+            Ok(())
+        }();
 
-            watch.sync("upload");
-        }
+        let blocks = &[(&block_hash, block_len, block_ids)];
+        let fut2 = self.hash_fs.inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
+            ino, blocks);
 
-        self.hash_fs.inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
-            ino, &[(&block_hash, block_len, block_ids)]).await?;
+        let (r1, r2) = futures::join!(fut1, fut2);
+        r1?;
+        r2?;
 
-        watch.sync("register");
+        watch.sync("upload+register");
 
         Ok(())
     }
@@ -595,18 +601,28 @@ impl Txn {
                 }
             }
 
-            if blocks_to_upload.len() > 0 {
-                self.hash_fs.hb_upload_new_blocks(&blocks_to_upload).await?;
-            }
+            let upload_fut = async || -> TiFsResult<()> {
+                if blocks_to_upload.len() > 0 {
+                    self.hash_fs.hb_upload_new_blocks(&blocks_to_upload).await
+                        .map_err(|e|e.into())
+                } else {
+                    Ok(())
+                }
+            }();
 
-            self.hash_fs
+            let blocks_data = mm.iter_all().map(|(h, ids)|{
+                    let data = new_blocks.get(h).unwrap().clone();
+                    (h, data.len() as u64, ids.to_vec())
+                }).collect::<Vec<_>>();
+            let update_fut = self.hash_fs
                 .inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
                     ino,
-                    &mm.iter_all().map(|(h, ids)|{
-                        let data = new_blocks.get(h).unwrap().clone();
-                        (h, data.len() as u64, ids.to_vec())
-                    }).collect::<Vec<_>>()
-                ).await?;
+                    &blocks_data,
+                );
+
+            let (r1, r2) = futures::join!(upload_fut, update_fut);
+            r1?;
+            r2?;
 
         } else {
             for (hash, block_ids) in mm {
