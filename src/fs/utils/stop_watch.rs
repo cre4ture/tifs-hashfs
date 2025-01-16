@@ -1,5 +1,16 @@
 use std::{fmt, ops::{Deref, DerefMut}, time::{Duration, SystemTime}};
 
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref FIRST_START: SystemTime = {
+        SystemTime::now().checked_sub(Duration::from_secs(100)).unwrap()
+    };
+}
+
+fn get_printable_timestamp_in_ms(timestamp: SystemTime) -> String {
+    timestamp.duration_since(*FIRST_START).expect("time went backwards").as_millis_f32().to_string()
+}
 
 pub struct StopWatch {
     start: SystemTime,
@@ -33,8 +44,12 @@ impl StopWatch {
 
 impl fmt::Display for StopWatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let now = SystemTime::now();
         let total = self.since_start();
         write!(f, "{}(ms){}", self.name, total.as_millis())?;
+        write!(f, ":[{}->{}]",
+            get_printable_timestamp_in_ms(self.start),
+            get_printable_timestamp_in_ms(now))?;
         for (l_name, l_time) in &self.laps {
             write!(f, "/{}{}", l_name, l_time.as_millis())?;
         }

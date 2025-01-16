@@ -274,6 +274,7 @@ define_options! { MountOption (FuseMountOption) {
     define ParallelJobsDelete(String),
     define MaxChunkSize(String),
     define WriteInProgressLimit(String),
+    define AlignedWriteInProgressLimit(String),
     define ReadAheadSize(String),
     define ReadAheadInProgressLimit(String),
     define HashAlgorithm(String),
@@ -308,6 +309,7 @@ pub struct TiFsConfig {
     pub max_chunk_size: usize,
     pub write_in_progress_limit: usize,
     pub write_accumulator_flush_threshold: u64,
+    pub aligned_write_in_progress_limit: usize,
     pub read_ahead_size: u64,
     pub read_ahead_in_progress_limit: usize,
     pub small_transactions: bool,
@@ -347,6 +349,7 @@ impl TiFsConfig {
             max_chunk_size: usize::MAX,
             write_in_progress_limit: 0,
             write_accumulator_flush_threshold: 2 << 20,
+            aligned_write_in_progress_limit: 4,
             read_ahead_size: 0,
             read_ahead_in_progress_limit: 10,
             small_transactions: false,
@@ -410,7 +413,7 @@ impl TiFsConfig {
                         })?;
                 }
                 MountOption::WriteAccumulatorFlushThreshold(value) => {
-                    config.write_accumulator_flush_threshold = value.parse::<u64>()
+                    config.write_accumulator_flush_threshold = parse_size(value)
                         .map_err(|err|{
                             FsError::ConfigParsingFailed {
                                 msg: format!("fail to parse WriteAccumulatorFlushThreshold({}): {}", value, err) }
@@ -476,6 +479,13 @@ impl TiFsConfig {
                     }).ok()
                 } else { None }
             }).unwrap_or(0);
+        config.aligned_write_in_progress_limit = options.iter().find_map(|opt|{
+            if let MountOption::AlignedWriteInProgressLimit(value) = &opt {
+                value.parse::<usize>().map_err(|err|{
+                    error!("fail to parse AlignedWriteInProgressLimit({}): {}", value, err);
+                }).ok()
+            } else { None }
+        }).unwrap_or(0);
         config.read_ahead_size = options.iter().find_map(|opt|{
                 if let MountOption::ReadAheadSize(value) = &opt {
                     parse_size(value).map_err(|err|{

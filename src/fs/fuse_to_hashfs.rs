@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use bytestring::ByteString;
 use fuser::TimeOrNow;
+use futures::FutureExt;
 use multimap::MultiMap;
 use num_bigint::BigUint;
 use num_format::{Buffer, Locale, ToFormattedString};
@@ -454,14 +455,17 @@ impl Txn {
         let fut1 = async || -> TiFsResult<()> {
             // Upload block if new
             if previous_reference_count == BigUint::from_u8(0).unwrap() {
+                let _block_watch = AutoStopWatch::start("block-upload");
                 self.hash_fs.hb_upload_new_blocks(&[(&block_hash, data)]).await?;
             }
             Ok(())
         }();
 
         let blocks = &[(&block_hash, block_len, block_ids)];
-        let fut2 = self.hash_fs.inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
-            ino, blocks);
+        let fut2 = (async || {
+            let _block_watch = AutoStopWatch::start("kv-update");
+            return self.hash_fs.inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(ino, blocks).await
+        })();
 
         let (r1, r2) = futures::join!(fut1, fut2);
         r1?;
@@ -477,7 +481,7 @@ impl Txn {
         fh: Arc<FileHandler>,
         jobs: &mut WriteTaskDataList,
         write_end: bool,
-    ) -> TiFsResult<bool> {
+    ) -> TiFsResult<()> {
         let aligned = jobs.get_aligned_write_queue_length(self.block_size);
         let mut tasks = WriteTaskDataList::default();
         if let Some(start) = jobs.pop_from_start(aligned.non_aligned_start) {
@@ -490,17 +494,21 @@ impl Txn {
             tasks.0.push_back(end);
         }
         if tasks.0.len() > 0 {
-            self.hb_write_data(fh, tasks).await
-        } else {
-            Ok(false)
+            let lock = fh.write_queue.write().await;
+            (*lock).push(self.hb_write_data(fh.clone(), tasks).boxed()).await;
+            let results = (*lock).get_results_so_far().await;
+            for r in results {
+                r?;
+            }
         }
+        Ok(())
     }
 
     pub async fn hb_write_data(
         self: Arc<Self>,
         fh: Arc<FileHandler>,
         jobs: WriteTaskDataList,
-    ) -> TiFsResult<bool> {
+    ) -> TiFsResult<()> {
 
         let ino = fh.ino();
         let mut watch = AutoStopWatch::start("hb_wrt");
@@ -578,11 +586,10 @@ impl Txn {
             }
         }
 
-        let new_block_hashes_len = new_block_index_hash.len();
         let mm = new_block_index_hash.into_iter()
             .map(|(k,v)| (v,k)).collect::<MultiMap<_,_>>();
 
-        let mut parallel_executor = AsyncParallelPipeStage::new(self.fs_config.parallel_jobs);
+        let parallel_executor = AsyncParallelPipeStage::new(self.fs_config.parallel_jobs);
 
         if self.fs_config.chunked_block_upload {
             let increments = mm.iter_all().map(|(h,ids)|{
@@ -603,6 +610,7 @@ impl Txn {
 
             let upload_fut = async || -> TiFsResult<()> {
                 if blocks_to_upload.len() > 0 {
+                    let _block_watch = AutoStopWatch::start("upload-chunked");
                     self.hash_fs.hb_upload_new_blocks(&blocks_to_upload).await
                         .map_err(|e|e.into())
                 } else {
@@ -614,11 +622,14 @@ impl Txn {
                     let data = new_blocks.get(h).unwrap().clone();
                     (h, data.len() as u64, ids.to_vec())
                 }).collect::<Vec<_>>();
-            let update_fut = self.hash_fs
+            let update_fut = (async || {
+                let _block_watch = AutoStopWatch::start("update-kv-chunked");
+                self.hash_fs
                 .inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(
                     ino,
                     &blocks_data,
-                );
+                ).await
+            })();
 
             let (r1, r2) = futures::join!(upload_fut, update_fut);
             r1?;
@@ -658,8 +669,7 @@ impl Txn {
         }).reduce(|a,s| a + ", " + &s).unwrap_or(format!("error"));
         tracing::debug!("hb_write_data(ino:{},start+len:{})-bl_len:{},jobs:{total_jobs}({skipped_new_block_hashes}/{input_block_hashes} skipped)", ino, starts_str, self.fs_config.block_size);
 
-        let was_modified = new_block_hashes_len > 0;
-        Ok(was_modified)
+        Ok(())
     }
 
     pub async fn write(self: TxnArc, fh: Arc<FileHandler>, start: u64, data: Bytes, flush: bool) -> TiFsResult<usize> {

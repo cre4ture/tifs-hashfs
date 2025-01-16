@@ -217,7 +217,7 @@ impl TikvBasedHashFs {
         let ino_size: Arc<InoSize> = self.f_txn.fetch(&ino).await?;
         let block_cnt = ino_size.size().div_ceil(self.fs_config.block_size);
 
-        let mut parallel_executor = AsyncParallelPipeStage::new(
+        let parallel_executor = AsyncParallelPipeStage::new(
             self.fs_config.parallel_jobs_delete);
         for block in (0..block_cnt).map(BlockIndex) {
             let addr = BlockAddress { ino, index: block };
@@ -225,7 +225,7 @@ impl TikvBasedHashFs {
             parallel_executor.push(me.clone().hb_clear_data_single_block_arc(addr, false)).await;
         }
         parallel_executor.wait_finish_all().await;
-        for r in parallel_executor.get_results_so_far() {
+        for r in parallel_executor.get_results_so_far().await {
             r?;
         }
         Ok(())

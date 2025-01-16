@@ -197,6 +197,7 @@ pub struct FileHandler {
     pub mut_data: RwLock<FileHandlerMutData>,
     pub write_cache: RwLock<AsyncParallelPipeStage<BoxFuture<'static, TiFsResult<usize>>>>,
     pub write_accumulator: RwLock<WriteTasksCache>,
+    pub write_queue: RwLock<AsyncParallelPipeStage<BoxFuture<'static, TiFsResult<()>>>>,
     pub read_ahead: RwLock<AsyncParallelPipeStage<BoxFuture<'static, TiFsResult<()>>>>,
     pub read_ahead_map: RwLock<ReadAhead>,
 }
@@ -215,6 +216,7 @@ impl FileHandler {
             }),
             write_cache: RwLock::new(AsyncParallelPipeStage::new(fs_config.write_in_progress_limit)),
             write_accumulator: RwLock::new(WriteTasksCache::new(fs_config.block_size)),
+            write_queue: RwLock::new(AsyncParallelPipeStage::new(fs_config.aligned_write_in_progress_limit)),
             read_ahead: RwLock::new(AsyncParallelPipeStage::new(2)),
             read_ahead_map: RwLock::new(ReadAhead { cached_ranges: RangeSet2::empty() })
         }
@@ -239,7 +241,7 @@ mod tests {
             data,
             start,
         };
-        write_task_data_list.0.push(task);
+        write_task_data_list.0.push_back(task);
         let data_length = write_task_data_list.write_data_len();
         assert_eq!(data_length, 10);
         let write_queue_length = write_task_data_list.get_aligned_write_queue_length(block_length);

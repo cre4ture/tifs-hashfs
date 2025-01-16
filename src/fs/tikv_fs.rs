@@ -431,9 +431,9 @@ impl TiFs {
         flags: i32,
         lock_owner: Option<u64>,
     ) -> Result<Data> {
-        let mut write_ahead_lock = file_handler.write_cache.write().await;
+        let write_ahead_lock = file_handler.write_cache.write().await;
         write_ahead_lock.wait_finish_all().await;
-        write_ahead_lock.get_results_so_far();
+        let _ = write_ahead_lock.get_results_so_far();
         mem::drop(write_ahead_lock);
 
         let start = start as u64;
@@ -461,7 +461,7 @@ impl TiFs {
                 let start = fp.start;
                 let size = fp.end - fp.start;
                 eprintln!("read ahead step: pos: {}, size: {}", start, size);
-                let mut lock = file_handler.read_ahead.write().await;
+                let lock = file_handler.read_ahead.write().await;
                 lock.push(arc.read_transaction_arc(ino, start, size as u32,
                      flags, lock_owner)
                         .map(|d|{ d.map(|_|{}) }).boxed()).await;
@@ -858,9 +858,9 @@ impl TiFs {
         }).await?;
 
         if let Some(handler) = released_handler {
-            let mut lock = handler.write_cache.write().await;
+            let lock = handler.write_cache.write().await;
             lock.wait_finish_all().await;
-            let results = lock.get_results_so_far();
+            let results = lock.get_results_so_far().await;
             trace!("got results of {} pending tasks", results.len());
             for result in &results {
                 if let Err(err) = result {
@@ -874,9 +874,9 @@ impl TiFs {
 
     pub async fn flush_write_cache(&self, fh: u64) -> TiFsResult<()> {
         let file_handler = self.get_file_handler_checked(fh).await?;
-        let mut write_cache = file_handler.write_cache.write().await;
+        let write_cache = file_handler.write_cache.write().await;
         write_cache.wait_finish_all().await;
-        let results = write_cache.get_results_so_far();
+        let results = write_cache.get_results_so_far().await;
         for r in results {
             r?;
         }

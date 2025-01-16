@@ -291,7 +291,7 @@ impl AsyncFileSystem for TiFs {
             return Err(FsError::InvalidOffset { ino, offset: start });
         }
 
-        let mut write_cache = file_handler.write_cache.write().await;
+        let write_cache = file_handler.write_cache.write().await;
         let fh_clone = file_handler.clone();
         let arc = self.weak.upgrade().unwrap();
 
@@ -300,7 +300,7 @@ impl AsyncFileSystem for TiFs {
                 move |_me, txn| txn.write(fh_clone.clone(), start as u64, data.clone(), false).boxed());
 
         write_cache.push(fut.boxed()).await;
-        let results = write_cache.get_results_so_far();
+        let results = write_cache.get_results_so_far().await;
         for r in results {
             r?;
         }

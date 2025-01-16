@@ -8,6 +8,7 @@
 #![feature(closure_lifetime_binder)]
 #![feature(step_trait)]
 #![feature(let_chains)]
+#![feature(duration_millis_float)]
 
 pub mod fs;
 pub mod utils;
