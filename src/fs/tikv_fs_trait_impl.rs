@@ -9,7 +9,7 @@ use tracing::{debug, trace};
 
 use crate::fs::{error::{FsError, Result}, inode::StorageFilePermission, reply::InoKind};
 
-use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, hash_fs_interface::GotOrMade};
+use super::{async_fs::AsyncFileSystem, file_handler::FileHandler, hash_fs_interface::GotOrMade, utils::stop_watch::AutoStopWatch};
 use super::inode::{ParentStorageIno, StorageDirItem};
 use super::key::{check_file_name, ROOT_INODE};
 use super::open_modes::OpenMode;
@@ -276,10 +276,13 @@ impl AsyncFileSystem for TiFs {
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<Write> {
+        let mut watch = AutoStopWatch::start("fuse-write");
         let file_handler = self.get_file_handler_checked(fh).await?;
         if !file_handler.open_mode.allows_write() {
             return Err(FsError::WriteNotAllowed);
         }
+
+        watch.sync("fh");
 
         let l_ino = LogicalIno::from_raw(ino);
         let data: Bytes = data.into();
@@ -291,19 +294,30 @@ impl AsyncFileSystem for TiFs {
             return Err(FsError::InvalidOffset { ino, offset: start });
         }
 
+        watch.sync("hf_d");
+
         let write_cache = file_handler.write_cache.write().await;
         let fh_clone = file_handler.clone();
         let arc = self.weak.upgrade().unwrap();
+
+        watch.sync("arc_tifs");
 
         let fut =
             arc.clone().spin_no_delay_arc(format!("write, ino:{ino}, fh:{fh}, offset:{offset}, data.len:{}", size),
                 move |_me, txn| txn.write(fh_clone.clone(), start as u64, data.clone(), false).boxed());
 
+        watch.sync("prep_fut");
+
         write_cache.push(fut.boxed()).await;
+
+        watch.sync("push_fut");
+
         let results = write_cache.get_results_so_far().await;
         for r in results {
             r?;
         }
+
+        watch.sync("g_rs");
 
         Ok(Write::new(size as u32))
     }

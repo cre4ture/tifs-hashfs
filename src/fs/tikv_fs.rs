@@ -44,6 +44,7 @@ use super::reply::{
 use super::fuse_to_hashfs::{Txn, TxnArc};
 use super::transaction_client_mux::TransactionClientMux;
 use super::utils::lazy_lock_map::LazyLockMap;
+use super::utils::stop_watch::AutoStopWatch;
 use super::utils::txn_data_cache::TxnDataCache;
 
 pub type TiFsBlockCache = Cache<TiFsHash, TiFsData>;
@@ -606,6 +607,7 @@ impl TiFs {
         T: 'static + Send,
         F: for<'a> FnMut(&'a TiFs, TxnArc) -> BoxedFuture<'a, T>,
     {
+        let mut watch = AutoStopWatch::start("spin_no_delay_arc");
         self.spin(msg, None, f).await
     }
 
