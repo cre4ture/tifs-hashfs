@@ -60,18 +60,6 @@ async fn main() -> anyhow::Result<()> {
                 .action(ArgAction::Append)
         )
         .arg(
-            Arg::new("foreground")
-                .long("foreground")
-                .short('f')
-                .help("foreground operation")
-        )
-        .arg(
-            Arg::new("serve")
-                .long("serve")
-                .help("run in server mode (implies --foreground)")
-                .hide(true)
-        )
-        .arg(
             Arg::new("logfile")
                 .long("log-file")
                 .value_name("LOGFILE")

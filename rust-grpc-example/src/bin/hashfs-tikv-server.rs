@@ -28,13 +28,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .action(ArgAction::Append)
         )
         .arg(
-            Arg::new("mount-point")
-                .value_name("MOUNT_POINT")
-                .required(true)
-                .help("act as a client, and mount FUSE at given path")
-                .index(2)
-        )
-        .arg(
             Arg::new("tracer")
                 .value_name("TRACER")
                 .long("tracer")
@@ -62,18 +55,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .short('o')
                 .help("filesystem mount options")
                 .action(ArgAction::Append)
-        )
-        .arg(
-            Arg::new("foreground")
-                .long("foreground")
-                .short('f')
-                .help("foreground operation")
-        )
-        .arg(
-            Arg::new("serve")
-                .long("serve")
-                .help("run in server mode (implies --foreground)")
-                .hide(true)
         )
         .arg(
             Arg::new("logfile")
