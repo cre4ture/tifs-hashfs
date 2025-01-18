@@ -284,6 +284,7 @@ define_options! { MountOption (FuseMountOption) {
     define S3Region(String),
     define S3Endpoint(String),
     define S3Bucket(String),
+    define FakeWrite,
 }}
 
 #[derive(Clone)]
@@ -318,6 +319,7 @@ pub struct TiFsConfig {
     pub s3_endpoint: String,
     pub s3_bucket: String,
     pub s3_path_prefix: String,
+    pub fake_write: bool,
 }
 
 impl TiFsConfig {
@@ -358,6 +360,7 @@ impl TiFsConfig {
             s3_endpoint: String::default(),
             s3_bucket: String::default(),
             s3_path_prefix: String::default(),
+            fake_write: false,
         };
 
         // iterate over options and overwrite defaults
@@ -422,6 +425,7 @@ impl TiFsConfig {
                 MountOption::S3Region(value) => config.s3_region = value.clone(),
                 MountOption::S3Endpoint(value) => config.s3_endpoint = value.clone(),
                 MountOption::S3Bucket(value) => config.s3_bucket = value.clone(),
+                MountOption::FakeWrite => config.fake_write = true,
                 _ => {}
             }
         }

@@ -607,7 +607,7 @@ impl TiFs {
         T: 'static + Send,
         F: for<'a> FnMut(&'a TiFs, TxnArc) -> BoxedFuture<'a, T>,
     {
-        let mut watch = AutoStopWatch::start("spin_no_delay_arc");
+        let _watch = AutoStopWatch::start("spin_no_delay_arc");
         self.spin(msg, None, f).await
     }
 

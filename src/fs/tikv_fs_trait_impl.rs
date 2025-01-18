@@ -276,6 +276,11 @@ impl AsyncFileSystem for TiFs {
         _flags: i32,
         _lock_owner: Option<u64>,
     ) -> Result<Write> {
+
+        if self.fs_config.fake_write {
+            return Ok(Write::new(data.len() as u32));
+        }
+
         let mut watch = AutoStopWatch::start("fuse-write");
         let file_handler = self.get_file_handler_checked(fh).await?;
         if !file_handler.open_mode.allows_write() {

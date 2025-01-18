@@ -11,6 +11,8 @@ use tokio::runtime::Handle;
 use tokio::task::{block_in_place, spawn};
 use tracing::trace;
 
+use crate::fs::utils::stop_watch::AutoStopWatch;
+
 use super::error::Result;
 use super::reply::
     FsReply
@@ -23,9 +25,11 @@ where
     V: Debug,
 {
     spawn(async move {
+        let mut watch = AutoStopWatch::start("spawn_reply");
         trace!("start request({}) - result type: {}", id, std::any::type_name::<V>());
         let result = f.await;
         // TODO eprintln!("reply to request({}): {:?}", id, result);
+        watch.sync("f.await");
         reply.reply(id, result);
     });
 }

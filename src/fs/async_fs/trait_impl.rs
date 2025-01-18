@@ -263,18 +263,19 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
         ino: u64,
         fh: u64,
         offset: i64,
-        data: &[u8],
+        data_raw: &[u8],
         write_flags: u32,
         flags: i32,
         lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
         let async_impl = self.0.clone();
-        let data = data.to_owned();
+        let data = data_raw.to_owned();
         spawn_reply(req.unique(), reply, async move {
             async_impl
                 .write(ino, fh, offset, data, write_flags, flags, lock_owner)
                 .await
+            //return Ok(Write{size: data.len() as u32});
         });
     }
 
@@ -381,6 +382,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
 
     #[tracing::instrument(skip(self))]
     fn getxattr(&mut self, req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+        //tracing::info!("getxattr: ino:{}, name:{}, size:{}", ino, name.to_string_lossy(), size);
         let async_impl = self.0.clone();
         let name = name.to_string_lossy().to_string().into();
         spawn_reply(req.unique(), reply, async move {
@@ -390,6 +392,7 @@ impl<T: AsyncFileSystem + 'static> Filesystem for AsyncFs<T> {
 
     #[tracing::instrument(skip(self))]
     fn listxattr(&mut self, req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+        //tracing::info!("listxattr: ino:{}, size:{}", ino, size);
         let async_impl = self.0.clone();
         spawn_reply(req.unique(), reply, async move {
             async_impl.listxattr(ino, size).await
