@@ -25,11 +25,11 @@ service HashFS {
   rpc inode_read_inline_data(inode_read_inline_data_rq) returns (inode_read_inline_data_rs);
   rpc inode_read_block_hashes_data_range(inode_read_block_hashes_data_range_rq) returns (inode_read_block_hashes_data_range_rs);
   rpc inode_read_block_hashes_block_range(inode_read_block_hashes_block_range_rq) returns (inode_read_block_hashes_block_range_rs);
-  rpc hb_get_block_data_by_hashes(hb_get_block_data_by_hashes_rq) returns (hb_get_block_data_by_hashes_rs);
+  rpc hb_get_block_data_by_hashes(hb_get_block_data_by_hashes_rq) returns (stream hb_get_block_data_by_hashes_rs);
   rpc file_get_hash(file_get_hash_rq) returns (file_get_hash_rs);
   rpc file_read_block_hashes(file_read_block_hashes_rq) returns (file_read_block_hashes_rs);
   rpc hb_increment_reference_count(hb_increment_reference_count_rq) returns (hb_increment_reference_count_rs);
-  rpc hb_upload_new_block(hb_upload_new_block_rq) returns (hb_upload_new_block_rs);
+  rpc hb_upload_new_block(stream hb_upload_new_block_rq) returns (hb_upload_new_block_rs);
   rpc inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes(inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes_rq) returns (inode_write_hash_block_to_addresses_update_ino_size_and_cleaning_previous_block_hashes_rs);
   rpc snapshot_create(snapshot_create_rq) returns (snapshot_create_rs);
 }

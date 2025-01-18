@@ -12,6 +12,7 @@ tonic = {workspace = true}
 prost = "0.13"
 prost-types = "0.13"
 tokio = {workspace = true}
+tokio-stream = {workspace = true}
 tifs = { path = ".." }
 clap = { version = "4.4", features = ["wrap_help", "cargo"] }
 clap_complete = "4.4"

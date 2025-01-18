@@ -9,6 +9,9 @@ use bytestring::ByteString;
 use fuser::TimeOrNow;
 use num_bigint::BigUint;
 
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
 use crate::grpc::hash_fs::{self as grpc_fs, InitRq, MetaStaticReadRq};
 use crate::utils::object_pool::{HandedOutPoolElement, Pool};
 use tifs::fs::hash_fs_interface::{BlockIndex, GotOrMade, HashFsData, HashFsError, HashFsInterface, HashFsResult};
@@ -413,16 +416,18 @@ impl HashFsInterface for HashFsClient {
         rq.hashes = hashes.iter().map(|h|{
             grpc_fs::Hash{ data: h.to_vec() }
         }).collect::<Vec<_>>();
-        let rs = self.lock_grpc().await?
+        let mut rs = self.lock_grpc().await?
             .hb_get_block_data_by_hashes(rq).await?.into_inner();
-        handle_error(&rs.error)?;
-        Ok(rs.block_data.into_iter().filter_map(|grpc_fs::HashBlockData{hash, data}|{
-            if let Some(hash) = hash {
-                Some((hash.data, Bytes::from(data)))
-            } else {
-                None
+
+        let mut result = HashMap::new();
+        while let Some(part) = rs.message().await? {
+            handle_error(&part.error)?;
+            let mut iter = part.block_data.into_iter();
+            while let Some(block) = iter.next() {
+                result.insert(block.hash.unwrap().data, Bytes::from(block.data));
             }
-        }).collect::<HashMap<_,_>>())
+        }
+        Ok(result)
     }
 
     async fn file_get_hash(&self, ino: StorageIno) -> HashFsResult<Vec<u8>> {
@@ -483,15 +488,25 @@ impl HashFsInterface for HashFsClient {
             return Ok(());
         }
 
-        let mut rq = grpc_fs::HbUploadNewBlockRq::default();
-        rq.blocks = blocks.iter().map(|(h, data)|{
-            grpc_fs::HashBlockData {
-                hash: Some(grpc_fs::Hash{data: (*h).clone()}),
-                data: data.to_vec(),
+        let (tx, rx) = mpsc::channel(10);
+        let upload = ReceiverStream::new(rx);
+
+        let values = blocks.iter().map(|(h,d)|{
+            (h.to_vec(), d.clone())
+        }).collect::<Vec<_>>();
+        tokio::spawn(async move {
+            for (h, data) in values.into_iter() {
+                let mut rq = grpc_fs::HashBlockData::default();
+                rq.hash = Some(grpc_fs::Hash{data: h});
+                rq.data = data.to_vec();
+                let mut rq_full = grpc_fs::HbUploadNewBlockRq::default();
+                rq_full.blocks.push(rq);
+                tx.send(rq_full).await.unwrap();
             }
-        }).collect();
+        });
+
         let rs = self.lock_grpc().await?
-            .hb_upload_new_block(rq).await?.into_inner();
+            .hb_upload_new_block(upload).await?.into_inner();
         handle_error(&rs.error)?;
         Ok(())
     }

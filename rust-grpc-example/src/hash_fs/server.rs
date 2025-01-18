@@ -3,12 +3,15 @@ use std::mem;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::grpc_time_to_system_time;
 use bytes::Bytes;
 use tifs::fs::fs_config::{self};
 use tifs::fs::hash_fs_interface::{BlockIndex, HashFsInterface};
 use tonic::{Request, Response, Status};
 
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::hash_fs::converters::*;
 use crate::grpc::greeter::greeter_server::Greeter;
 use crate::grpc::greeter::{HelloResponse, HelloRequest};
 use crate::grpc::hash_fs::{self as grpc_fs};
@@ -482,11 +485,12 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         }
         Ok(tonic::Response::new(rsp))
     }
+    type hb_get_block_data_by_hashesStream = ReceiverStream<Result<grpc_fs::HbGetBlockDataByHashesRs, Status>>;
     async fn hb_get_block_data_by_hashes(
         &self,
         request: tonic::Request<grpc_fs::HbGetBlockDataByHashesRq>,
     ) -> std::result::Result<
-        tonic::Response<grpc_fs::HbGetBlockDataByHashesRs>,
+        tonic::Response<Self::hb_get_block_data_by_hashesStream>,
         tonic::Status,
     >{
         let rq = request.into_inner();
@@ -495,19 +499,29 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
         }).collect::<HashSet<_>>();
         let r = self.fs_impl
             .hb_get_block_data_by_hashes(&hashes).await;
-        let mut rsp = grpc_fs::HbGetBlockDataByHashesRs::default();
+
+        let (tx, rx) = mpsc::channel(10);
+
         match r {
-            Err(err) => rsp.error = Some(err.into()),
+            Err(err) => {
+                let mut rs = grpc_fs::HbGetBlockDataByHashesRs::default();
+                rs.error = Some(err.into());
+                tx.send(Ok(rs)).await.unwrap();
+            },
             Ok(data) => {
-                rsp.block_data = data.into_iter().map(|(k,v)|{
-                    grpc_fs::HashBlockData{
-                        hash: Some(grpc_fs::Hash{data: k}),
-                        data: v.to_vec(),
+                tokio::spawn(async move {
+                    for (hash, data) in data {
+                        let mut rs = grpc_fs::HbGetBlockDataByHashesRs::default();
+                        rs.block_data.push(grpc_fs::HashBlockData {
+                            hash: Some(grpc_fs::Hash{data: hash}),
+                            data: data.to_vec(),
+                        });
+                        tx.send(Ok(rs)).await.unwrap();
                     }
-                }).collect::<Vec<_>>();
+                });
             }
         }
-        Ok(tonic::Response::new(rsp))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
     async fn file_get_hash(
         &self,
@@ -587,21 +601,28 @@ impl grpc_fs::hash_fs_server::HashFs for HashFsGrpcServer {
     }
     async fn hb_upload_new_block(
         &self,
-        request: tonic::Request<grpc_fs::HbUploadNewBlockRq>,
+        request: tonic::Request<tonic::Streaming<grpc_fs::HbUploadNewBlockRq>>,
     ) -> std::result::Result<
         tonic::Response<grpc_fs::HbUploadNewBlockRs>,
         tonic::Status,
     >{
-        let mut rq = request.into_inner();
-        if rq.blocks.len() == 0 {
-            return Err(tonic::Status::invalid_argument("blocks parameter is required!"));
-        };
-        let blocks = rq.blocks.iter_mut().filter_map(|d|{
-            let hash = &d.hash.as_ref()?.data;
-            Some((hash, Bytes::from(mem::take(&mut d.data))))
-        }).collect::<Vec<_>>();
+        let mut rqs = request.into_inner();
+        let mut blocks = Vec::new();
+        while let Some(rq) = rqs.message().await? {
+            let mut biter = rq.blocks.into_iter();
+            while let Some(mut block) = biter.next() {
+                let hash = block.hash.take().ok_or_else(||{
+                    tonic::Status::invalid_argument("hash parameter is required!")
+                })?.data;
+                let data = Bytes::from(mem::take(&mut block.data));
+                blocks.push((hash, data));
+            }
+        }
         let r = self.fs_impl
-            .hb_upload_new_blocks(&blocks).await;
+            .hb_upload_new_blocks(&blocks.iter().map(|(h, d)|{
+                (h, d.clone())
+            }).collect::<Vec<_>>()
+        ).await;
         let mut rsp = grpc_fs::HbUploadNewBlockRs::default();
         match r {
             Err(err) => rsp.error = Some(err.into()),
